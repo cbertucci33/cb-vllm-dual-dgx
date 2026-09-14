@@ -510,6 +510,15 @@ class Scheduler(SchedulerInterface):
             if self.draft_replay_reserve
             else 0
         )
+        # Incremental multimodal prompts often append a new item before the
+        # producer's end-of-prompt state. Materialize one reusable state at the
+        # final MM boundary, aligned to the cache-hit granularity. Limiting this
+        # to the final feature adds at most one prefill split per request.
+        mm_boundary = request.last_mm_feature_end
+        mm_alignment = (
+            self.hash_block_size if self.mamba_fine_grained_prefix_cache else block_size
+        )
+        mm_boundary_stop = mm_boundary // mm_alignment * mm_alignment
         stops = (
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
@@ -530,6 +539,10 @@ class Scheduler(SchedulerInterface):
             # cache restore. Materialize the exact restorable target-state
             # boundary before the final prefill chunk advances that page.
             replay_boundary if start < replay_boundary < end else 0,
+            # Last multimodal boundary: cache a state that an incremental
+            # sibling can discover on its first request, before Marconi has a
+            # chance to observe and repair the missing Mamba state.
+            mm_boundary_stop if start < mm_boundary_stop < end else 0,
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
