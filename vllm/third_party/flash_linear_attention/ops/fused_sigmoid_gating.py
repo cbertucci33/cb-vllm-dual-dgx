@@ -60,7 +60,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     IS_KDA: tl.constexpr,
 ):
     """Sigmoid-gated delta-rule update; an invalid state index zeroes the output."""
-    i_nh, i_v, i_k = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
     if IS_VARLEN:
@@ -256,9 +256,7 @@ def fused_sigmoid_gating_delta_rule_update(
     else:
         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
 
-    # N * HV goes in gridDim.x: gridDim.z is capped at 65535 and batch x heads exceeds it
-    # (e.g. GLM-5.3-Flash at TP=1: 1024 x 64 = 65536 -> "invalid argument" at CUDA-graph capture).
-    grid = (N * HV, NV, NK)
+    grid = (NK, NV, N * HV)
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
         a=a.contiguous(),
