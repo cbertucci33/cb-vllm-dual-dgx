@@ -1014,9 +1014,15 @@ def test_concat_and_cache_ds_mla(
 
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @pytest.mark.parametrize("block_size", [64, 256])
+@pytest.mark.parametrize(
+    "entry_size,row_padding,page_padding",
+    [(528, 0, 0), (656, 0, 0), (528, 128, 1), (656, 16, 1)],
+)
 @torch.inference_mode()
-def test_concat_and_cache_ds_mla_nope(device: str, block_size: int) -> None:
-    """NoPE rows keep the 656-byte layout and padded tokens leave it untouched."""
+def test_concat_and_cache_ds_mla_nope(
+    device: str, block_size: int, entry_size: int, row_padding: int, page_padding: int
+) -> None:
+    """NoPE matches zero RoPE and preserves unused slots and stride padding."""
     dtype = torch.bfloat16
     if current_platform.is_rocm():
         pytest.skip("concat_and_cache_mla doesn't support fp8_ds_mla on ROCm")
@@ -1038,56 +1044,54 @@ def test_concat_and_cache_ds_mla_nope(device: str, block_size: int) -> None:
     kv_c[0, :128] = 0
     kv_c[0, 128:256] *= 1e-3
     k_pe = torch.empty(num_tokens, 0, dtype=dtype, device=device)
+    zero_k_pe = torch.zeros(num_tokens, 64, dtype=dtype, device=device)
     scale = torch.tensor(1.0, dtype=torch.float32, device=device)
-    kv_cache = _create_mla_cache(
-        num_blocks,
-        block_size,
-        656,
+    storage = torch.full(
+        (num_blocks, block_size + page_padding, entry_size + row_padding),
+        0xFF,
         dtype=torch.uint8,
-        kv_cache_dtype="fp8_ds_mla",
         device=device,
     )
-    kv_cache.fill_(0xFF)
+    kv_cache = storage[:, :block_size, :entry_size]
+    ref_cache = torch.full(
+        (num_blocks, block_size, 656), 0xFF, dtype=torch.uint8, device=device
+    )
 
     opcheck(
         torch.ops._C_cache_ops.concat_and_cache_mla,
         (kv_c, k_pe, kv_cache, slot_mapping, "fp8_ds_mla", scale),
         test_utils=DEFAULT_OPCHECK_TEST_UTILS,
     )
-    kv_cache.fill_(0xFF)
+    storage.fill_(0xFF)
     ops.concat_and_cache_mla(kv_c, k_pe, kv_cache, slot_mapping, "fp8_ds_mla", scale)
+    ops.concat_and_cache_mla(
+        kv_c, zero_k_pe, ref_cache, slot_mapping, "fp8_ds_mla", scale
+    )
 
-    for i in range(num_tokens):
-        slot = slot_mapping[i].item()
-        if slot < 0:
-            continue
-        row = kv_cache[slot // block_size, slot % block_size]
-        kv_c_f = kv_c[i].to(torch.float32)
-        for tile_idx in range(kv_lora_rank // 128):
-            tile = kv_c_f[tile_idx * 128 : (tile_idx + 1) * 128]
-            raw_scale = torch.clamp(tile.abs().max() / 448.0, min=1e-4)
-            tile_scale = torch.exp2(torch.ceil(torch.log2(raw_scale)))
-            torch.testing.assert_close(
-                row.view(torch.float32)[128 + tile_idx], tile_scale, atol=0, rtol=0
-            )
-            ref_tile = torch.empty(128, dtype=torch.uint8, device=device)
-            ops.convert_fp8(
-                ref_tile,
-                kv_c[i][tile_idx * 128 : (tile_idx + 1) * 128],
-                tile_scale.item(),
-                kv_dtype="fp8",
-            )
-            torch.testing.assert_close(
-                row[tile_idx * 128 : (tile_idx + 1) * 128],
-                ref_tile,
-                atol=0,
-                rtol=0,
-            )
-        assert (row[528:656] == 0).all()
-
+    torch.testing.assert_close(kv_cache, ref_cache[..., :entry_size], atol=0, rtol=0)
+    rows = kv_cache.reshape(total_slots, entry_size)
+    written_slots = slot_mapping[slot_mapping >= 0]
+    if entry_size == 656:
+        assert (rows[written_slots, 528:] == 0).all()
     untouched = torch.ones(total_slots, dtype=torch.bool, device=device)
-    untouched[slot_mapping[slot_mapping >= 0]] = False
-    assert (kv_cache.view(total_slots, 656)[untouched] == 0xFF).all()
+    untouched[written_slots] = False
+    assert (rows[untouched] == 0xFF).all()
+    assert (storage[..., entry_size:] == 0xFF).all()
+    assert (storage[:, block_size:] == 0xFF).all()
+
+    if entry_size == 528:
+        with pytest.raises(RuntimeError, match="528-byte rows with pe_dim == 0"):
+            ops.concat_and_cache_mla(
+                kv_c, zero_k_pe, kv_cache, slot_mapping, "fp8_ds_mla", scale
+            )
+        with pytest.raises(RuntimeError, match="at least 656 bytes"):
+            ops.cp_gather_and_upconvert_fp8_kv_cache(
+                kv_cache,
+                torch.empty(1, 576, dtype=dtype, device=device),
+                torch.zeros(1, 1, dtype=torch.int32, device=device),
+                torch.zeros(1, dtype=torch.int32, device=device),
+                1,
+            )
 
 
 # Bytes per token for the nvfp4_ds_mla cache layout (see flashmla_sparse.py).
