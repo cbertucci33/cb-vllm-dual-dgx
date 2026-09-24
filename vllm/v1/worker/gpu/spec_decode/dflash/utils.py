@@ -12,7 +12,9 @@ from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
 from vllm.v1.worker.gpu.spec_decode.utils import get_pp_safe_draft_load_config
 
 
-def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
+def load_dflash_model(
+    target_model: nn.Module, vllm_config: VllmConfig
+) -> tuple[nn.Module, VllmConfig]:
     from vllm.compilation.backends import set_model_tag
     from vllm.model_executor.models.qwen3_dflash import (
         dflash_has_any_non_causal,
@@ -71,4 +73,4 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     if maybe_init_fp8_draft_head is not None:
         maybe_init_fp8_draft_head()
 
-    return dflash_model
+    return dflash_model, draft_vllm_config

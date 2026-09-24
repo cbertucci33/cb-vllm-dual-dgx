@@ -17,25 +17,53 @@ from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
 
 
 def test_dflash_attention_config_uses_draft_cache_dtype():
-    from vllm.config import VllmConfig
+    import copy
+
+    from vllm.config import VllmConfig, replace
 
     target_config = VllmConfig()
     target_config.cache_config.kv_cache_layout = "LBHNC"
+    draft_config = copy.copy(target_config)
+    draft_config.attention_config = replace(
+        target_config.attention_config,
+        backend="FLASHINFER",
+        use_non_causal=True,
+    )
+    draft_config.cache_config = replace(
+        target_config.cache_config, cache_dtype="fp8_e4m3"
+    )
+    assert draft_config.cache_config.kv_cache_layout is None
+
     speculator = object.__new__(DFlashSpeculator)
     speculator.vllm_config = target_config
-    speculator.speculative_config = SimpleNamespace(
-        attention_backend="FLASHINFER",
-        kv_cache_dtype="fp8_e4m3",
-    )
-    speculator.requires_non_causal = True
+    speculator._draft_vllm_config = draft_config
 
     config = speculator.attn_vllm_config
 
+    assert config is draft_config
     assert config.cache_config.cache_dtype == "fp8_e4m3"
     assert config.attention_config.backend.name == "FLASHINFER"
     assert config.attention_config.use_non_causal is True
     assert config.cache_config.kv_cache_layout == "LBHNC"
     assert config.cache_config is not target_config.cache_config
+
+
+def test_dflash_load_retains_exact_draft_config(monkeypatch):
+    from vllm.v1.worker.gpu.spec_decode.dflash import speculator as module
+
+    target_config = object()
+    draft_config = object()
+    draft_model = object()
+    speculator = object.__new__(DFlashSpeculator)
+    speculator.vllm_config = target_config
+    monkeypatch.setattr(
+        module,
+        "load_dflash_model",
+        lambda target_model, vllm_config: (draft_model, draft_config),
+    )
+
+    assert speculator.load_draft_model(object(), set()) is draft_model
+    assert speculator._draft_vllm_config is draft_config
 
 
 def test_attention_groups_receive_target_and_draft_configs(monkeypatch):

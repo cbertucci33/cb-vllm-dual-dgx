@@ -12,7 +12,7 @@ from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
-from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID, record_kv_cache_layout
 from vllm.v1.kv_cache_interface import (
     DFlashSWASpec,
     KVCacheConfig,
@@ -158,20 +158,13 @@ class DFlashSpeculator(DraftModelSpeculator):
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
-        # The draft's attention differs from the target's in causality,
-        # backend, and potentially KV-cache dtype.
-        config = copy.copy(super().attn_vllm_config)
-        config.attention_config = replace(
-            self.vllm_config.attention_config,
-            use_non_causal=self.requires_non_causal,
-            backend=self.speculative_config.attention_backend,
-        )
-        if self.speculative_config.kv_cache_dtype is not None:
-            # Preserve derived runtime state such as the engine-resolved KV
-            # layout; dataclass replacement reconstructs init fields only.
-            config.cache_config = copy.copy(self.vllm_config.cache_config)
-            config.cache_config.cache_dtype = self.speculative_config.kv_cache_dtype
-        return config
+        # The attention implementation keeps the config object used at model
+        # construction. Adopt the target's engine-resolved layout on that same
+        # object so metadata builders and runtime attention stay consistent.
+        layout = self.vllm_config.cache_config.kv_cache_layout
+        if layout is not None:
+            record_kv_cache_layout(self._draft_vllm_config.cache_config, layout)
+        return self._draft_vllm_config
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         wants_full = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
@@ -222,7 +215,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         target_model: nn.Module,
         target_attn_layer_names: set[str],
     ) -> nn.Module:
-        return load_dflash_model(target_model, self.vllm_config)
+        model, self._draft_vllm_config = load_dflash_model(
+            target_model, self.vllm_config
+        )
+        return model
 
     def set_attn(
         self,
