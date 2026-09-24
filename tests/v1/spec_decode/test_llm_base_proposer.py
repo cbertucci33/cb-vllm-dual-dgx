@@ -29,8 +29,10 @@ class _FakeAttentionGroup:
         self.kv_cache_spec = kv_cache_spec
         self.kv_cache_group_id = kv_cache_group_id
         self.kernel_block_size = None
+        self.vllm_config = None
 
     def create_metadata_builders(self, vllm_config, device, kernel_block_size=None):
+        self.vllm_config = vllm_config
         self.kernel_block_size = kernel_block_size
 
     def get_metadata_builder(self):
@@ -58,6 +60,7 @@ def _make_proposer(
     proposer.kv_cache_gid = -1
     proposer.draft_attn_groups = []
     proposer.block_size = -1
+    proposer._create_draft_vllm_config = lambda: "draft-config"
     return proposer
 
 
@@ -93,6 +96,16 @@ def test_block_size_falls_back_to_kv_cache_spec(monkeypatch: pytest.MonkeyPatch)
     )
 
     assert proposer.block_size == SCHEDULER_BLOCK_SIZE
+
+
+def test_metadata_builder_uses_draft_vllm_config(monkeypatch: pytest.MonkeyPatch):
+    """Draft metadata must not inherit the target KV-cache dtype."""
+    layer_names = {"draft.0.self_attn.attn"}
+    proposer = _make_proposer(monkeypatch, layer_names)
+
+    proposer.initialize_attn_backend(_make_kv_cache_config(layer_names))
+
+    assert proposer.draft_attn_groups[0].vllm_config == "draft-config"
 
 
 def test_draft_layer_iteration_is_deterministic(monkeypatch: pytest.MonkeyPatch):

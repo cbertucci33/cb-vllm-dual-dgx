@@ -1743,6 +1743,12 @@ class SpecDecodeBaseProposer:
 
         attention_groups: dict[tuple[str, str], AttentionGroup] = {}
         if kv_cache_spec is not None:
+            # Metadata builders serve the draft attention layers, so resolve
+            # backend settings from the same draft config used to construct
+            # the model.  In particular, the target and draft may use
+            # different KV-cache formats (for example fp8_ds_mla and
+            # fp8_e4m3 respectively).
+            draft_vllm_config = self._create_draft_vllm_config()
             # _draft_attn_layer_names is a set; iterate in sorted order so
             # that attention_groups (and anything derived from its first
             # element) is deterministic across processes.
@@ -1769,7 +1775,7 @@ class SpecDecodeBaseProposer:
                         kv_cache_group_id=self.kv_cache_gid,
                     )
                     attn_group.create_metadata_builders(
-                        self.vllm_config,
+                        draft_vllm_config,
                         self.device,
                         kernel_block_size=kernel_block_size,
                     )
