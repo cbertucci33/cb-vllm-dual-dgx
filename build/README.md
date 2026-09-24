@@ -36,8 +36,15 @@ The resulting paths are:
 - `/srv/glm53/models/target`
 - `/srv/glm53/models/dflash2`
 
-The repository and immutable revision for each model are stored in
-`versions.env`.
+`versions.env` stores two immutable identities for each model: the serving
+artifact downloaded by the runner and the upstream checkpoint used to produce
+that artifact. `download_models.sh` verifies the derived manifests, source
+revisions, and source/derived metadata hashes before accepting the download.
+
+The target artifact is the TP2 rank-sliced EXL3 release derived from
+`neko-legends/GLM-5.3-Flash-Uncensored-EXL3`. The DFlash artifact is the MXFP8
+conversion derived from `incoai/GLM-5.3-Flash-DFlash2`. Exact repositories,
+commits, and hashes are in `versions.env` and the final image provenance file.
 
 ## Fetch the build sources
 
@@ -73,7 +80,7 @@ docker build \
   -f build/Dockerfile.builder \
   --build-arg BASE_IMAGE="$VLLM_BASE_IMAGE" \
   --build-arg CUDA_DEVEL_IMAGE="$CUDA_DEVEL_IMAGE" \
-  -t glm53-runner-builder:internal-v3 .
+  -t glm53-runner-builder:internal-v3.1 .
 ```
 
 Use the builder for all Python and CUDA artifacts:
@@ -88,7 +95,7 @@ run_builder() {
     -v "$repo:/repo:ro" \
     -v "$work:/work" \
     -w /repo \
-    glm53-runner-builder:internal-v3 -lc "$1"
+    glm53-runner-builder:internal-v3.1 -lc "$1"
 }
 
 run_builder 'build/download_build_deps.sh /work/build-deps'
@@ -140,7 +147,9 @@ docker build \
   --build-arg SPARKINFER_COMMIT="$SPARKINFER_COMMIT" \
   --build-arg EXLLAMAV3_COMMIT="$EXLLAMAV3_COMMIT" \
   --build-arg B12X_COMMIT="$B12X_COMMIT" \
-  -t glm53-flash-exl3:internal-v3.0 \
+  --build-arg RUNNER_VERSION="$RUNNER_VERSION" \
+  --build-arg RUNNER_SOURCE_URL="$RUNNER_SOURCE_URL" \
+  -t glm53-flash-exl3:internal-v3.1 \
   /srv/glm53/build/image-context
 ```
 

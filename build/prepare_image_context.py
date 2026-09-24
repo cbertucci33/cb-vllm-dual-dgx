@@ -111,7 +111,11 @@ def main() -> None:
     shutil.copy2(template, args.output_dir / "chat_template.jinja")
 
     provenance = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "runner": {
+            "version": versions["RUNNER_VERSION"],
+            "source": versions["RUNNER_SOURCE_URL"],
+        },
         "vllm": {
             "base_version": versions["VLLM_BASE_VERSION"],
             "commit": vllm_commit,
@@ -129,6 +133,46 @@ def main() -> None:
             "sparkinfer": versions["SPARKINFER_COMMIT"],
             "exllamav3": versions["EXLLAMAV3_COMMIT"],
             "b12x": versions["B12X_COMMIT"],
+        },
+        "models": {
+            "target": {
+                "artifact": {
+                    "repository": versions["TARGET_MODEL_REPO"],
+                    "revision": versions["TARGET_MODEL_REVISION"],
+                    "release_manifest_sha256": versions[
+                        "TARGET_MODEL_RELEASE_MANIFEST_SHA256"
+                    ],
+                    "config_sha256": versions["TARGET_MODEL_CONFIG_SHA256"],
+                    "index_sha256": versions["TARGET_MODEL_INDEX_SHA256"],
+                    "license": versions["TARGET_MODEL_LICENSE"],
+                    "license_file": versions["TARGET_MODEL_LICENSE_FILE"],
+                    "license_sha256": versions["TARGET_MODEL_LICENSE_SHA256"],
+                },
+                "source": {
+                    "repository": versions["TARGET_SOURCE_REPO"],
+                    "revision": versions["TARGET_SOURCE_REVISION"],
+                    "config_sha256": versions["TARGET_SOURCE_CONFIG_SHA256"],
+                    "index_sha256": versions["TARGET_SOURCE_INDEX_SHA256"],
+                },
+            },
+            "dflash": {
+                "artifact": {
+                    "repository": versions["DFLASH_MODEL_REPO"],
+                    "revision": versions["DFLASH_MODEL_REVISION"],
+                    "conversion_manifest_sha256": versions[
+                        "DFLASH_MODEL_CONVERSION_MANIFEST_SHA256"
+                    ],
+                    "config_sha256": versions["DFLASH_MODEL_CONFIG_SHA256"],
+                    "weights_sha256": versions["DFLASH_MODEL_WEIGHTS_SHA256"],
+                    "license": versions["DFLASH_MODEL_LICENSE"],
+                },
+                "source": {
+                    "repository": versions["DFLASH_SOURCE_REPO"],
+                    "revision": versions["DFLASH_SOURCE_REVISION"],
+                    "config_sha256": versions["DFLASH_SOURCE_CONFIG_SHA256"],
+                    "weights_sha256": versions["DFLASH_SOURCE_WEIGHTS_SHA256"],
+                },
+            },
         },
         "chat_template": {
             "source_revision": "690b705278a3a58e538fcb37c2ca8b5f9511213c",

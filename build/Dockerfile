@@ -8,6 +8,8 @@ ARG FLASHINFER_COMMIT
 ARG SPARKINFER_COMMIT
 ARG EXLLAMAV3_COMMIT
 ARG B12X_COMMIT
+ARG RUNNER_VERSION
+ARG RUNNER_SOURCE_URL
 
 ENV FLASHINFER_CUDA_ARCH_LIST=12.1a \
     FLASHINFER_WORKSPACE_BASE=/cache/jit/flashinfer/${FLASHINFER_COMMIT} \
@@ -30,8 +32,9 @@ RUN cd /opt/glm53-runner-artifacts \
     && /usr/bin/python3 /opt/verify_runtime.py --build-only \
     && rm -rf /root/.cache/pip
 
-LABEL org.opencontainers.image.source="https://github.com/cbertucci33/vllm-v29-glm53flash-exl3-dgx" \
+LABEL org.opencontainers.image.source="${RUNNER_SOURCE_URL}" \
       org.opencontainers.image.revision="${VLLM_COMMIT}" \
+      org.opencontainers.image.version="${RUNNER_VERSION}" \
       org.opencontainers.image.base.name="${BASE_IMAGE}" \
       io.glm53runner.flashinfer.revision="${FLASHINFER_COMMIT}" \
       io.glm53runner.sparkinfer.revision="${SPARKINFER_COMMIT}" \

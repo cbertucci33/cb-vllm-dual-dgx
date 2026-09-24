@@ -236,6 +236,22 @@ def verify_build() -> dict[str, str]:
     provenance = json.loads(
         Path("/opt/glm53-runner-provenance.json").read_text(encoding="utf-8")
     )
+    if provenance.get("schema_version") != 2:
+        raise RuntimeError("runner provenance schema mismatch")
+    runner = provenance.get("runner", {})
+    if runner.get("version") != "3.1" or not runner.get("source"):
+        raise RuntimeError("runner release provenance mismatch")
+    for model_name in ("target", "dflash"):
+        model = provenance.get("models", {}).get(model_name, {})
+        for stage in ("artifact", "source"):
+            identity = model.get(stage, {})
+            if (
+                not identity.get("repository")
+                or len(identity.get("revision", "")) != 40
+            ):
+                raise RuntimeError(
+                    f"incomplete {model_name} {stage} provenance"
+                )
     flashinfer_commit = Path(os.environ.get("FLASHINFER_WORKSPACE_BASE", "")).name
     if flashinfer_commit != provenance["external_revisions"]["flashinfer"]:
         raise RuntimeError("FlashInfer JIT workspace is not keyed by source revision")

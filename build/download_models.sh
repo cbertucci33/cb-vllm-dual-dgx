@@ -36,6 +36,21 @@ hf cache verify "$DFLASH_MODEL_REPO" \
   --local-dir "$output_dir/dflash2" \
   --fail-on-missing-files --fail-on-extra-files
 
+provenance_dir="$output_dir/provenance"
+hf download "$TARGET_SOURCE_REPO" config.json model.safetensors.index.json \
+  --revision "$TARGET_SOURCE_REVISION" \
+  --local-dir "$provenance_dir/target-source"
+hf download "$DFLASH_SOURCE_REPO" config.json \
+  --revision "$DFLASH_SOURCE_REVISION" \
+  --local-dir "$provenance_dir/dflash-source"
+
+python3 "$script_dir/verify_model_provenance.py" \
+  "$output_dir/target" \
+  "$output_dir/dflash2" \
+  "$provenance_dir/target-source" \
+  "$provenance_dir/dflash-source" \
+  "$script_dir/versions.env"
+
 test -f "$output_dir/target/config.json"
 test -f "$output_dir/dflash2/config.json"
-echo "downloaded and verified both pinned model revisions in $output_dir"
+echo "downloaded and verified both model artifacts and their source provenance in $output_dir"
