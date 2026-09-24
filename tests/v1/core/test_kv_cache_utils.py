@@ -35,6 +35,7 @@ from vllm.multimodal.inputs import (
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor, xxhash, xxhash_cbor
 from vllm.utils.mem_constants import GiB_bytes
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -57,6 +58,7 @@ from vllm.v1.core.kv_cache_utils import (
     make_block_hash_with_group_id,
     tensor_data,
 )
+from vllm.v1.core.single_type_kv_cache_manager import DFlashRingManager
 from vllm.v1.hisparse.layout import (
     create_hisparse_layout,
     get_hisparse_gpu_memory_usage,
@@ -110,6 +112,39 @@ def test_dflash_replay_reserve_uses_last_safe_aligned_boundary():
     assert reserve == 96
     assert get_draft_replay_boundary(257, reserve, 64) == 128
     assert get_draft_replay_boundary(64, reserve, 64) == 0
+
+
+def test_dflash_private_ring_is_not_prefix_cached():
+    """Long prompts must not hash worker-owned DFlash ring storage."""
+    spec = DFlashSWASpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float16,
+        sliding_window=96,
+        private_ring=True,
+    )
+    manager = DFlashRingManager(
+        kv_cache_spec=spec,
+        block_pool=BlockPool(
+            num_gpu_blocks=4,
+            enable_caching=True,
+            hash_block_size=16,
+        ),
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=64,
+    )
+    request = SimpleNamespace(
+        request_id="long-prompt",
+        shared_prefix_boundary=0,
+        block_hashes=[],
+    )
+
+    manager.cache_blocks(request, 8192, replay_boundaries=[])
+
+    assert manager.num_cached_block == {}
+    assert manager.req_to_blocks == {}
 
 
 @pytest.mark.parametrize("gpu_block_size", [32, 64])
