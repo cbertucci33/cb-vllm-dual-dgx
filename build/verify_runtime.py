@@ -71,6 +71,25 @@ REQUIRED_TOPK_EXPORTS = (
     "can_implement_filtered_topk",
 )
 
+FLASHKDA_FWD_ARGUMENTS = (
+    "q",
+    "k",
+    "v",
+    "g",
+    "beta",
+    "scale",
+    "out",
+    "workspace",
+    "A_log",
+    "dt_bias",
+    "lower_bound",
+    "initial_state",
+    "final_state",
+    "cu_seqlens",
+    "checkpoint_state",
+    "checkpoint_offsets",
+)
+
 
 def package_root(distribution: str) -> Path:
     return Path(importlib.metadata.distribution(distribution).locate_file(""))
@@ -101,13 +120,15 @@ def sha256(path: Path) -> str:
 def function_parameters(path: Path, function_name: str) -> set[str]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     for node in tree.body:
-        if isinstance(
-            node,
-            (ast.FunctionDef, ast.AsyncFunctionDef),
-        ) and node.name == function_name:
+        if (
+            isinstance(
+                node,
+                (ast.FunctionDef, ast.AsyncFunctionDef),
+            )
+            and node.name == function_name
+        ):
             return {
-                argument.arg
-                for argument in (*node.args.posonlyargs, *node.args.args)
+                argument.arg for argument in (*node.args.posonlyargs, *node.args.args)
             } | {argument.arg for argument in node.args.kwonlyargs}
     raise RuntimeError(f"{function_name} is missing from {path}")
 
@@ -118,21 +139,21 @@ def source_signature(
 ) -> tuple[tuple[str, str], ...]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     for node in tree.body:
-        if isinstance(
-            node,
-            (ast.FunctionDef, ast.AsyncFunctionDef),
-        ) and node.name == function_name:
+        if (
+            isinstance(
+                node,
+                (ast.FunctionDef, ast.AsyncFunctionDef),
+            )
+            and node.name == function_name
+        ):
             positional_only = tuple(
-                (argument.arg, "POSITIONAL_ONLY")
-                for argument in node.args.posonlyargs
+                (argument.arg, "POSITIONAL_ONLY") for argument in node.args.posonlyargs
             )
             positional_or_keyword = tuple(
-                (argument.arg, "POSITIONAL_OR_KEYWORD")
-                for argument in node.args.args
+                (argument.arg, "POSITIONAL_OR_KEYWORD") for argument in node.args.args
             )
             keyword_only = tuple(
-                (argument.arg, "KEYWORD_ONLY")
-                for argument in node.args.kwonlyargs
+                (argument.arg, "KEYWORD_ONLY") for argument in node.args.kwonlyargs
             )
             var_positional = (
                 ((node.args.vararg.arg, "VAR_POSITIONAL"),)
@@ -174,6 +195,8 @@ def verify_build() -> dict[str, str]:
     vllm_root = site_root / "vllm"
     core_extension = require_one(vllm_root, "_C_stable_libtorch*.so")
     require_cuda_architecture(core_extension, "sm_120")
+    flashkda_extension = require_one(vllm_root, "_flashkda_C*.so")
+    require_cuda_architecture(flashkda_extension, "sm_120")
     require_one(vllm_root, "_rust_tool_parser*.so")
     if not (vllm_root / "vllm-rs").is_file():
         raise RuntimeError("vLLM Rust frontend binary is missing")
@@ -206,9 +229,7 @@ def verify_build() -> dict[str, str]:
     provenance = json.loads(
         Path("/opt/glm53-runner-provenance.json").read_text(encoding="utf-8")
     )
-    flashinfer_commit = Path(
-        os.environ.get("FLASHINFER_WORKSPACE_BASE", "")
-    ).name
+    flashinfer_commit = Path(os.environ.get("FLASHINFER_WORKSPACE_BASE", "")).name
     if flashinfer_commit != provenance["external_revisions"]["flashinfer"]:
         raise RuntimeError("FlashInfer JIT workspace is not keyed by source revision")
 
@@ -270,7 +291,17 @@ def verify_runtime() -> dict[str, str]:
     from sparkinfer.moe import trellis_moe
 
     importlib.import_module("vllm._C_stable_libtorch")
+    importlib.import_module("vllm._flashkda_C")
     importlib.import_module("vllm._rust_tool_parser")
+    flashkda_fwd = torch.ops._flashkda_C.fwd.default
+    flashkda_arguments = tuple(arg.name for arg in flashkda_fwd._schema.arguments)
+    if flashkda_arguments != FLASHKDA_FWD_ARGUMENTS:
+        raise RuntimeError(
+            "FlashKDA fwd schema mismatch: "
+            f"expected {FLASHKDA_FWD_ARGUMENTS}, got {flashkda_arguments}"
+        )
+    if not hasattr(torch.ops._flashkda_C, "get_workspace_size"):
+        raise RuntimeError("FlashKDA workspace query is missing")
     missing = [
         name for name in required_trellis_symbols if not hasattr(trellis_moe, name)
     ]
