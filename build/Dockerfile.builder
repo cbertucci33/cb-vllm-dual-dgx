@@ -10,3 +10,8 @@ FROM ${BASE_IMAGE}
 # toolchain into the isolated builder only. Runtime images still start from the
 # untouched official vLLM base.
 COPY --from=cuda_devel /usr/local/cuda-13.0/ /usr/local/cuda-13.0/
+
+# The v0.30 base ships FlashInfer 0.6 AOT packages whose shim API predates the
+# pinned 0.7 source. Artifact builds use the pinned source and must not import
+# those incompatible providers.
+RUN /usr/bin/python3 -m pip uninstall -y flashinfer-jit-cache flashinfer-cubin

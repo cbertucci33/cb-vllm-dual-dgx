@@ -23,11 +23,10 @@ RUN cd /opt/glm53-runner-artifacts \
     && sha256sum -c artifact-sha256.txt \
     && install -m 0755 ./_C_stable_libtorch*.so \
        /usr/local/lib/python3.12/dist-packages/vllm/_C_stable_libtorch.abi3.so \
+    && /usr/bin/python3 -m pip uninstall -y flashinfer-jit-cache flashinfer-cubin \
     && /usr/bin/python3 -m pip install --no-deps --force-reinstall ./*.whl \
-    && install -m 0755 ./flashinfer-topk-sm121.so \
-       /usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache/jit_cache/topk/topk.so \
-    && rm -rf \
-       /usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache/jit_cache/sparse_mla_sm120 \
+    && install -D -m 0755 ./flashinfer-topk-sm121.so \
+       /usr/local/lib/python3.12/dist-packages/flashinfer/data/aot/topk/topk.so \
     && /usr/bin/python3 /opt/verify_runtime.py --build-only \
     && rm -rf /root/.cache/pip
 

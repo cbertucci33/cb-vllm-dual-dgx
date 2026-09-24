@@ -216,16 +216,23 @@ def verify_build() -> dict[str, str]:
             f"{sorted(missing_parameters)}"
         )
 
-    topk_module = site_root / "flashinfer_jit_cache/jit_cache/topk/topk.so"
+    topk_module = site_root / "flashinfer/data/aot/topk/topk.so"
     if not topk_module.is_file():
         raise RuntimeError("matching FlashInfer TopK module is missing")
     require_cuda_architecture(topk_module, "sm_121")
-    stale_sparse_mla = (
+    stale_sparse_mla = site_root / "flashinfer/data/aot/sparse_mla_sm120"
+    stale_release_sparse_mla = (
         site_root
         / "flashinfer_jit_cache/jit_cache/sparse_mla_sm120/sparse_mla_sm120.so"
     )
-    if stale_sparse_mla.exists():
+    if stale_sparse_mla.exists() or stale_release_sparse_mla.exists():
         raise RuntimeError("stale release sparse-MLA AOT module is still installed")
+    try:
+        importlib.metadata.version("flashinfer-jit-cache")
+    except importlib.metadata.PackageNotFoundError:
+        pass
+    else:
+        raise RuntimeError("incompatible release FlashInfer JIT cache is installed")
     provenance = json.loads(
         Path("/opt/glm53-runner-provenance.json").read_text(encoding="utf-8")
     )
