@@ -12,13 +12,23 @@ output_dir=$(realpath -m "$3")
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$script_dir/versions.env"
 
-actual_commit=$(git -C "$source_dir" rev-parse HEAD)
+if command -v git >/dev/null 2>&1; then
+  actual_commit=$(git -C "$source_dir" rev-parse HEAD)
+  source_date_epoch=$(git -C "$source_dir" show -s --format=%ct HEAD)
+  if [[ -n $(git -C "$source_dir" status --porcelain) ]]; then
+    echo "FlashInfer source is not clean: $source_dir" >&2
+    exit 1
+  fi
+else
+  actual_commit=${FLASHINFER_SOURCE_COMMIT:-}
+  source_date_epoch=${FLASHINFER_SOURCE_DATE_EPOCH:-}
+fi
 if [[ $actual_commit != "$FLASHINFER_COMMIT" ]]; then
   echo "FlashInfer source is $actual_commit, expected $FLASHINFER_COMMIT" >&2
   exit 1
 fi
-if [[ -n $(git -C "$source_dir" status --porcelain) ]]; then
-  echo "FlashInfer source is not clean: $source_dir" >&2
+if [[ ! $source_date_epoch =~ ^[0-9]+$ ]]; then
+  echo "FlashInfer source date epoch is invalid: $source_date_epoch" >&2
   exit 1
 fi
 (cd "$build_deps_dir" && sha256sum -c build-deps-sha256.txt)
@@ -37,8 +47,7 @@ fi
 
 export BUILD_NVEP=0 BUILD_NIXL_EP=0 BUILD_NCCL_EP=0
 export FLASHINFER_BUILD_NO_PIP=1
-export SOURCE_DATE_EPOCH
-SOURCE_DATE_EPOCH=$(git -C "$source_dir" show -s --format=%ct HEAD)
+export SOURCE_DATE_EPOCH=$source_date_epoch
 
 /usr/bin/python3 -m pip wheel --no-deps --no-build-isolation \
   --wheel-dir "$output_dir" "$source_dir"

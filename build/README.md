@@ -83,6 +83,8 @@ repo=$(pwd)
 work=/srv/glm53/build
 run_builder() {
   docker run --rm --gpus all --entrypoint /bin/bash \
+    -e FLASHINFER_SOURCE_COMMIT="$FLASHINFER_COMMIT" \
+    -e FLASHINFER_SOURCE_DATE_EPOCH="$FLASHINFER_SOURCE_DATE_EPOCH" \
     -v "$repo:/repo:ro" \
     -v "$work:/work" \
     -w /repo \
