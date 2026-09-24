@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GLM-5.3-Flash KDA layer with separate convolutions and a bounded safe gate."""
 
+from dataclasses import replace
+
 import torch
 from torch import nn
 
@@ -33,10 +35,17 @@ from vllm.model_executor.utils import (
     maybe_disable_graph_partition,
     set_weight_attrs,
 )
+from vllm.models.kimi_k3.nvidia.kda import (
+    _flashkda_prefill,
+    _store_cache_checkpoints_kernel,
+)
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
+from vllm.triton_utils import triton
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if current_platform.is_rocm():
@@ -154,6 +163,21 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
     head_dim: int
     num_heads: int
     conv_size: int
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> MambaSpec:
+        spec = super().get_kv_cache_spec(vllm_config)
+        assert isinstance(spec, MambaSpec)
+        checkpoint_enabled = self.kda_prefill_backend == "flashkda"
+        if checkpoint_enabled and vllm_config.cache_config.prefix_match_unit is None:
+            raise ValueError(
+                "FlashKDA prefill checkpoints require an explicit "
+                "prefix_match_unit"
+            )
+        return replace(
+            spec,
+            num_prefill_checkpoint_blocks=int(checkpoint_enabled),
+            prefill_checkpoint_alignment=16 if checkpoint_enabled else None,
+        )
 
     def get_state_dtype(
         self,
@@ -340,62 +364,19 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             )
             self._flashkda_buffer_specs = (
                 (
+                    (1, max_tokens, self.local_num_heads, self.head_dim),
+                    vllm_config.model_config.dtype,
+                ),
+                (
+                    (max_seqs, self.local_num_heads, self.head_dim, self.head_dim),
+                    self.get_state_dtype()[1],
+                ),
+                (
                     (max_seqs, self.local_num_heads, self.head_dim, self.head_dim),
                     self.get_state_dtype()[1],
                 ),
                 ((workspace_size,), torch.uint8),
-                # Output buffer for steps that also carry spec-decode tokens:
-                # the non-spec tokens are then scattered by non_spec_token_indx.
-                (
-                    (1, max_tokens, self.local_num_heads, self.head_dim),
-                    vllm_config.model_config.dtype,
-                ),
             )
-
-    def _flashkda_prefill(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-        initial_state: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        out: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Fused KDA chunked prefill (FlashKDA). Takes the raw gate logits ``g``
-        and raw ``beta`` logits, l2-normalizes q/k in-kernel and applies the
-        bounded gate ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``,
-        matching ``chunk_kda_with_fused_gate(..., safe_gate=True)``. Writes the
-        attention output into ``out`` (a workspace buffer when ``None``) and
-        returns ``(out, final_state)``."""
-        assert self._flashkda_buffer_specs is not None
-        final_state, workspace, workspace_out = (
-            current_workspace_manager().get_simultaneous(*self._flashkda_buffer_specs)
-        )
-        final_state = final_state[: initial_state.shape[0]]
-        if out is None:
-            out = workspace_out[:, : q.shape[1]]
-        # FlashKDA hardcodes dense q/k/v/g strides; beta may be row-strided.
-        torch.ops._flashkda_C.fwd(
-            q.contiguous(),
-            k.contiguous(),
-            v.contiguous(),
-            g.contiguous(),
-            beta,
-            self.head_dim**-0.5,
-            out,
-            workspace,
-            self.A_log.view(-1),
-            self.dt_bias.view(-1, self.head_dim),
-            self.kda_lower_bound,
-            initial_state.contiguous(),
-            final_state,
-            cu_seqlens.contiguous(),
-            None,
-            None,
-        )
-        return out, final_state
 
     def forward(
         self,
@@ -565,6 +546,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             q_spec, k_spec, v_spec = qkv_spec.split(self.local_projection_size, dim=-1)
 
         # --- causal conv1d: non-spec path (prefill or plain decode) ---
+        raw_qkv_ns = qkv_ns
         q_ns = k_ns = v_ns = None
         if attn_metadata_narrowed.num_prefills > 0:
             assert qkv_ns is not None
@@ -649,20 +631,83 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 recurrent_state, non_spec_state_indices_tensor, has_initial_state
             )
             if self.kda_prefill_backend == "flashkda":
+                assert self._flashkda_buffer_specs is not None
+                workspace_out, final_state, checkpoint_state, workspace = (
+                    current_workspace_manager().get_simultaneous(
+                        *self._flashkda_buffer_specs
+                    )
+                )
                 # Non-spec step: write straight into the layer output buffer
                 # (dense token order, no merge copy). Step with spec-decode
                 # tokens: write to the workspace buffer and scatter below.
                 ns_out = None if use_spec else core_attn_out[:, :num_actual_tokens]
-                core_attn_out_non_spec, last_recurrent_state = self._flashkda_prefill(
+                flashkda_out = (
+                    workspace_out[:, : q_ns.shape[0]] if ns_out is None else ns_out
+                )
+                final_state = final_state[: initial_state.shape[0]]
+                checkpoint = attn_metadata_narrowed.checkpoint
+                checkpoint_state_out = (
+                    checkpoint_state[: initial_state.shape[0]]
+                    if checkpoint is not None
+                    else None
+                )
+                core_attn_out_non_spec, last_recurrent_state = _flashkda_prefill(
                     q=_rearr(q_ns),
                     k=_rearr(k_ns),
                     v=_rearr(v_ns),
                     g=g1_ns,
                     beta=beta_ns,
+                    A_log=self.A_log.view(-1),
+                    dt_bias=self.dt_bias,
+                    lower_bound=lower_bound,
                     initial_state=initial_state,
                     cu_seqlens=non_spec_query_start_loc,
-                    out=ns_out,
+                    out=flashkda_out,
+                    final_state=final_state,
+                    workspace=workspace,
+                    checkpoint_state=checkpoint_state_out,
+                    checkpoint_offsets=(
+                        checkpoint.checkpoint_offsets
+                        if checkpoint is not None
+                        else None
+                    ),
                 )
+                if checkpoint is not None:
+                    assert raw_qkv_ns is not None
+                    assert checkpoint_state_out is not None
+                    state_len = self.conv_size - 1
+                    width = raw_qkv_ns.shape[-1]
+                    recurrent_row_size = checkpoint_state_out[0].numel()
+                    block_size = 256
+                    _store_cache_checkpoints_kernel[
+                        (
+                            checkpoint.checkpoint_offsets.numel(),
+                            triton.cdiv(
+                                max(width * state_len, recurrent_row_size), block_size
+                            ),
+                        )
+                    ](
+                        raw_qkv_ns,
+                        conv_state,
+                        checkpoint_state_out,
+                        recurrent_state,
+                        non_spec_query_start_loc,
+                        checkpoint.checkpoint_offsets,
+                        checkpoint.state_indices,
+                        raw_qkv_ns.stride(0),
+                        raw_qkv_ns.stride(1),
+                        conv_state.stride(0),
+                        conv_state.stride(1),
+                        conv_state.stride(2),
+                        checkpoint_state_out.stride(0),
+                        recurrent_state.stride(0),
+                        checkpoint.checkpoint_offsets.stride(0),
+                        state_len,
+                        width,
+                        recurrent_row_size,
+                        NULL_BLOCK_ID,
+                        block_size,
+                    )
             else:
                 (
                     core_attn_out_non_spec,

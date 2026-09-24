@@ -21,6 +21,7 @@ from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
 )
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import MambaSpec
 
 BLOCK_SIZE = 16
@@ -125,6 +126,9 @@ GDN_BUILD_TEST_CASES = {
 def _create_gdn_builder(
     num_speculative_tokens: int = 0,
     full_cuda_graph: bool = False,
+    mamba_cache_mode: str = "none",
+    num_prefill_checkpoint_blocks: int = 0,
+    prefix_match_unit: int | None = None,
 ) -> GDNAttentionMetadataBuilder:
     """Create a GDNAttentionMetadataBuilder with minimal config."""
     vllm_config = create_vllm_config(
@@ -138,10 +142,17 @@ def _create_gdn_builder(
             method="ngram",
             num_speculative_tokens=num_speculative_tokens,
         )
+    vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
+    vllm_config.cache_config.prefix_match_unit = prefix_match_unit
     mamba_spec = MambaSpec(
         block_size=BLOCK_SIZE,
         shapes=((16, 64),),
         dtypes=(torch.float16,),
+        mamba_cache_mode=mamba_cache_mode,
+        num_prefill_checkpoint_blocks=num_prefill_checkpoint_blocks,
+        prefill_checkpoint_alignment=(
+            16 if num_prefill_checkpoint_blocks > 0 else None
+        ),
     )
     return GDNAttentionMetadataBuilder(
         kv_cache_spec=mamba_spec,
@@ -196,6 +207,30 @@ def test_has_initial_state_after_reclassification():
     assert meta.has_initial_state is not None
     # req0 has context_lens = 65 - 1 = 64 > 0, so has_initial_state[0] = True
     assert meta.has_initial_state[0].item() is True
+
+
+def test_internal_checkpoint_metadata_targets_last_aligned_boundary():
+    builder = _create_gdn_builder(
+        mamba_cache_mode="align",
+        num_prefill_checkpoint_blocks=1,
+        prefix_match_unit=BLOCK_SIZE,
+    )
+    batch = BatchSpec(seq_lens=[50, 32], query_lens=[50, 16])
+    common = create_common_attn_metadata(
+        batch, BLOCK_SIZE, DEVICE, arange_block_indices=True
+    )
+
+    meta = builder.build(common_prefix_len=0, common_attn_metadata=common)
+
+    assert meta.checkpoint is not None
+    torch.testing.assert_close(
+        meta.checkpoint.state_indices,
+        torch.tensor([2, NULL_BLOCK_ID], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        meta.checkpoint.checkpoint_offsets,
+        torch.tensor([48, 0], dtype=torch.int32),
+    )
 
 
 def test_full_cudagraph_spec_metadata_uses_request_count():

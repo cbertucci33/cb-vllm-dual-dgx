@@ -8,6 +8,7 @@ from typing import Literal
 import torch
 
 from vllm.config import VllmConfig
+from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -21,7 +22,11 @@ from vllm.v1.attention.backends.utils import (
     mamba_get_block_table_tensor,
     split_decodes_and_prefills,
 )
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import (
+    MambaSpec,
+    get_mamba_prefill_checkpoint_position,
+    is_mamba_prefill_checkpoint_valid,
+)
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -39,6 +44,12 @@ class GDNAttentionBackend(AttentionBackend):
 
 
 @dataclass
+class KDACheckpointMetadata:
+    checkpoint_offsets: torch.Tensor
+    state_indices: torch.Tensor
+
+
+@dataclass
 class GDNAttentionMetadata:
     num_prefills: int
     num_prefill_tokens: int
@@ -48,6 +59,7 @@ class GDNAttentionMetadata:
     num_spec_decode_tokens: int
     num_actual_tokens: int
 
+    checkpoint: KDACheckpointMetadata | None = None
     has_initial_state: torch.Tensor | None = None
 
     spec_query_start_loc: torch.Tensor | None = None  # shape: [num_spec_decodes + 1,]
@@ -205,6 +217,79 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 device=device,
             ),
         )
+
+    def _build_checkpoint_metadata(
+        self,
+        m: CommonAttentionMetadata,
+        request_rows: list[int],
+    ) -> KDACheckpointMetadata | None:
+        if (
+            self.vllm_config.cache_config.mamba_cache_mode != "align"
+            or self.kv_cache_spec.num_prefill_checkpoint_blocks == 0
+        ):
+            return None
+
+        assert m.seq_lens_cpu_upper_bound is not None
+        all_query_lens = m.query_start_loc_cpu.diff().tolist()
+        query_lens = [all_query_lens[row] for row in request_rows]
+        seq_lens = m.seq_lens_cpu_upper_bound.tolist()
+        block_size = self.kv_cache_spec.block_size
+        hash_block_size = self.vllm_config.cache_config.prefix_match_unit
+        if hash_block_size is None:
+            raise ValueError(
+                "KDA prefill checkpoints require an explicit prefix_match_unit"
+            )
+        speculative_config = self.vllm_config.speculative_config
+        drop_eagle_block = (
+            speculative_config is not None
+            and speculative_config.use_eagle_block_drop()
+        )
+        checkpoint_splits: list[tuple[int, int]] = []
+        checkpoint_cols: list[int] = []
+        for row, query_len in zip(request_rows, query_lens):
+            seq_len = seq_lens[row]
+            query_start = seq_len - query_len
+            checkpoint_position = get_mamba_prefill_checkpoint_position(
+                seq_len,
+                hash_block_size,
+                drop_eagle_block=drop_eagle_block,
+            )
+            valid = is_mamba_prefill_checkpoint_valid(
+                query_start=query_start,
+                query_end=seq_len,
+                checkpoint_position=checkpoint_position,
+                hash_block_size=hash_block_size,
+                mamba_block_size=block_size,
+                checkpoint_alignment=self.kv_cache_spec.prefill_checkpoint_alignment,
+            )
+            offset = checkpoint_position - query_start if valid else 0
+            first_len = offset or query_len
+            checkpoint_splits.append((first_len, query_len - first_len))
+            checkpoint_cols.append(cdiv(seq_len, block_size) - 2 if valid else -1)
+
+        if not any(tail for _, tail in checkpoint_splits):
+            return None
+
+        checkpoint_offsets = async_tensor_h2d(
+            [first if tail else 0 for first, tail in checkpoint_splits],
+            dtype=torch.int32,
+            device=m.query_start_loc.device,
+        )
+        request_rows_tensor = async_tensor_h2d(
+            request_rows, dtype=torch.int64, device=m.query_start_loc.device
+        )
+        checkpoint_cols_tensor = async_tensor_h2d(
+            checkpoint_cols, dtype=torch.int64, device=m.query_start_loc.device
+        )
+        checkpoint_state_indices = m.block_table_tensor[
+            request_rows_tensor, checkpoint_cols_tensor
+        ]
+        checkpoint_state_indices = torch.where(
+            checkpoint_cols_tensor >= 0,
+            checkpoint_state_indices,
+            NULL_BLOCK_ID,
+        )
+        return KDACheckpointMetadata(checkpoint_offsets, checkpoint_state_indices)
 
     def build(  # type: ignore[override]
         self,
@@ -493,7 +578,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
             non_spec_query_start_loc[num_decodes + 1 :].fill_(non_spec_num_query_tokens)
 
+        checkpoint = None
+        if num_prefills > 0:
+            request_rows = list(range(m.num_reqs))
+            if spec_sequence_masks_cpu is not None:
+                request_rows = (~spec_sequence_masks_cpu).nonzero().flatten().tolist()
+            checkpoint = self._build_checkpoint_metadata(m, request_rows)
+
         attn_metadata = GDNAttentionMetadata(
+            checkpoint=checkpoint,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             num_decodes=num_decodes,
