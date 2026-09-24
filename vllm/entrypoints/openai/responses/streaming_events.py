@@ -53,6 +53,7 @@ from openai.types.responses import (
     ResponseWebSearchCallSearchingEvent,
     response_function_web_search,
     response_text_delta_event,
+    response_text_done_event,
 )
 from openai.types.responses.response_output_item import McpCall
 from openai.types.responses.response_output_text import Logprob as OutputTextLogprob
@@ -852,6 +853,25 @@ def _output_text_logprobs(
     ]
 
 
+def _text_done_logprobs(
+    logprobs: list[OutputTextLogprob],
+) -> list[response_text_done_event.Logprob]:
+    return [
+        response_text_done_event.Logprob(
+            token=lp.token,
+            logprob=lp.logprob,
+            top_logprobs=[
+                response_text_done_event.LogprobTopLogprob(
+                    token=top.token,
+                    logprob=top.logprob,
+                )
+                for top in lp.top_logprobs
+            ],
+        )
+        for lp in logprobs
+    ]
+
+
 def emit_simple_content_open(
     state: SimpleStreamingState,
 ) -> list[StreamingResponsesResponse]:
@@ -926,7 +946,7 @@ def emit_simple_content_done(
             output_index=state.output_index,
             content_index=state.content_index,
             text=state.accumulated_text,
-            logprobs=[],
+            logprobs=_text_done_logprobs(state.accumulated_logprobs),
             item_id=state.current_item_id,
         ),
         ResponseContentPartDoneEvent(

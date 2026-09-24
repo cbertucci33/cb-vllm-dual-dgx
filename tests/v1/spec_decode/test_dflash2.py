@@ -152,6 +152,7 @@ def test_ring_synthesis_covers_context_and_draft_queries():
         idx_mapping,
         seq_lens,
         block_size=4,
+        ring_base=1,
         ring_size=ring_size,
         num_query_per_req=5,
     )

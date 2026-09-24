@@ -40,6 +40,7 @@ def _synthesize_draft_ring_block_tables_kernel(
     idx_mapping_ptr,
     seq_lens_ptr,
     block_size,
+    ring_base,
     ring_size,
     num_query_per_req,
     BLOCK_SIZE: tl.constexpr,
@@ -49,7 +50,7 @@ def _synthesize_draft_ring_block_tables_kernel(
     seq_len = tl.load(seq_lens_ptr + batch_idx)
     num_blocks = (seq_len + num_query_per_req + block_size - 1) // block_size
     row_ptr = block_table_ptr + batch_idx.to(tl.int64) * block_table_stride
-    base = 1 + req_state_idx * ring_size
+    base = ring_base + req_state_idx * ring_size
     for start in tl.range(0, block_table_stride, BLOCK_SIZE):
         offsets = start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < block_table_stride
@@ -62,6 +63,7 @@ def synthesize_draft_ring_block_tables(
     idx_mapping: torch.Tensor,
     seq_lens: torch.Tensor,
     block_size: int,
+    ring_base: int,
     ring_size: int,
     num_query_per_req: int,
 ) -> None:
@@ -72,6 +74,7 @@ def synthesize_draft_ring_block_tables(
         idx_mapping,
         seq_lens,
         block_size,
+        ring_base,
         ring_size,
         num_query_per_req,
         BLOCK_SIZE=256,  # type: ignore
@@ -154,6 +157,7 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
+        self.draft_ring_base: dict[int, int] = {}
         self.draft_ring_size: dict[int, int] = {}
 
     @property
@@ -264,8 +268,17 @@ class DFlashSpeculator(DraftModelSpeculator):
                 for t in kv_cache_config.kv_cache_tensors
                 if names.intersection(t.layers)
             )
-            pages = tensor.layer_stride // spec.page_size_bytes
-            self.draft_ring_size[gid] = (pages - 1) // self.max_num_reqs
+            manager_pages = tensor.layer_stride // spec.page_size_bytes
+            ring_manager_pages = (manager_pages - 1) // self.max_num_reqs
+            assert (
+                ring_manager_pages > 0
+                and 1 + self.max_num_reqs * ring_manager_pages == manager_pages
+            )
+            kernel_pages_per_manager_page = self.block_tables.blocks_per_kv_block[gid]
+            self.draft_ring_base[gid] = kernel_pages_per_manager_page
+            self.draft_ring_size[gid] = (
+                ring_manager_pages * kernel_pages_per_manager_page
+            )
 
         # Per-group context slot buffers for the precompute (one row per group).
         self._context_slot_mappings = torch.zeros(
@@ -442,6 +455,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 input_batch.idx_mapping,
                 input_batch.seq_lens,
                 self.block_tables.kernel_block_sizes[gid],
+                self.draft_ring_base[gid],
                 ring_size,
                 self.num_query_per_req,
             )

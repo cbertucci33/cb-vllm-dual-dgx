@@ -698,12 +698,12 @@ __device__ __noinline__ void histogram_streaming_topk(
     uint32_t equal_before = run_eq + (packed_rank >> 16);
 #pragma unroll
     for (int j = 0; j < kItems; ++j) {
-      if (is_gt[j] || (is_eq[j] && equal_before < remaining_k)) {
-        const uint32_t kept_equal_before =
-            equal_before < static_cast<uint32_t>(remaining_k)
-                ? equal_before
-                : static_cast<uint32_t>(remaining_k);
-        const uint32_t pos = greater_before + kept_equal_before;
+      if (is_gt[j]) {
+        const uint32_t pos = greater_before;
+        if (pos < static_cast<uint32_t>(TopK)) output_indices[pos] = mine + j;
+      } else if (is_eq[j] && equal_before < remaining_k) {
+        const uint32_t pos = static_cast<uint32_t>(TopK - remaining_k) +
+                             equal_before;
         if (pos < static_cast<uint32_t>(TopK)) output_indices[pos] = mine + j;
       }
       greater_before += is_gt[j];
