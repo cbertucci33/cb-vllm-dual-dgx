@@ -67,4 +67,8 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             del dflash_model.lm_head
         dflash_model.lm_head = target_lm_head
 
+    maybe_init_fp8_draft_head = getattr(dflash_model, "maybe_init_fp8_draft_head", None)
+    if maybe_init_fp8_draft_head is not None:
+        maybe_init_fp8_draft_head()
+
     return dflash_model

@@ -6,7 +6,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.model_executor.models.qwen3_dflash2 import _grouped_conv, _score_edges
+from vllm.model_executor.models.qwen3_dflash2 import (
+    CandidateSelector,
+    DFlashGroupedConv,
+    _grouped_conv,
+    _score_edges,
+)
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
 
@@ -104,6 +109,58 @@ def test_selector_edges_match_sequential_reference():
         )
 
     torch.testing.assert_close(actual, expected)
+
+
+def test_dflash2_projection_layers_receive_draft_quant_config(monkeypatch):
+    """MXFP8 scale tensors need quant-aware projection owners."""
+    from vllm.model_executor.models import qwen3_dflash2
+
+    captured = []
+
+    class FakeReplicatedLinear(torch.nn.Module):
+        def __init__(self, *args, quant_config=None, **kwargs):
+            super().__init__()
+            captured.append(quant_config)
+
+    monkeypatch.setattr(qwen3_dflash2, "ReplicatedLinear", FakeReplicatedLinear)
+    quant_config = object()
+    with torch.device("meta"):
+        DFlashGroupedConv(
+            hidden_size=16,
+            taps=3,
+            group_size=4,
+            block_size=8,
+            params_dtype=torch.bfloat16,
+            prefix="conv",
+            quant_config=quant_config,
+        )
+        CandidateSelector(
+            hidden_size=16,
+            vocab_size=32,
+            rank=8,
+            top_k=4,
+            params_dtype=torch.bfloat16,
+            prefix="selector",
+            quant_config=quant_config,
+        )
+
+    assert captured == [quant_config, quant_config]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_fp8_draft_head_logits_track_bf16_reference():
+    from vllm.model_executor.layers.fp8_draft_head import (
+        fp8_draft_head_logits,
+        quantize_draft_head,
+    )
+
+    torch.manual_seed(0)
+    hidden = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+    actual = fp8_draft_head_logits(hidden, quantize_draft_head(weight))
+    expected = hidden @ weight.t()
+
+    torch.testing.assert_close(actual, expected, atol=1.0, rtol=0.08)
 
 
 def _stub_base(monkeypatch, draft_logits):

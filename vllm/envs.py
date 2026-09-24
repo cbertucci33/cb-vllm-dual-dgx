@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     VLLM_DFLASH_KV_RING: bool = True
+    VLLM_DFLASH_FP8_DRAFT_HEAD: bool = False
     VLLM_HOST_IP: str = ""
     VLLM_PORT: int | None = None
     VLLM_RPC_BASE_PATH: str = tempfile.gettempdir()
@@ -607,6 +608,9 @@ def _resolve_rust_cli_path() -> str | None:
 
 environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DFLASH_KV_RING": lambda: os.getenv("VLLM_DFLASH_KV_RING", "1") == "1",
+    "VLLM_DFLASH_FP8_DRAFT_HEAD": lambda: bool(
+        int(os.getenv("VLLM_DFLASH_FP8_DRAFT_HEAD", "0"))
+    ),
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
     # rocm, cpu]
