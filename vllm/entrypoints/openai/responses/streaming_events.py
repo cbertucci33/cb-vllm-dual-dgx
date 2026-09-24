@@ -895,8 +895,8 @@ def emit_simple_content_delta(
     logprobs: list[response_text_delta_event.Logprob] | None = None,
 ) -> list[StreamingResponsesResponse]:
     state.accumulated_text += delta
-    if logprobs:
-        state.accumulated_logprobs.extend(_output_text_logprobs(logprobs))
+    output_logprobs = _output_text_logprobs(logprobs) if logprobs else []
+    state.accumulated_logprobs.extend(output_logprobs)
     return [
         ResponseTextDeltaEvent(
             type="response.output_text.delta",
@@ -905,7 +905,7 @@ def emit_simple_content_delta(
             output_index=state.output_index,
             item_id=state.current_item_id,
             delta=delta,
-            logprobs=logprobs or [],
+            logprobs=output_logprobs,
         )
     ]
 

@@ -67,7 +67,8 @@ def test_simple_streaming_ids_and_final_logprobs():
         logprob=-0.25,
         top_logprobs=[SimpleNamespace(token="e", logprob=-0.5)],
     )
-    emit_simple_content_delta(content_state, "é", [input_logprob])
+    content_delta = emit_simple_content_delta(content_state, "é", [input_logprob])[0]
+    assert content_delta.logprobs[0].bytes == list("é".encode())
     content_done = emit_simple_content_done(content_state)
     output_text = content_done[-1].item.content[0]
     assert output_text.logprobs is not None

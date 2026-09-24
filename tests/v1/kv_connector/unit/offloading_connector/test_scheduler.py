@@ -1521,6 +1521,7 @@ def _make_scheduler_with_lookup(
     scheduler = object.__new__(OffloadingConnectorScheduler)
     scheduler.manager = manager
     scheduler._events_tracker = MagicMock()
+    scheduler._mamba_align_size = None
     return scheduler
 
 
