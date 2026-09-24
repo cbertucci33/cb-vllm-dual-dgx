@@ -201,7 +201,7 @@ def verify_build() -> dict[str, str]:
     if not (vllm_root / "vllm-rs").is_file():
         raise RuntimeError("vLLM Rust frontend binary is missing")
 
-    flashinfer_source = site_root / "flashinfer/mla/_sparse_mla_sm120.py"
+    flashinfer_source = site_root / "flashinfer/mla/_sparse_mla_sm120/__init__.py"
     if "_MODEL_TYPE_GLM53_NOPE" not in flashinfer_source.read_text(encoding="utf-8"):
         raise RuntimeError("pinned FlashInfer package lacks GLM53_NOPE")
     flashinfer_core = site_root / "flashinfer/mla/_core.py"
