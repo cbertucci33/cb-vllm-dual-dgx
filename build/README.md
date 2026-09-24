@@ -156,12 +156,12 @@ The build recompiles the changed `_C_stable_libtorch` extension and overlays
 the Python package plus the required native artifacts. Unchanged vLLM native
 extensions, including the Rust frontend, remain from the official base image.
 
-The pinned GLM-qualified FlashInfer source retains package version 0.6.18 but
-is newer than that release tag and contains the GLM-5.3 NoPE sparse-MLA model
-type absent from 0.6.18.post1. vLLM 0.30 uses CUTLASS DSL 4.7.1. The Sparkinfer
-and B12X patches relax their older 4.6.x package constraints to the compatible
-4.7.x line. B12X 1.3.0 already contains the corrected MXFP8 capability
-predicate.
+The pinned FlashInfer 0.7.0 source is the exact revision used to validate
+compact 528-byte GLM-5.3 NoPE sparse-MLA rows in vLLM #58305. It includes
+FlashInfer #5075, which added runtime KV row strides and the compact-row model
+type. vLLM 0.30 uses CUTLASS DSL 4.7.1. The Sparkinfer and B12X patches relax
+their older 4.6.x package constraints to the compatible 4.7.x line. B12X 1.3.0
+already contains the corrected MXFP8 capability predicate.
 
 The ExLlamaV3 patch excludes optional x86 CPU all-reduce translation units on
 ARM64 and supplies fail-closed stubs. It does not change the CUDA EXL3 kernels.
