@@ -111,7 +111,9 @@ def test_selector_edges_match_sequential_reference():
     torch.testing.assert_close(actual, expected)
 
 
-def test_dflash2_projection_layers_receive_draft_quant_config(monkeypatch):
+def test_dflash2_projection_layers_receive_draft_quant_config(
+    monkeypatch, default_vllm_config
+):
     """MXFP8 scale tensors need quant-aware projection owners."""
     from vllm.model_executor.models import qwen3_dflash2
 
@@ -123,8 +125,10 @@ def test_dflash2_projection_layers_receive_draft_quant_config(monkeypatch):
             captured.append(quant_config)
 
     monkeypatch.setattr(qwen3_dflash2, "ReplicatedLinear", FakeReplicatedLinear)
+    from vllm.config import set_current_vllm_config
+
     quant_config = object()
-    with torch.device("meta"):
+    with set_current_vllm_config(default_vllm_config), torch.device("meta"):
         DFlashGroupedConv(
             hidden_size=16,
             taps=3,
