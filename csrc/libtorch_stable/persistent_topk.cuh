@@ -49,6 +49,9 @@ constexpr size_t kFixedSmemLarge =
 
 __device__ __forceinline__ auto convert_to_uint32_v2(float x) -> uint32_t {
   uint32_t bits = __float_as_uint(x);
+  // Numeric ties must have one key. Without canonicalization +0.0 and -0.0
+  // select different radix bins and violate deterministic index tie-breaking.
+  if ((bits & 0x7FFFFFFFu) == 0u) bits = 0u;
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
@@ -138,6 +141,9 @@ struct PersistentTopKParams {
   uint32_t chunk_size;      // large path: elements per CTA
   uint32_t ctas_per_group;  // 1=medium, >1=large
   uint32_t max_seq_len;     // max seq_len across all rows (for early CTA exit)
+  // <128KB-smem parts (GB10/consumer-Blackwell): run every row on one CTA via
+  // the exact streaming selector, never the multi-CTA cooperative barrier.
+  bool force_noncooperative = false;
 };
 
 // ============================================================================
@@ -426,7 +432,7 @@ __device__ __noinline__ void histogram_256_topk(
     const float* __restrict__ logits, int* __restrict__ output_indices,
     int logits_offset, int seq_len) {
   // All shared state lives in dynamic shared memory to avoid static
-  extern __shared__ char medium_smem[];
+  extern __shared__ __align__(16) char medium_smem[];
 
   int (*shared_histogram)[RADIX + 128] =
       reinterpret_cast<int (*)[RADIX + 128]>(medium_smem);
@@ -588,6 +594,123 @@ __device__ __noinline__ void histogram_256_topk(
         }
       }
     }
+    __syncthreads();
+  }
+}
+
+// Exact, non-cooperative, single-CTA streaming top-k for an arbitrarily long
+// row. The buffered medium selector can drop candidates at a dense pivot once
+// MAX_BUFFERED_ITEMS is exceeded. This variant re-streams the row for every
+// radix round, then emits values in descending order with ties resolved by
+// ascending source index. It needs only the fixed histogram shared memory.
+template <int TopK>
+__device__ __noinline__ void histogram_streaming_topk(
+    const float* __restrict__ logits, int* __restrict__ output_indices,
+    int logits_offset, int seq_len) {
+  extern __shared__ __align__(16) char medium_smem[];
+  int (*hist)[RADIX + 128] =
+      reinterpret_cast<int (*)[RADIX + 128]>(medium_smem);
+  int* scalars = reinterpret_cast<int*>(medium_smem + kMediumHistBytes);
+  int& shared_threshold_bin = scalars[0];
+
+  const int tid = threadIdx.x;
+  uint32_t prefix = 0u;
+  int remaining_k = TopK;
+
+  // Four most-significant-digit radix rounds over the order-preserving key.
+  for (int round = 0; round < 4; ++round) {
+    const int bit_offset = 24 - round * 8;
+    const uint32_t hi_mask =
+        (bit_offset + 8 >= 32) ? 0u : (~0u << (bit_offset + 8));
+
+    if (tid < RADIX + 1) hist[0][tid] = 0;
+    __syncthreads();
+
+    for (int idx = tid; idx < seq_len; idx += kThreadsPerBlock) {
+      const uint32_t key = convert_to_uint32_v2(logits[idx + logits_offset]);
+      if ((key & hi_mask) == (prefix & hi_mask)) {
+        atomicAdd(&hist[0][(key >> bit_offset) & 0xFF], 1);
+      }
+    }
+    __syncthreads();
+
+#pragma unroll 8
+    for (int i = 0; i < 8; ++i) {
+      if (__builtin_expect(tid < RADIX, 1)) {
+        const int stride = 1 << i;
+        const int src = i & 1;
+        const int dst = src ^ 1;
+        int value = hist[src][tid];
+        if (tid < RADIX - stride) value += hist[src][tid + stride];
+        hist[dst][tid] = value;
+      }
+      __syncthreads();
+    }
+
+    if (tid < RADIX && hist[0][tid] >= remaining_k &&
+        hist[0][tid + 1] < remaining_k) {
+      shared_threshold_bin = tid;
+    }
+    __syncthreads();
+
+    const int threshold_bin = shared_threshold_bin;
+    remaining_k -= hist[0][threshold_bin + 1];
+    prefix |= static_cast<uint32_t>(threshold_bin) << bit_offset;
+    __syncthreads();
+  }
+
+  using ScanT = cub::BlockScan<uint32_t, kThreadsPerBlock>;
+  auto* scan_tmp = reinterpret_cast<typename ScanT::TempStorage*>(medium_smem);
+  constexpr int kItems = 4;
+  constexpr int kTile = kItems * kThreadsPerBlock;
+  static_assert(kTile <= 0xFFFF,
+                "packed deterministic emission counts must fit in 16 bits");
+
+  uint32_t run_gt = 0;
+  uint32_t run_eq = 0;
+  for (int base = 0; base < seq_len; base += kTile) {
+    const int mine = base + tid * kItems;
+    uint32_t keys[kItems];
+    bool valid[kItems];
+#pragma unroll
+    for (int j = 0; j < kItems; ++j) {
+      const int idx = mine + j;
+      valid[j] = idx < seq_len;
+      keys[j] = valid[j]
+                    ? convert_to_uint32_v2(logits[idx + logits_offset])
+                    : 0u;
+    }
+
+    uint32_t is_gt[kItems];
+    uint32_t is_eq[kItems];
+    uint32_t packed = 0;
+#pragma unroll
+    for (int j = 0; j < kItems; ++j) {
+      is_gt[j] = valid[j] && keys[j] > prefix;
+      is_eq[j] = valid[j] && keys[j] == prefix;
+      packed += is_gt[j] | (is_eq[j] << 16);
+    }
+
+    uint32_t packed_rank;
+    uint32_t packed_total;
+    ScanT(*scan_tmp).ExclusiveSum(packed, packed_rank, packed_total);
+    uint32_t greater_before = run_gt + (packed_rank & 0xFFFFu);
+    uint32_t equal_before = run_eq + (packed_rank >> 16);
+#pragma unroll
+    for (int j = 0; j < kItems; ++j) {
+      if (is_gt[j] || (is_eq[j] && equal_before < remaining_k)) {
+        const uint32_t kept_equal_before =
+            equal_before < static_cast<uint32_t>(remaining_k)
+                ? equal_before
+                : static_cast<uint32_t>(remaining_k);
+        const uint32_t pos = greater_before + kept_equal_before;
+        if (pos < static_cast<uint32_t>(TopK)) output_indices[pos] = mine + j;
+      }
+      greater_before += is_gt[j];
+      equal_before += is_eq[j];
+    }
+    run_gt += packed_total & 0xFFFFu;
+    run_eq += packed_total >> 16;
     __syncthreads();
   }
 }
@@ -880,8 +1003,12 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
 
   if (blockIdx.x >= num_groups * ctas_per_group) return;
 
-  // Early exit: non-CTA-0 threads are never needed if no large rows exist
-  if (cta_in_group != 0 && params.max_seq_len <= RADIX_THRESHOLD) return;
+  // Early exit: non-CTA-0 threads are never needed if no large rows exist.
+  // The non-cooperative path always launches one CTA per group; the additional
+  // condition is defensive if its launch geometry changes.
+  if (cta_in_group != 0 &&
+      (params.max_seq_len <= RADIX_THRESHOLD || params.force_noncooperative))
+    return;
 
   uint32_t* local_histogram = reinterpret_cast<uint32_t*>(smem_raw);
   uint32_t* suffix_sum = local_histogram + RADIX;
@@ -929,7 +1056,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
     int32_t* row_output = params.output + row_idx * params.top_k;
     const float* row_input = params.input + row_idx * params.stride;
 
-    if (seq_len <= RADIX_THRESHOLD) {
+    if (seq_len <= RADIX_THRESHOLD || params.force_noncooperative) {
       if (cta_in_group == 0) {
         if (seq_len <= static_cast<uint32_t>(TopK)) {
           // Trivial case: seq_len <= TopK
@@ -937,6 +1064,10 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
                i += kThreadsPerBlock) {
             row_output[i] = (i < seq_len) ? static_cast<int32_t>(i) : -1;
           }
+        } else if (params.force_noncooperative) {
+          // Low-smem consumer Blackwell: avoid atomic output ordering and the
+          // unsupported cooperative barrier for every non-trivial row.
+          histogram_streaming_topk<TopK>(row_input, row_output, 0, seq_len);
         } else if (seq_len <= static_cast<uint32_t>(HIST2048_THRESHOLD)) {
           histogram_2048_topk<TopK>(row_input, row_output, seq_len);
         } else {

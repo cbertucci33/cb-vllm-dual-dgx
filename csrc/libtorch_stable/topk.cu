@@ -4,7 +4,6 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 
-#include "ops.h"
 #include "torch_utils.h"
 
 #ifndef USE_ROCM
@@ -35,6 +34,12 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
     num_sms = device_prop->multiProcessorCount;
     max_smem_per_block = device_prop->sharedMemPerBlockOptin;
   }
+
+  // GB10 and other consumer Blackwell parts cannot host the 128 KiB
+  // cooperative-radix fallback. Gate on actual shared-memory capacity so
+  // datacenter Blackwell and Hopper keep the tuned cooperative path.
+  // This is fail-closed: the unsupported path has no environment override.
+  const bool force_noncooperative = max_smem_per_block < 128 * 1024;
 
   if (num_rows > 32 && max_smem_per_block >= 128 * 1024) {
     cudaError_t status =
@@ -87,6 +92,13 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
     size_t smem_size = P::kFixedSmemLarge + chunk_size * sizeof(uint32_t);
     if (smem_size < P::kSmemMedium) smem_size = P::kSmemMedium;
 
+    if (force_noncooperative) {
+      // One barrier-free CTA per row. The exact streaming selector re-reads
+      // the row and therefore does not need the cooperative chunk buffer.
+      ctas_per_group = 1;
+      smem_size = P::kSmemMedium;
+    }
+
     // Query occupancy for the instantiation that will actually launch;
     // overestimating it deadlocks the cooperative barrier.
     int occupancy = 1;
@@ -113,6 +125,7 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
     // the radix path (seq_len > RADIX_THRESHOLD). Below that, non-CTA-0 CTAs
     // early-exit, so oversubscription can't deadlock and headroom is wasted.
     const bool needs_cooperative =
+        !force_noncooperative &&
         static_cast<uint32_t>(max_seq_len) > P::RADIX_THRESHOLD;
 
     const uint32_t hw_resident_cap =
@@ -133,15 +146,11 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
     if (num_groups == 0) num_groups = 1;
     uint32_t total_ctas = num_groups * ctas_per_group;
 
-    // If the cooperative launch wouldn't fit, use the generic decode kernel on
-    // low-smem devices or FilteredTopK where its 128 KiB requirement is met.
+    // If the cooperative launch would not fit, use FilteredTopK. Low-smem
+    // devices took the single-CTA path above and never reach this branch.
     if (needs_cooperative && total_ctas > hw_resident_cap) {
-      if (max_smem_per_block < 128 * 1024) {
-        const int64_t next_n = lengths.dim() == 2 ? lengths.size(1) : 1;
-        top_k_per_row_decode(logits, next_n, lengths, output, num_rows,
-                             logits.stride(0), logits.stride(1), TopK);
-        return;
-      }
+      STD_TORCH_CHECK(max_smem_per_block >= 128 * 1024,
+                      "FilteredTopK fallback requires >=128 KiB smem");
       cudaError_t status =
           vllm::FilteredTopKRaggedTransform<float, int32_t, TopK>(
               logits.const_data_ptr<float>(),
@@ -202,6 +211,7 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
         workspace.mutable_data_ptr<uint8_t>());
     params.ctas_per_group = ctas_per_group;
     params.max_seq_len = static_cast<uint32_t>(max_seq_len);
+    params.force_noncooperative = force_noncooperative;
 
   #define LAUNCH_PERSISTENT(TOPK_VAL, VS)                                     \
     do {                                                                      \
