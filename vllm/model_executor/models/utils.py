@@ -964,11 +964,34 @@ def get_draft_quant_config(vllm_config: VllmConfig) -> "QuantizationConfig | Non
     draft_model_config = vllm_config.speculative_config.draft_model_config
     draft_load_config = vllm_config.load_config
 
-    return (
-        VllmConfig.get_quantization_config(draft_model_config, draft_load_config)
-        if draft_model_config
-        else None
+    if not draft_model_config:
+        return None
+
+    quant_config = VllmConfig.get_quantization_config(
+        draft_model_config, draft_load_config
     )
+
+    # The target model's EXL3 metadata is hydrated elsewhere, but the draft
+    # quant config is constructed independently here. Hydrate it as well so a
+    # rank-sliced MTP layer selects the Trellis path and normalizes rank names.
+    if (
+        quant_config is not None
+        and getattr(quant_config, "get_name", lambda: None)() == "exl3"
+    ):
+        draft_hf = getattr(draft_model_config, "hf_config", None)
+        target_hf = getattr(
+            getattr(vllm_config, "model_config", None), "hf_config", None
+        )
+        hf_config = draft_hf
+        if getattr(draft_hf, "hybrid_tr3_tail", None) is None:
+            hf_config = target_hf
+        if getattr(hf_config, "hybrid_tr3_tail", None) is not None:
+            quant_config.maybe_update_config(
+                draft_model_config.model,
+                hf_config=hf_config,
+            )
+
+    return quant_config
 
 
 def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:

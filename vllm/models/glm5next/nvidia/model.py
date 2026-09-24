@@ -1017,6 +1017,17 @@ class Glm5NextForCausalLM(
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        rank_sliced_name = getattr(
+            self.quant_config,
+            "normalize_rank_sliced_weight_name",
+            None,
+        )
+        if rank_sliced_name is not None:
+            weights = (
+                (normalized_name, loaded_weight)
+                for name, loaded_weight in weights
+                if (normalized_name := rank_sliced_name(name)) is not None
+            )
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
 

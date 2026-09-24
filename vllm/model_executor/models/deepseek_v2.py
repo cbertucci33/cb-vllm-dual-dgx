@@ -1429,6 +1429,7 @@ class DeepseekV2Model(nn.Module):
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.config = config
+        self.quant_config = quant_config
         self.device = current_platform.device_type
         self.hidden_size = config.hidden_size
         self.vocab_size = config.vocab_size
@@ -1642,7 +1643,16 @@ class DeepseekV2Model(nn.Module):
         indexer_present_prefixes = {
             n.rsplit(".indexer.", 1)[0] for n in params_dict if ".indexer." in n
         }
+        rank_sliced_name = getattr(
+            self.quant_config,
+            "normalize_rank_sliced_weight_name",
+            None,
+        )
         for name, loaded_weight in weights:
+            if rank_sliced_name is not None:
+                name = rank_sliced_name(name)
+                if name is None:
+                    continue
             if "rotary_emb.inv_freq" in name:
                 continue
 
