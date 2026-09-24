@@ -1024,8 +1024,6 @@ def test_concat_and_cache_ds_mla_nope(
 ) -> None:
     """NoPE matches zero RoPE and preserves unused slots and stride padding."""
     dtype = torch.bfloat16
-    if current_platform.is_rocm():
-        pytest.skip("concat_and_cache_mla doesn't support fp8_ds_mla on ROCm")
     num_tokens, num_blocks = 8, 8
     kv_lora_rank = 512
     set_random_seed(0)
