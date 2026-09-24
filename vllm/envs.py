@@ -12,6 +12,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
+    VLLM_DFLASH_KV_RING: bool = True
     VLLM_HOST_IP: str = ""
     VLLM_PORT: int | None = None
     VLLM_RPC_BASE_PATH: str = tempfile.gettempdir()
@@ -605,6 +606,7 @@ def _resolve_rust_cli_path() -> str | None:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    "VLLM_DFLASH_KV_RING": lambda: os.getenv("VLLM_DFLASH_KV_RING", "1") == "1",
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
     # rocm, cpu]
@@ -2185,9 +2187,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_PREFILL_BLOCK_M": lambda: os.getenv("VLLM_EXL3_PREFILL_BLOCK_M"),
     "VLLM_EXL3_EXT_PATH": lambda: os.getenv("VLLM_EXL3_EXT_PATH"),
     "VLLM_EXL3_ABI_SHIM": lambda: os.getenv("VLLM_EXL3_ABI_SHIM"),
-    "VLLM_NVFP4_MLA_SCALES_FILE": lambda: os.getenv(
-        "VLLM_NVFP4_MLA_SCALES_FILE"
-    ),
+    "VLLM_NVFP4_MLA_SCALES_FILE": lambda: os.getenv("VLLM_NVFP4_MLA_SCALES_FILE"),
 }
 
 

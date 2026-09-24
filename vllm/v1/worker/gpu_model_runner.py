@@ -1165,6 +1165,13 @@ class GPUModelRunner(
 
         Called from gpu_worker.py outside the CuMem pool context.
         """
+        from vllm.v1.core.kv_cache_utils import dflash_ring_layer_names
+
+        self.runner_only_attn_layers.update(
+            dflash_ring_layer_names(
+                self.vllm_config, self.kv_cache_config.kv_cache_groups
+            )
+        )
         self._kv_block_zeroer = KVBlockZeroer(
             self.device,
             attn_groups_iter=self._kv_cache_spec_attn_group_iterator(),
@@ -1245,7 +1252,7 @@ class GPUModelRunner(
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
         if scheduler_output.kv_cache_block_copies:
             copy_kv_cache_blocks_inplace(
-                self.kv_caches,
+                self.block_copy_kv_caches,
                 self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
             )
@@ -7383,6 +7390,14 @@ class GPUModelRunner(
             num_attn_module,
             kv_cache_groups=kv_cache_config.kv_cache_groups,
         )
+        from vllm.v1.core.kv_cache_utils import dflash_ring_layer_names
+
+        ring_layers = dflash_ring_layer_names(
+            self.vllm_config, kv_cache_config.kv_cache_groups
+        )
+        self.block_copy_kv_caches = [
+            cache for name, cache in kv_caches.items() if name not in ring_layers
+        ]
         return kv_caches
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(

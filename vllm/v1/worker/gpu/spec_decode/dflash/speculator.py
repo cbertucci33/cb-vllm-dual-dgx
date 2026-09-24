@@ -14,6 +14,7 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import (
+    DFlashSWASpec,
     KVCacheConfig,
     get_kv_cache_spec_sliding_window,
 )
@@ -30,6 +31,51 @@ from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+
+@triton.jit
+def _synthesize_draft_ring_block_tables_kernel(
+    block_table_ptr,
+    block_table_stride,
+    idx_mapping_ptr,
+    seq_lens_ptr,
+    block_size,
+    ring_size,
+    num_query_per_req,
+    BLOCK_SIZE: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
+    seq_len = tl.load(seq_lens_ptr + batch_idx)
+    num_blocks = (seq_len + num_query_per_req + block_size - 1) // block_size
+    row_ptr = block_table_ptr + batch_idx.to(tl.int64) * block_table_stride
+    base = 1 + req_state_idx * ring_size
+    for start in tl.range(0, block_table_stride, BLOCK_SIZE):
+        offsets = start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < block_table_stride
+        ring_ids = tl.where(offsets < num_blocks, base + offsets % ring_size, 0)
+        tl.store(row_ptr + offsets, ring_ids, mask=mask)
+
+
+def synthesize_draft_ring_block_tables(
+    block_table: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_size: int,
+    ring_size: int,
+    num_query_per_req: int,
+) -> None:
+    """Build a draft block table covering context and the next draft queries."""
+    _synthesize_draft_ring_block_tables_kernel[(idx_mapping.shape[0],)](
+        block_table,
+        block_table.stride(0),
+        idx_mapping,
+        seq_lens,
+        block_size,
+        ring_size,
+        num_query_per_req,
+        BLOCK_SIZE=256,  # type: ignore
+    )
 
 
 class DFlashSpeculator(DraftModelSpeculator):
@@ -108,6 +154,7 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
+        self.draft_ring_size: dict[int, int] = {}
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
@@ -204,6 +251,18 @@ class DFlashSpeculator(DraftModelSpeculator):
         ]
         assert self.draft_kv_cache_group_ids, "No draft attention groups found."
         self.draft_kv_cache_group_id = self.draft_kv_cache_group_ids[0]
+        for gid in self.draft_kv_cache_group_ids:
+            spec = kv_cache_config.kv_cache_groups[gid].kv_cache_spec
+            if type(spec) is not DFlashSWASpec or not spec.private_ring:
+                continue
+            names = set(kv_cache_config.kv_cache_groups[gid].layer_names)
+            tensor = next(
+                t
+                for t in kv_cache_config.kv_cache_tensors
+                if names.intersection(t.layers)
+            )
+            pages = tensor.layer_stride // spec.page_size_bytes
+            self.draft_ring_size[gid] = (pages - 1) // self.max_num_reqs
 
         # Per-group context slot buffers for the precompute (one row per group).
         self._context_slot_mappings = torch.zeros(
@@ -374,6 +433,15 @@ class DFlashSpeculator(DraftModelSpeculator):
         # The query slot mapping is written into the shared BlockTables slot_mappings.
         # That buffer's address is what the captured CUDA graph reads from at replay.
         assert self.draft_kv_cache_group_id >= 0
+        for gid, ring_size in self.draft_ring_size.items():
+            synthesize_draft_ring_block_tables(
+                self.block_tables.input_block_tables[gid],
+                input_batch.idx_mapping,
+                input_batch.seq_lens,
+                self.block_tables.kernel_block_sizes[gid],
+                ring_size,
+                self.num_query_per_req,
+            )
         # Support multiple draft KV cache groups by preparing inputs once for each
         for i, gid in enumerate(self.draft_kv_cache_group_ids):
             prepare_dflash_inputs(

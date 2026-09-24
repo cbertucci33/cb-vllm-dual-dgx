@@ -15,6 +15,7 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.core.single_type_kv_cache_manager import (
     ChunkedLocalAttentionManager,
     CircularBufferManager,
+    DFlashRingManager,
     FullAttentionManager,
     MambaManager,
     RSWAManager,
@@ -23,6 +24,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     CircularBufferSpec,
+    DFlashSWASpec,
     FullAttentionSpec,
     MambaSpec,
     RSWASpec,
@@ -30,6 +32,37 @@ from vllm.v1.kv_cache_interface import (
 )
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_dflash_private_ring_does_not_debit_block_pool():
+    spec = DFlashSWASpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=8,
+        private_ring=True,
+    )
+    block_pool = BlockPool(num_gpu_blocks=4, enable_caching=True, hash_block_size=1)
+    manager = DFlashRingManager(
+        spec,
+        block_pool=block_pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=4,
+    )
+    free_before = block_pool.get_num_free_blocks()
+
+    assert (
+        manager.get_num_blocks_to_allocate(
+            "request", 4096, (), 0, 0, 4096, apply_admission_cap=True
+        )
+        == 0
+    )
+    assert manager.allocate_new_blocks("request", 4096, 4096) == []
+    manager.free("request")
+
+    assert block_pool.get_num_free_blocks() == free_before
 
 
 def test_external_computed_blocks_do_not_corrupt_free_pool():

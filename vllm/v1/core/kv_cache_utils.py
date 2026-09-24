@@ -29,6 +29,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     ChunkedLocalAttentionSpec,
     CircularBufferSpec,
+    DFlashSWASpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
     HiSparseHotSpec,
@@ -1083,6 +1084,19 @@ def get_max_concurrency_for_kv_cache_config(
     num_blocks_per_request = 0
     host_blocks_per_request = 0
     for group in kv_cache_config.kv_cache_groups:
+        group_spec = group.kv_cache_spec
+        private_ring = (
+            type(group_spec) is DFlashSWASpec and group_spec.private_ring
+        ) or (
+            isinstance(group_spec, UniformTypeKVCacheSpecs)
+            and group_spec.kv_cache_specs
+            and all(
+                type(spec) is DFlashSWASpec and spec.private_ring
+                for spec in group_spec.kv_cache_specs.values()
+            )
+        )
+        if private_ring:
+            continue
         required = cdiv(
             group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
             group.kv_cache_spec.page_size_bytes,
@@ -1091,7 +1105,11 @@ def get_max_concurrency_for_kv_cache_config(
             host_blocks_per_request += required
         else:
             num_blocks_per_request += required
-    limits = [kv_cache_config.num_blocks / num_blocks_per_request]
+    limits = [
+        float("inf")
+        if num_blocks_per_request == 0
+        else kv_cache_config.num_blocks / num_blocks_per_request
+    ]
     if host_blocks_per_request:
         assert kv_cache_config.hisparse_host_num_blocks is not None
         limits.append(
@@ -1212,6 +1230,18 @@ def _get_kv_cache_groups_glm5_next(
         for name, spec in kv_cache_spec.items()
         if not isinstance(spec, (MambaSpec, KpoolTailSpec))
     }
+    draft_specs = {
+        name: spec
+        for name, spec in attn_specs.items()
+        if type(spec) in (FullAttentionSpec, SlidingWindowSpec, DFlashSWASpec)
+    }
+    if draft_specs:
+        spec_config = vllm_config.speculative_config
+        if spec_config is None or spec_config.method != "dflash":
+            return None
+        attn_specs = {
+            name: spec for name, spec in attn_specs.items() if name not in draft_specs
+        }
     if not mamba_specs or not all(
         type(spec) is MLAAttentionSpec for spec in attn_specs.values()
     ):
@@ -1267,10 +1297,32 @@ def _get_kv_cache_groups_glm5_next(
     for index, name in enumerate(mamba_specs):
         mamba_grouped_names[index % num_groups].append(name)
 
+    draft_groups: list[KVCacheGroupSpec] = []
+    if draft_specs:
+        private_ring = (
+            envs.VLLM_DFLASH_KV_RING
+            and vllm_config.kv_transfer_config is None
+            and all(type(spec) is DFlashSWASpec for spec in draft_specs.values())
+        )
+        if private_ring:
+            draft_specs = {
+                name: replace(cast(DFlashSWASpec, spec), private_ring=True)
+                for name, spec in draft_specs.items()
+            }
+        draft_buckets: dict[KVCacheSpec, list[str]] = defaultdict(list)
+        for name, spec in draft_specs.items():
+            draft_buckets[spec].append(name)
+        draft_groups = [
+            KVCacheGroupSpec(names, spec) for spec, names in draft_buckets.items()
+        ]
+        for group in draft_groups:
+            group.is_eagle_group = True
+            group.enable_kv_transfer = False
     return (
         [KVCacheGroupSpec(list(attn_specs), uniform_spec)]
         + ([tail_group] if tail_group is not None else [])
         + create_kv_cache_group_specs(padded_specs, mamba_grouped_names)
+        + draft_groups
     )
 
 
@@ -1286,6 +1338,7 @@ def _glm5_next_tensor_layout(
         int,
         list[str],
         int,
+        list[KVCacheGroupSpec],
     ]
     | None
 ):
@@ -1308,7 +1361,15 @@ def _glm5_next_tensor_layout(
             tail_group = group
     if attn_group is None or not mamba_groups:
         return None
-    if len(uniform_groups) + len(mamba_groups) != len(kv_cache_groups):
+    draft_groups = [
+        group
+        for group in kv_cache_groups
+        if type(group.kv_cache_spec)
+        in (FullAttentionSpec, SlidingWindowSpec, DFlashSWASpec)
+    ]
+    if len(uniform_groups) + len(mamba_groups) + len(draft_groups) != len(
+        kv_cache_groups
+    ):
         return None
 
     attn_uniform = cast(UniformTypeKVCacheSpecs, attn_group.kv_cache_spec)
@@ -1359,7 +1420,22 @@ def _glm5_next_tensor_layout(
         idx_page,
         tail_names,
         tail_page,
+        draft_groups,
     )
+
+
+def dflash_ring_layer_names(
+    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
+) -> set[str]:
+    if not envs.VLLM_DFLASH_KV_RING or vllm_config.kv_transfer_config is not None:
+        return set()
+    return {
+        name
+        for group in kv_cache_groups
+        if type(group.kv_cache_spec) is DFlashSWASpec
+        and group.kv_cache_spec.private_ring
+        for name in group.layer_names
+    }
 
 
 def unify_kv_cache_spec_page_size(
@@ -1590,8 +1666,16 @@ def _get_kv_cache_bytes_per_block(
 ) -> int:
     """Return the largest cache group's bytes per block."""
     if (glm5_layout := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
-        _, _, mla_names, idx_names, mla_page, idx_page, _, _ = glm5_layout
-        return len(mla_names) * mla_page + len(idx_names) * idx_page
+        _, _, mla_names, idx_names, mla_page, idx_page, _, _, draft_groups = glm5_layout
+        base = len(mla_names) * mla_page + len(idx_names) * idx_page
+        if draft_groups and all(
+            type(g.kv_cache_spec) is DFlashSWASpec and g.kv_cache_spec.private_ring
+            for g in draft_groups
+        ):
+            return base
+        return base + sum(
+            g.kv_cache_spec.page_size_bytes * len(g.layer_names) for g in draft_groups
+        )
 
     bytes_per_block = max(
         sum(
@@ -1689,24 +1773,49 @@ def get_kv_cache_config_from_groups(
             idx_page,
             tail_names,
             _,
+            draft_groups,
         ) = glm5_layout
-        bytes_per_block = len(mla_names) * mla_page + len(idx_names) * idx_page
-        num_blocks = may_override_num_blocks(
-            vllm_config, available_memory // bytes_per_block
+        base_bytes = len(mla_names) * mla_page + len(idx_names) * idx_page
+        ring_pages = None
+        if draft_groups and all(
+            type(g.kv_cache_spec) is DFlashSWASpec and g.kv_cache_spec.private_ring
+            for g in draft_groups
+        ):
+            max_admission = max(
+                g.kv_cache_spec.max_admission_blocks_per_request(
+                    vllm_config.max_in_flight_tokens,
+                    vllm_config.model_config.max_model_len,
+                )
+                for g in draft_groups
+            )
+            ring_pages = 1 + vllm_config.scheduler_config.max_num_seqs * (
+                max_admission + 1
+            )
+        draft_page_bytes = sum(
+            g.kv_cache_spec.page_size_bytes * len(g.layer_names) for g in draft_groups
         )
-        size = bytes_per_block * num_blocks
+        fixed = (ring_pages or 0) * draft_page_bytes
+        bytes_per_block = (
+            base_bytes if ring_pages is not None else base_bytes + draft_page_bytes
+        )
+        num_blocks = may_override_num_blocks(
+            vllm_config, max(available_memory - fixed, 0) // bytes_per_block
+        )
+        size = bytes_per_block * num_blocks + fixed
         attn_specs = cast(
             UniformTypeKVCacheSpecs, attn_group.kv_cache_spec
         ).kv_cache_specs
 
         kv_cache_tensors: list[KVCacheTensor] = []
 
-        def add_tensor(layer_name: str, spec: KVCacheSpec, offset: int) -> None:
+        def add_tensor(
+            layer_name: str, spec: KVCacheSpec, offset: int, blocks: int = num_blocks
+        ) -> None:
             kv_cache_tensors.append(
                 KVCacheTensor(
                     size=size,
                     layers=[layer_name],
-                    layer_stride=spec.page_size_bytes * num_blocks,
+                    layer_stride=spec.page_size_bytes * blocks,
                     block_stride=spec.page_size_bytes,
                     offset=offset,
                 )
@@ -1733,6 +1842,13 @@ def get_kv_cache_config_from_groups(
                 ).kv_cache_specs
                 add_tensor(tail_name, tail_specs[tail_name], offset)
 
+        draft_offset = base_bytes * num_blocks
+        for group in draft_groups:
+            blocks = ring_pages or num_blocks
+            for name in group.layer_names:
+                add_tensor(name, group.kv_cache_spec, draft_offset, blocks)
+                draft_offset += group.kv_cache_spec.page_size_bytes * blocks
+        assert draft_offset == size
         return KVCacheConfig(
             num_blocks=num_blocks,
             kv_cache_tensors=kv_cache_tensors,
@@ -2432,6 +2548,7 @@ def _max_memory_usage_bytes_from_groups(
             idx_page,
             tail_names,
             _,
+            draft_groups,
         ) = glm5_layout
         uniform_spec = cast(UniformTypeKVCacheSpecs, attn_group.kv_cache_spec)
         total_blocks = uniform_spec.max_memory_usage_pages(vllm_config)
@@ -2444,7 +2561,31 @@ def _max_memory_usage_bytes_from_groups(
         )
         if tail_names:
             total_blocks += 1
-        return total_blocks * (len(mla_names) * mla_page + len(idx_names) * idx_page)
+        base = total_blocks * (len(mla_names) * mla_page + len(idx_names) * idx_page)
+        if draft_groups:
+            if all(
+                type(g.kv_cache_spec) is DFlashSWASpec and g.kv_cache_spec.private_ring
+                for g in draft_groups
+            ):
+                max_admission = max(
+                    g.kv_cache_spec.max_admission_blocks_per_request(
+                        vllm_config.max_in_flight_tokens,
+                        vllm_config.model_config.max_model_len,
+                    )
+                    for g in draft_groups
+                )
+                ring_pages = 1 + vllm_config.scheduler_config.max_num_seqs * (
+                    max_admission + 1
+                )
+                return base + ring_pages * sum(
+                    g.kv_cache_spec.page_size_bytes * len(g.layer_names)
+                    for g in draft_groups
+                )
+            return base + total_blocks * sum(
+                g.kv_cache_spec.page_size_bytes * len(g.layer_names)
+                for g in draft_groups
+            )
+        return base
 
     bytes_per_block = _pool_bytes_per_block(kv_cache_groups)
     total_blocks = 0
@@ -2609,6 +2750,7 @@ def _project_kv_cache_groups_to_worker(
                 worker_layer_names,
                 group_spec,
                 is_eagle_group=group.is_eagle_group and bool(worker_layer_names),
+                enable_kv_transfer=group.enable_kv_transfer,
             )
         )
     return projected_groups

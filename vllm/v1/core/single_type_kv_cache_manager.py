@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     CircularBufferSpec,
     CrossAttentionSpec,
+    DFlashSWASpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
     HiSparseHotSpec,
@@ -1188,6 +1189,97 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         window in the future.
         """
         return 0
+
+
+class DFlashRingManager(SlidingWindowManager):
+    """Scheduler bookkeeping for worker-owned DFlash KV rings."""
+
+    def get_num_blocks_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        total_computed_tokens: int,
+        num_local_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+    ) -> int:
+        del (
+            request_id,
+            num_tokens,
+            new_computed_blocks,
+            total_computed_tokens,
+            num_local_computed_tokens,
+            num_tokens_main_model,
+            apply_admission_cap,
+        )
+        return 0
+
+    def allocate_new_blocks(
+        self, request_id: str, num_tokens: int, num_tokens_main_model: int
+    ) -> list[KVCacheBlock]:
+        del num_tokens, num_tokens_main_model
+        self.req_to_blocks[request_id]
+        return []
+
+    def add_local_computed_blocks(
+        self,
+        request_id: str,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        del num_local_computed_tokens
+        assert not new_computed_blocks
+        assert num_external_computed_tokens == 0
+        self.req_to_blocks[request_id]
+        self.num_cached_block[request_id] = 0
+
+    def allocate_external_computed_blocks(
+        self,
+        request_id: str,
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        del request_id, num_local_computed_tokens
+        assert num_external_computed_tokens == 0
+
+    def remove_skipped_blocks(
+        self,
+        request_id: str,
+        processed_computed_tokens: int,
+        num_prompt_tokens: int | None = None,
+    ) -> None:
+        del request_id, processed_computed_tokens, num_prompt_tokens
+
+    def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+        del running_request_id
+        return 0
+
+    @classmethod
+    def find_longest_cache_hit(
+        cls,
+        block_hashes: BlockHashList,
+        max_length: int,
+        kv_cache_group_ids: list[int],
+        block_pool: BlockPool,
+        kv_cache_spec: KVCacheSpec,
+        drop_eagle_block: bool,
+        alignment_tokens: int,
+        dcp_world_size: int = 1,
+        pcp_world_size: int = 1,
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+        del (
+            block_hashes,
+            max_length,
+            block_pool,
+            kv_cache_spec,
+            drop_eagle_block,
+            alignment_tokens,
+            dcp_world_size,
+            pcp_world_size,
+        )
+        return tuple([] for _ in kv_cache_group_ids), 0
 
 
 class CircularBufferManager(FullAttentionManager):
@@ -2619,7 +2711,11 @@ def get_manager_for_kv_cache_spec(
     Returns:
         An instance of the appropriate SingleTypeKVCacheManager subclass
     """
-    manager_class = KVCacheSpecRegistry.get_manager_class(kv_cache_spec, role)
+    manager_class = (
+        DFlashRingManager
+        if type(kv_cache_spec) is DFlashSWASpec and kv_cache_spec.private_ring
+        else KVCacheSpecRegistry.get_manager_class(kv_cache_spec, role)
+    )
     assert manager_class is not None, (
         f"No manager registered for KVCacheSpec {type(kv_cache_spec)}"
     )
@@ -2668,6 +2764,11 @@ def register_all_kvcache_specs(vllm_config):
         SlidingWindowSpec,
         SlidingWindowManager,
         uniform_type_base_spec=SlidingWindowSpec,
+    )
+    KVCacheSpecRegistry.register(
+        DFlashSWASpec,
+        SlidingWindowManager,
+        uniform_type_base_spec=DFlashSWASpec,
     )
     KVCacheSpecRegistry.register(
         CircularBufferSpec,

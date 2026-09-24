@@ -36,6 +36,8 @@ from vllm.platforms import current_platform
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.transformers_utils.repo_utils import get_hf_file_bytes
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.kv_cache_interface import DFlashSWASpec, KVCacheSpec, SlidingWindowSpec
+from vllm.v1.kv_cache_interface import replace_as as replace_kv_spec
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
@@ -66,6 +68,14 @@ def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
         return bool(override)
     layer_types = getattr(config, "layer_types", None)
     return bool(layer_types) and layer_types[layer_idx] == _SLIDING_ATTENTION
+
+
+class DFlashAttention(Attention):
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        spec = super().get_kv_cache_spec(vllm_config)
+        if isinstance(spec, SlidingWindowSpec):
+            return replace_kv_spec(spec, DFlashSWASpec, page_size_padded=None)
+        return spec
 
 
 def dflash_has_any_non_causal(config: Qwen3Config) -> bool:
@@ -225,7 +235,7 @@ class DFlashQwen3Attention(nn.Module):
         )
 
         self.sliding_window = sliding_window
-        self.attn = Attention(
+        self.attn = DFlashAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,

@@ -11,6 +11,41 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_ring_synthesis_covers_context_and_draft_queries():
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+        synthesize_draft_ring_block_tables,
+    )
+
+    ring_size = 4
+    block_table = torch.tensor(
+        [[0, 0, 17, 23, 9, 41, 0], [5, 6, 7, 0, 0, 0, 0]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    idx_mapping = torch.tensor([3, 1], dtype=torch.int32, device="cuda")
+    seq_lens = torch.tensor([20, 12], dtype=torch.int32, device="cuda")
+    synthesize_draft_ring_block_tables(
+        block_table,
+        idx_mapping,
+        seq_lens,
+        block_size=4,
+        ring_size=ring_size,
+        num_query_per_req=5,
+    )
+
+    base0, base1 = 1 + 3 * ring_size, 1 + ring_size
+    expected = torch.tensor(
+        [
+            [base0, base0 + 1, base0 + 2, base0 + 3, base0, base0 + 1, base0 + 2],
+            [base1, base1 + 1, base1 + 2, base1 + 3, base1, 0, 0],
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    assert torch.equal(block_table, expected)
+
+
 @pytest.mark.parametrize("block_size", [5, 8])
 def test_grouped_conv_matches_reference(block_size: int):
     torch.manual_seed(0)

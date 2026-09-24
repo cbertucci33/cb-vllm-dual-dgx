@@ -755,6 +755,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.kv_caches = [
             cache for cache in kv_caches_dict.values() if cache.device == self.device
         ]
+        from vllm.v1.core.kv_cache_utils import dflash_ring_layer_names
+
+        ring_layers = dflash_ring_layer_names(
+            self.vllm_config, self.kv_cache_config.kv_cache_groups
+        )
+        self.block_copy_kv_caches = [
+            cache for name, cache in kv_caches_dict.items() if name not in ring_layers
+        ]
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
         else:
@@ -762,12 +770,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
+        from vllm.v1.core.kv_cache_utils import dflash_ring_layer_names
+
+        ring_layers = dflash_ring_layer_names(
+            self.vllm_config, self.kv_cache_config.kv_cache_groups
+        )
         self.kv_block_zeroer = KVBlockZeroer(
             self.device,
             attn_groups_iter=(g for groups in self.attn_groups for g in groups),
             kernel_block_sizes=self.kernel_block_sizes,
             static_forward_context=self.compilation_config.static_forward_context,
             num_blocks=self.kv_cache_config.num_blocks,
+            runner_only_attn_layers=ring_layers,
         )
 
     @torch.inference_mode()
@@ -1209,7 +1223,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # zeroing new blocks and before the forward pass reads them.
         if scheduler_output.kv_cache_block_copies:
             copy_kv_cache_blocks_inplace(
-                self.kv_caches,
+                self.block_copy_kv_caches,
                 self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
             )

@@ -968,6 +968,17 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
 
 
 @dataclass(frozen=True, kw_only=True)
+class DFlashSWASpec(SlidingWindowSpec):
+    """Non-prefix-cacheable sliding-window storage for a DFlash drafter."""
+
+    private_ring: bool = False
+
+    @property
+    def prefix_cacheable(self) -> bool:
+        return False
+
+
+@dataclass(frozen=True, kw_only=True)
 class KpoolTailSpec(SlidingWindowSpec):
     """One-block circular scratch cache for a kpool indexer's raw tail."""
 
