@@ -167,10 +167,10 @@ class DFlashSpeculator(DraftModelSpeculator):
             backend=self.speculative_config.attention_backend,
         )
         if self.speculative_config.kv_cache_dtype is not None:
-            config.cache_config = replace(
-                self.vllm_config.cache_config,
-                cache_dtype=self.speculative_config.kv_cache_dtype,
-            )
+            # Preserve derived runtime state such as the engine-resolved KV
+            # layout; dataclass replacement reconstructs init fields only.
+            config.cache_config = copy.copy(self.vllm_config.cache_config)
+            config.cache_config.cache_dtype = self.speculative_config.kv_cache_dtype
         return config
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:

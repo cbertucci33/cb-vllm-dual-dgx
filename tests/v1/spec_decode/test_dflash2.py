@@ -20,6 +20,7 @@ def test_dflash_attention_config_uses_draft_cache_dtype():
     from vllm.config import VllmConfig
 
     target_config = VllmConfig()
+    target_config.cache_config.kv_cache_layout = "LBHNC"
     speculator = object.__new__(DFlashSpeculator)
     speculator.vllm_config = target_config
     speculator.speculative_config = SimpleNamespace(
@@ -33,6 +34,7 @@ def test_dflash_attention_config_uses_draft_cache_dtype():
     assert config.cache_config.cache_dtype == "fp8_e4m3"
     assert config.attention_config.backend.name == "FLASHINFER"
     assert config.attention_config.use_non_causal is True
+    assert config.cache_config.kv_cache_layout == "LBHNC"
     assert config.cache_config is not target_config.cache_config
 
 
