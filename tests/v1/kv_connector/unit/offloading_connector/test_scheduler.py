@@ -1540,6 +1540,35 @@ def _maximal_lookup(sched, keys, start_chunk_idx: int = 0):
     )
 
 
+def test_dflash_replay_reserve_keeps_final_token_out_of_complete_hit():
+    scheduler = _make_scheduler_with_lookup({}, default=LookupResult.HIT)
+    scheduler.config = SimpleNamespace(
+        draft_replay_reserve=2048,
+        kv_group_configs=(
+            SimpleNamespace(
+                tokens_per_chunk=64,
+                sliding_window_size_in_chunks=None,
+                is_eagle_group=False,
+            ),
+        ),
+    )
+    scheduler._lookup_groups = (0,)
+    scheduler._sliding_window_groups = ()
+    scheduler._chunks_being_loaded = set()
+    request = SimpleNamespace(num_tokens=2112, request_id="req")
+    request_state = SimpleNamespace(
+        num_locally_computed_tokens=0,
+        req=request,
+        req_context=_EMPTY_REQ_CTX,
+        group_states=(SimpleNamespace(offload_keys=to_keys(range(33))),),
+    )
+
+    # 2112 - 2048 is exactly one 64-token chunk. That chunk cannot be loaded:
+    # the final prompt token must remain available for logits recomputation.
+    assert scheduler._lookup_complete_chunks(request_state) == 0
+    scheduler.manager.lookup.assert_not_called()
+
+
 # Lookups issued, and end index returned, by a window-1 scan over 3 keys all
 # resolving to the same result. A result that keeps the streak alive ends the
 # scan at the first key; one that resets it makes the scan walk every key,

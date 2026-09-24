@@ -776,10 +776,11 @@ class OffloadingConnectorScheduler:
             max_hit_size_tokens = min(
                 max_hit_size_tokens, num_computed_tokens + max_num_new_tokens
             )
-        if self._sliding_window_groups:
-            # the last prompt token has to be recomputed to get the logprobs
-            # for sliding window attention, we must reduce by 1 to make sure
-            # we still have a hit after reduction
+        if self._sliding_window_groups or self.config.draft_replay_reserve:
+            # The last prompt token has to be recomputed to get the logprobs.
+            # Transferable sliding-window groups already require that replay;
+            # a non-transferable DFlash group requires it as well, in addition
+            # to the draft window reserved above.
             max_hit_size_tokens -= 1
             if self._mamba_align_size is not None:
                 # Constrain hit-window to the mamba block size.
