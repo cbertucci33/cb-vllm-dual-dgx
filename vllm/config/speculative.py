@@ -1913,8 +1913,15 @@ class SpeculativeConfig:
         return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
 
     def use_eagle_block_drop(self) -> bool:
-        """Whether volatile trailing cache blocks should be discarded."""
-        return self.use_eagle() and not self.disable_eagle_block_drop
+        """Whether the drafter can pollute the target's trailing KV block.
+
+        DFlash and DSpark consume target hidden states, but keep their draft KV
+        private. They therefore need draft-prefix replay without EAGLE's target
+        cache tail drop.
+        """
+        return self.method in ("eagle", "eagle3", "mtp") and not (
+            self.disable_eagle_block_drop
+        )
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"
