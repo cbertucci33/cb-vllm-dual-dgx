@@ -10,6 +10,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.utils import DRAFT_GUMBEL_POS_OFFSET
 
 
 @triton.jit
@@ -27,6 +28,7 @@ def _selector_walk_kernel(
     BLOCK_K: tl.constexpr,
     SAMPLE_PROBABILISTIC: tl.constexpr,
     USE_FP64: tl.constexpr,
+    POS_OFFSET: tl.constexpr,
 ):
     row = tl.program_id(0)
     offsets = tl.arange(0, BLOCK_K)
@@ -51,9 +53,9 @@ def _selector_walk_kernel(
             other=0,
         )
 
-        # sample_pos is the predicted token's position P. Sampling keys a draw
-        # by the position before the sampled token, P-1.
-        sample_pos = tl.load(sample_pos_ptr + flat) - 1
+        # The verifier keys acceptance/recovery noise from P-1. Salt the draft
+        # stream so it cannot reuse those exact random words.
+        sample_pos = tl.load(sample_pos_ptr + flat) - 1 + POS_OFFSET
         _, index = gumbel_noised_argmax(
             scores,
             candidates,
@@ -157,6 +159,7 @@ class DFlash2Speculator(DFlashSpeculator):
             BLOCK_K=block_k,
             SAMPLE_PROBABILISTIC=self.draft_logits is not None,
             USE_FP64=self.use_fp64_gumbel,
+            POS_OFFSET=DRAFT_GUMBEL_POS_OFFSET,
             num_warps=1,
         )
 

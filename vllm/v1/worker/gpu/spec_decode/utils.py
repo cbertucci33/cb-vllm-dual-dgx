@@ -12,6 +12,10 @@ from vllm.v1.worker.gpu.input_batch import InputBatch
 
 logger = init_logger(__name__)
 
+# Keep draft Gumbel keys disjoint from verifier/recovery keys at the same
+# sequence position. The value stays within Triton's signed 32-bit RNG range.
+DRAFT_GUMBEL_POS_OFFSET = 1 << 30
+
 
 def get_pp_safe_draft_load_config(load_config: LoadConfig) -> LoadConfig:
     """Avoid collectives that include PP ranks without a draft model."""

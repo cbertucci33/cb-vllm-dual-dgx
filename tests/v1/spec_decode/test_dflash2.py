@@ -172,6 +172,72 @@ def test_mxfp8_context_kv_rows_are_dequantized_for_plain_linear():
     torch.testing.assert_close(rows, weight[2:].to(torch.bfloat16))
 
 
+def test_candidate_topk_accepts_precomputed_local_logits():
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+
+    processor = object.__new__(LogitsProcessor)
+    torch.nn.Module.__init__(processor)
+    processor.scale = 2.0
+    processor.soft_cap = 2.0
+
+    shard_indices = SimpleNamespace(
+        num_org_vocab_padding=1,
+        num_org_elements=3,
+        num_org_elements_padded=4,
+        num_added_vocab_padding=1,
+        num_added_elements=1,
+        num_added_elements_padded=2,
+        added_vocab_start_index=100,
+        org_vocab_start_index=10,
+    )
+    lm_head = SimpleNamespace(tp_size=1, shard_indices=shard_indices)
+    local_logits = torch.tensor([[1.0, 3.0, 2.0, 100.0, 4.0, 99.0]])
+
+    ids, values = processor.get_top_k_tokens(
+        lm_head,
+        hidden_states=torch.empty(1, 0),
+        k=2,
+        local_logits=local_logits,
+    )
+
+    assert ids.tolist() == [[100, 11]]
+    expected = torch.tanh(torch.tensor([[4.0, 3.0]]) / 2.0) * 4.0
+    torch.testing.assert_close(values, expected)
+
+
+def test_selector_walk_uses_disjoint_draft_gumbel_positions(monkeypatch):
+    from vllm.v1.worker.gpu.spec_decode import utils
+    from vllm.v1.worker.gpu.spec_decode.dflash2 import speculator as module
+
+    captured = {}
+
+    class FakeKernel:
+        def __getitem__(self, grid):
+            captured["grid"] = grid
+
+            def launch(*args, **kwargs):
+                captured.update(kwargs)
+
+            return launch
+
+    monkeypatch.setattr(module, "_selector_walk_kernel", FakeKernel())
+    speculator = object.__new__(DFlash2Speculator)
+    speculator.selector_top_k = 4
+    speculator.num_speculative_steps = 3
+    speculator.draft_logits = None
+    speculator.use_fp64_gumbel = False
+    speculator.sample_pos = torch.empty(3, dtype=torch.int64)
+    speculator.sample_idx_mapping = torch.empty(3, dtype=torch.int64)
+    speculator.temperature = torch.empty(1)
+    speculator.seeds = torch.empty(1, dtype=torch.int64)
+    speculator.draft_tokens = torch.empty((1, 3), dtype=torch.int64)
+    speculator._selector_scores = torch.empty((1, 3, 4))
+
+    speculator._sample_path(torch.empty((1, 3, 4)), torch.empty((1, 3, 4, 4)), 1)
+
+    assert captured["POS_OFFSET"] == utils.DRAFT_GUMBEL_POS_OFFSET == 1 << 30
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_fp8_draft_head_logits_track_bf16_reference():
     from vllm.model_executor.layers.fp8_draft_head import (

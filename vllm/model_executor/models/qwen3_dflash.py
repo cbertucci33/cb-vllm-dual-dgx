@@ -847,7 +847,9 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             result = result.squeeze(0)
         return result
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+    def load_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> set[str]:
         model_weights = {}
         includes_draft_id_mapping = False
         includes_embed_tokens = False
@@ -887,8 +889,12 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             orig_to_new_substr["mask_embedding"] = None
         mapper = WeightsMapper(orig_to_new_substr=orig_to_new_substr)
         loader = AutoWeightsLoader(self)
-        loader.load_weights(model_weights.items(), mapper=mapper)
+        loaded = loader.load_weights(model_weights.items(), mapper=mapper)
         self.model._build_fused_kv_buffers()
+        if not self.model.has_separate_mask_embedding:
+            # This zero buffer is intentionally unused without an override.
+            loaded.add("model.mask_embedding")
+        return loaded
 
     def _read_mask_embedding(self) -> torch.Tensor | None:
         """Checks for an override mask embedding in `mask_embedding.pt` and returns it.
