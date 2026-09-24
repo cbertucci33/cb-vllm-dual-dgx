@@ -129,7 +129,7 @@ def test_plan_rejects_invalid_mcg_marker_dtype(tmp_path: Path):
     _make_checkpoint(source)
     shard = source / "model-00001.safetensors"
     with safe_open(shard, framework="pt", device="cpu") as handle:
-        tensors = {name: handle.get_tensor(name) for name in handle}
+        tensors = {name: handle.get_tensor(name) for name in handle.keys()}
     marker = next(name for name in tensors if name.endswith(".mcg"))
     tensors[marker] = tensors[marker].to(torch.int64)
     save_file(tensors, shard, metadata={"format": "pt"})
