@@ -34,6 +34,7 @@ from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
+from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import KpoolTailSpec, MLAAttentionSpec
 
 logger = init_logger(__name__)
@@ -190,13 +191,34 @@ class Glm5NextTailCache(DeepseekV32IndexerCache):
     def get_kv_cache_spec(self, vllm_config: VllmConfig):
         # The two head slots form [K, gate score] in the generic
         # [block, head, state, content] cache view.
+        span = self._index_kpool + vllm_config.num_speculative_tokens
+        capacity = self._index_kpool * cdiv(span, self._index_kpool)
+        storage_states = self.cache_config.block_size // self._index_kpool
+        max_page_size = max(PAGED_MQA_PAGE_SIZES)
+        min_page_size = min(PAGED_MQA_PAGE_SIZES)
+        if storage_states <= max_page_size:
+            indexer_page_states = storage_states
+        elif storage_states % max_page_size == 0:
+            indexer_page_states = max_page_size
+        else:
+            indexer_page_states = min_page_size
+        indexer_page_bytes = indexer_page_states * (self.head_dim + 4)
+        tail_page_bytes = 2 * capacity * self.head_dim * torch.bfloat16.itemsize
+        if tail_page_bytes > indexer_page_bytes:
+            raise ValueError(
+                "GLM K-pool speculative tail ring does not fit its aliased "
+                "indexer page: "
+                f"capacity={capacity}, tail_bytes={tail_page_bytes}, "
+                f"indexer_bytes={indexer_page_bytes}. Refusing a generic "
+                "cache-layout fallback."
+            )
         return KpoolTailSpec(
-            block_size=self._index_kpool,
+            block_size=capacity,
             num_kv_heads=2,
             head_size=self.head_dim,
             head_size_v=0,
             dtype=torch.bfloat16,
-            sliding_window=self._index_kpool,
+            sliding_window=capacity,
         )
 
     def get_attn_backend(self):

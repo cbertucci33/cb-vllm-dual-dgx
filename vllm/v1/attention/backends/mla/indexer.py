@@ -641,10 +641,10 @@ def compute_kpool_tail_slot_mapping(
     positions: torch.Tensor,
     num_actual_tokens: int,
     num_reqs: int,
-    kpool: int,
+    ring: int,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Map every token to its request's one circular tail block."""
+    """Map every token to its request's one circular tail-ring block."""
     if out is None:
         out = slot_mapping.clone()
     else:
@@ -657,7 +657,7 @@ def compute_kpool_tail_slot_mapping(
     req = req.clamp_(min=0, max=num_reqs - 1)
     own_block = block_table[:num_reqs, 0].index_select(0, req).to(torch.int64)
     pos = positions[:num_actual_tokens].to(torch.int64)
-    out[:num_actual_tokens] = own_block * kpool + torch.remainder(pos, kpool)
+    out[:num_actual_tokens] = own_block * ring + torch.remainder(pos, ring)
     return out
 
 

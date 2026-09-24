@@ -1802,6 +1802,23 @@ class MambaManager(SingleTypeKVCacheManager):
             )
         )
 
+    def _align_tokens_for_lookahead(
+        self, num_tokens: int, num_tokens_main_model: int
+    ) -> tuple[int, bool]:
+        """Return the page-aligned capacity required by scheduler lookahead."""
+        lookahead = num_tokens - num_tokens_main_model
+        materialize_next_page = (
+            lookahead >= 1
+            and num_tokens_main_model > 0
+            and num_tokens_main_model % self.block_size == 0
+        )
+        effective_tokens = (
+            num_tokens_main_model + self.block_size
+            if materialize_next_page
+            else num_tokens_main_model
+        )
+        return effective_tokens, materialize_next_page
+
     def get_num_blocks_to_allocate(
         self,
         request_id: str,
@@ -1839,12 +1856,9 @@ class MambaManager(SingleTypeKVCacheManager):
                 apply_admission_cap=apply_admission_cap,
             )
         else:
-            # We don't allocate blocks for lookahead tokens in align mode, because if
-            # x * block_size tokens are scheduled, num_tokens is
-            # x * block_size + num_lookahead_tokens and breaks the alignment.
-            # We can ignore lookahead tokens because current draft models don't have
-            # mamba layers.
-            num_tokens = num_tokens_main_model
+            num_tokens, materialize_next_page = self._align_tokens_for_lookahead(
+                num_tokens, num_tokens_main_model
+            )
 
             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
             # num_tokens can include draft tokens that will later be rejected.
@@ -1865,21 +1879,21 @@ class MambaManager(SingleTypeKVCacheManager):
             if has_partial_hit:
                 num_new_blocks = max(num_new_blocks, 0) + 1
             checkpoint_position = get_mamba_prefill_checkpoint_position(
-                num_tokens,
+                num_tokens_main_model,
                 self.block_pool.hash_block_size,
                 self.drop_eagle_checkpoint_block,
             )
             if not self._needs_internal_checkpoint(
                 request_id,
                 total_computed_tokens,
-                num_tokens,
+                num_tokens_main_model,
                 checkpoint_position,
             ):
                 checkpoint_position = 0
             checkpoint_block = int(checkpoint_position > 0)
             if not apply_admission_cap:
                 if checkpoint_position > 0:
-                    checkpoint_idx = cdiv(num_tokens, self.block_size) - 2
+                    checkpoint_idx = cdiv(num_tokens_main_model, self.block_size) - 2
                     self._checkpoints[request_id] = (
                         checkpoint_position,
                         checkpoint_idx,
@@ -1888,10 +1902,12 @@ class MambaManager(SingleTypeKVCacheManager):
                     self._checkpoints.pop(request_id, None)
             if num_new_blocks > 0:
                 blocks_allocated = request_id in self._allocated_block_reqs
-                if not (checkpoint_block and blocks_allocated):
-                    num_new_blocks = 1 + int(has_partial_hit) + checkpoint_block
-                    if not blocks_allocated:
-                        num_new_blocks += self.num_speculative_blocks
+                physical_block_cap = 1 + int(has_partial_hit) + checkpoint_block
+                if not blocks_allocated or checkpoint_block:
+                    physical_block_cap += self.num_speculative_blocks
+                if materialize_next_page:
+                    physical_block_cap += 1
+                num_new_blocks = min(num_new_blocks, physical_block_cap)
 
             num_evictable_computed_blocks = self._get_num_evictable_blocks(
                 new_computed_blocks
@@ -1911,12 +1927,9 @@ class MambaManager(SingleTypeKVCacheManager):
                 request_id, num_tokens, num_tokens_main_model
             )
         else:
-            # We don't allocate blocks for lookahead tokens in align mode, because if
-            # x * block_size tokens are scheduled, num_tokens is
-            # x * block_size + num_lookahead_tokens and breaks the alignment.
-            # We can ignore lookahead tokens because current draft models don't have
-            # mamba layers.
-            num_tokens = num_tokens_main_model
+            num_tokens, materialize_next_page = self._align_tokens_for_lookahead(
+                num_tokens, num_tokens_main_model
+            )
             req_blocks: list[KVCacheBlock] = self.req_to_blocks[request_id]
             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
             # num_tokens can include draft tokens that will later be rejected.
@@ -1953,6 +1966,11 @@ class MambaManager(SingleTypeKVCacheManager):
                 num_skipped_blocks = (
                     num_required_blocks - self.num_speculative_blocks - 1
                 )
+                if materialize_next_page:
+                    num_skipped_blocks = max(
+                        cdiv(num_tokens_main_model, self.block_size) - 1,
+                        0,
+                    )
                 # null blocks
                 if prev_block_len < num_skipped_blocks:
                     # minus the internal checkpoint block
@@ -1977,6 +1995,8 @@ class MambaManager(SingleTypeKVCacheManager):
                 max_new_blocks = 1 + int(has_partial_hit) + checkpoint_block
                 if not blocks_allocated or checkpoint_block:
                     max_new_blocks += self.num_speculative_blocks
+                if materialize_next_page:
+                    max_new_blocks += 1
                 assert num_new_blocks <= max_new_blocks
                 new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
                 returned_blocks = req_blocks[prev_block_len:]
