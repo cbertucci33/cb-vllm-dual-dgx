@@ -37,9 +37,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import
 from vllm.utils.network_utils import get_open_port
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KpoolTailSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheLayout,
+    KVCacheTensor,
+    create_kv_cache_views,
 )
 from vllm.v1.request import RequestStatus
 
@@ -1340,6 +1343,67 @@ def test_register_kv_caches(layout: KVCacheLayout, separate_kv_head_groups: bool
                 assert worker.kv_block_len_per_layer == [spec.page_size_bytes] * 2
                 assert worker.registered_layer_names == list(kv_caches)
                 assert worker.registered_layer_indices == [0, 1]
+
+
+def test_register_kpool_tail_transfers_keys_and_gate_scores():
+    """The tail payload occupies both head slots; padding stays untransferred."""
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_consumer"
+    )
+    num_blocks = 2
+    layer_name = "model.layers.0.self_attn"
+    tail_spec = KpoolTailSpec(
+        block_size=4,
+        num_kv_heads=2,
+        head_size=128,
+        head_size_v=0,
+        dtype=torch.bfloat16,
+        page_size_padded=4096,
+        sliding_window=4,
+    )
+    tensor = KVCacheTensor(
+        size=num_blocks * tail_spec.page_size_bytes,
+        layers=[layer_name],
+        layer_stride=num_blocks * tail_spec.page_size_bytes,
+        block_stride=tail_spec.page_size_bytes,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[tensor],
+        kv_cache_groups=[KVCacheGroupSpec([layer_name], tail_spec)],
+    )
+    raw = torch.zeros(tensor.size, dtype=torch.int8)
+    (tail_cache,) = create_kv_cache_views(
+        raw,
+        tail_spec,
+        num_blocks,
+        KVCacheLayout.LBHNC,
+        tensor,
+    )
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch_worker_dependencies(),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.threading.Event"
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.threading.Thread"
+        ) as mock_thread,
+    ):
+        connector = MooncakeConnector(
+            vllm_config,
+            KVConnectorRole.WORKER,
+            kv_cache_config,
+        )
+        worker = connector.connector_worker
+        mock_thread.return_value.is_alive.return_value = False
+
+        with patch.object(worker.engine, "batch_register_memory", return_value=0):
+            connector.register_kv_caches({layer_name: tail_cache})
+
+        assert worker.block_len_per_layer == [tail_spec.page_size_bytes]
+        assert worker.kv_block_len_per_layer == [tail_spec.unpadded_page_size_bytes]
 
 
 def test_register_kv_caches_supports_mixed_mla_and_eagle_shapes():

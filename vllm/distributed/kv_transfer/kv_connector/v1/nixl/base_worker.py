@@ -81,6 +81,7 @@ from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
     KpoolTailSpec,
+    KVCacheGroupSpec,
     KVCacheLayout,
     KVCacheSpec,
     MambaSpec,
@@ -255,14 +256,20 @@ class NixlBaseConnectorWorker:
             if _is_attention_spec(spec_type):
                 # A scratch cache lives only in its own regions; every other
                 # attention group spans all of them.
-                fa_region_ids = (
-                    np.asarray(self._scratch_region_indices, dtype=np.int32)
-                    if spec_type is CircularBufferSpec
-                    else np.arange(self.num_regions, dtype=np.int32)
-                )[:, None]
-                all_descs.append(
-                    (fa_region_ids * num_blocks + group_arr[None, :]).ravel()
-                )
+                if spec_type is CircularBufferSpec:
+                    fa_region_ids = np.asarray(
+                        self._scratch_region_indices, dtype=np.int32
+                    )
+                    all_descs.append(
+                        (
+                            region_offsets[fa_region_ids, None] + group_arr[None, :]
+                        ).ravel()
+                    )
+                else:
+                    fa_region_ids = np.arange(self.num_regions, dtype=np.int32)[:, None]
+                    all_descs.append(
+                        (fa_region_ids * num_blocks + group_arr[None, :]).ravel()
+                    )
             elif _is_ssm_spec(spec_type):
                 # NOTE (NickLucche) SSM and Attention block regions can
                 # be exchanged arbitrarily by manager.  Therefore, descs
@@ -749,9 +756,14 @@ class NixlBaseConnectorWorker:
         self._sync_block_size_with_kernel()
 
         # Unwrap UniformTypeKVCacheSpecs to get the representative spec type
+        def transfer_spec_type(group: KVCacheGroupSpec) -> type[KVCacheSpec]:
+            spec_type = get_representative_spec_type(group.kv_cache_spec)
+            # The K-pool tail is an independently allocated one-block scratch
+            # group even though its storage aliases the compressed indexer.
+            return CircularBufferSpec if spec_type is KpoolTailSpec else spec_type
+
         self._group_spec_types = tuple(
-            get_representative_spec_type(g.kv_cache_spec)
-            for g in self.kv_cache_config.transfer_groups
+            transfer_spec_type(group) for group in self.kv_cache_config.transfer_groups
         )
         # Per-region MLA flag, 1:1 with block_len_per_layer. True -> REPLICATE
         # (MLA), False -> SPLIT (head-sharded full-attn). Mixed only for models
@@ -1292,7 +1304,7 @@ class NixlBaseConnectorWorker:
             layer_specs[layer_name] = layer_spec
             physical_page_size = (
                 layer_spec.page_size_bytes
-                if isinstance(layer_spec, MambaSpec)
+                if isinstance(layer_spec, (MambaSpec, KpoolTailSpec))
                 else layer_spec.page_size_bytes
                 // self._physical_blocks_per_logical_kv_block
             )
@@ -1352,7 +1364,7 @@ class NixlBaseConnectorWorker:
             group_id = group_index
             num_blocks = (
                 logical_num_blocks
-                if isinstance(layer_spec, MambaSpec)
+                if isinstance(layer_spec, (MambaSpec, KpoolTailSpec))
                 else logical_num_blocks * self._physical_blocks_per_logical_kv_block
             )
             base_addr = cache.data_ptr()
@@ -1388,31 +1400,33 @@ class NixlBaseConnectorWorker:
 
             if isinstance(layer_spec, KpoolTailSpec):
                 compressed_owner = compressed_region_owners.get(cache.data_ptr())
-                if compressed_owner is not None:
-                    owner_storage = compressed_owner.untyped_storage()
-                    owner_end = compressed_owner.data_ptr() + compressed_owner.nbytes
-                    tail_is_covered = (
-                        compressed_owner.is_contiguous()
-                        and owner_storage.data_ptr() == storage_addr
-                        and _tensor_byte_span_end(cache) <= owner_end
+                if compressed_owner is None:
+                    raise AssertionError(
+                        "Kpool tail cache has no compressed indexer owner: "
+                        f"{layer_name}"
                     )
-                    if not tail_is_covered:
-                        raise AssertionError(
-                            "Kpool tail cache is not fully covered by its compressed "
-                            f"indexer region: layer={layer_name}, "
-                            f"tail_shape={tuple(cache.shape)}, "
-                            f"tail_stride={tuple(cache.stride())}, "
-                            f"owner_shape={tuple(compressed_owner.shape)}, "
-                            f"owner_stride={tuple(compressed_owner.stride())}"
-                        )
-                    logger.debug(
-                        "Skipping layer %s because its compressed indexer region "
-                        "covers the same storage",
-                        layer_name,
+                owner_storage = compressed_owner.untyped_storage()
+                owner_end = compressed_owner.data_ptr() + compressed_owner.nbytes
+                if not (
+                    owner_storage.data_ptr() == storage_addr
+                    and _tensor_byte_span_end(cache) <= owner_end
+                ):
+                    raise AssertionError(
+                        "Kpool tail cache is not fully covered by its compressed "
+                        f"indexer region: layer={layer_name}, "
+                        f"tail_shape={tuple(cache.shape)}, "
+                        f"tail_stride={tuple(cache.stride())}, "
+                        f"owner_shape={tuple(compressed_owner.shape)}, "
+                        f"owner_stride={tuple(compressed_owner.stride())}"
                     )
-                    continue
-
-            if isinstance(layer_spec, MambaSpec):
+                region_specs = [
+                    (
+                        cache.data_ptr(),
+                        layer_spec.unpadded_page_size_bytes,
+                        cache.stride(0) * cache.element_size(),
+                    )
+                ]
+            elif isinstance(layer_spec, MambaSpec):
                 physical_ratio = self._physical_blocks_per_logical_kv_block
                 block_len = physical_page_size // physical_ratio
                 block_stride = physical_page_size
@@ -1487,7 +1501,9 @@ class NixlBaseConnectorWorker:
                     ]
 
             for base_addr, block_len, block_stride in region_specs:
-                if base_addr in seen_base_addresses:
+                if base_addr in seen_base_addresses and not isinstance(
+                    layer_spec, KpoolTailSpec
+                ):
                     region_index = seen_base_addresses.index(base_addr)
                     assert region_mem_types[region_index] == mem_type
                     self._region_is_mla[region_index] |= is_mla_region
@@ -1516,7 +1532,7 @@ class NixlBaseConnectorWorker:
                     elif region_index not in self._ssm_region_indices:
                         self._ssm_region_indices.append(region_index)
                 elif (
-                    isinstance(layer_spec, CircularBufferSpec)
+                    isinstance(layer_spec, (CircularBufferSpec, KpoolTailSpec))
                     and region_index not in self._scratch_region_indices
                 ):
                     self._scratch_region_indices.append(region_index)
@@ -1561,7 +1577,15 @@ class NixlBaseConnectorWorker:
         self._uses_region_group_mapping = len(set(self.region_group_ids)) > 1
         self._mixed_mem_types = len(set(region_mem_types)) > 1
         if self._has_mamba:
-            self.region_num_blocks = [self.num_blocks] * self.num_regions
+            # Hybrid registration historically normalizes attention aliases to
+            # the kernel-expanded block count. Scratch regions are independent
+            # one-block-per-request groups and retain their logical geometry.
+            self.region_num_blocks = [
+                count
+                if region_index in self._scratch_region_indices
+                else self.num_blocks
+                for region_index, count in enumerate(self.region_num_blocks)
+            ]
 
         if self.pp_size > 1:
             start_layer, end_layer = self.model_config.get_layers_start_end_indices(

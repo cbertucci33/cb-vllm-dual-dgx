@@ -506,21 +506,43 @@ def test_register_compressed_indexer_uses_virtual_transfer_pages(
                 0,
             ]
             for block_idx in range(num_transfer_blocks)
+        ]
+        + [
+            [
+                raw.data_ptr() + block_idx * indexer_page_size,
+                tail_spec.unpadded_page_size_bytes,
+                0,
+            ]
+            for block_idx in range(num_logical_blocks)
         ],
         dtype=np.uint64,
     )
 
     assert worker.block_size == transfer_block_size
-    assert worker.num_regions == 1
-    assert worker.block_len_per_layer == [transfer_page_size]
-    assert worker.block_stride_per_layer == [transfer_page_size]
-    assert worker._region_is_mla == [True]
-    assert worker.kv_caches_base_addr[worker.engine_id][0] == [raw.data_ptr()]
+    assert worker.num_regions == 2
+    assert worker.block_len_per_layer == [
+        transfer_page_size,
+        tail_spec.unpadded_page_size_bytes,
+    ]
+    assert worker.block_stride_per_layer == [transfer_page_size, indexer_page_size]
+    assert worker.region_num_blocks == [num_transfer_blocks, num_logical_blocks]
+    assert worker._region_is_mla == [True, False]
+    assert worker._scratch_region_indices == [1]
+    assert worker.kv_caches_base_addr[worker.engine_id][0] == [
+        raw.data_ptr(),
+        raw.data_ptr(),
+    ]
     assert worker._registered_descs[0] == [(raw.data_ptr(), raw.nbytes, 0, "")]
     np.testing.assert_array_equal(worker.src_blocks_data, expected_descs)
-    assert expected_descs[-1, 0] + expected_descs[-1, 1] == (
-        raw.data_ptr() + raw.nbytes
+    desc_ids = worker._compute_desc_ids(
+        block_ids=([1], [2]),
+        dst_num_blocks=num_transfer_blocks,
+        block_size_ratio=None,
+        physical_blocks_per_logical=num_transfer_blocks // num_logical_blocks,
     )
+    assert desc_ids.tolist() == [1, num_transfer_blocks + 2]
+    indexer_end = expected_descs[num_transfer_blocks - 1]
+    assert indexer_end[0] + indexer_end[1] == raw.data_ptr() + raw.nbytes
 
 
 def _make_remote_meta(

@@ -1762,7 +1762,7 @@ class MooncakeConnectorWorker:
                 region_base_addresses.append(base_addr)
 
                 if isinstance(layer_spec, KpoolTailSpec):
-                    kv_block_len = layer_spec.unpadded_page_size_bytes // 2
+                    kv_block_len = layer_spec.unpadded_page_size_bytes
                 elif isinstance(layer_spec, AttentionSpec) and block_is_contiguous:
                     assert (
                         layer_spec.page_size_bytes
