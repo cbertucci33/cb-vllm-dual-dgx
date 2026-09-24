@@ -640,6 +640,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.vllm_config,
                 self.device,
                 draft_layer_names=draft_attn_layer_names,
+                draft_vllm_config=(
+                    self.speculator.attn_vllm_config
+                    if isinstance(self.speculator, DraftModelSpeculator)
+                    else None
+                ),
             )
         additional_attn_cg_support = self.model_state.get_additional_cg_support()
         attn_cg_support = attn_cg_support.narrow(*additional_attn_cg_support)

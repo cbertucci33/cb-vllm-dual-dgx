@@ -16,6 +16,93 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
 
 
+def test_dflash_attention_config_uses_draft_cache_dtype():
+    from vllm.config import VllmConfig
+
+    target_config = VllmConfig()
+    speculator = object.__new__(DFlashSpeculator)
+    speculator.vllm_config = target_config
+    speculator.speculative_config = SimpleNamespace(
+        attention_backend="FLASHINFER",
+        kv_cache_dtype="fp8_e4m3",
+    )
+    speculator.requires_non_causal = True
+
+    config = speculator.attn_vllm_config
+
+    assert config.cache_config.cache_dtype == "fp8_e4m3"
+    assert config.attention_config.backend.name == "FLASHINFER"
+    assert config.attention_config.use_non_causal is True
+    assert config.cache_config is not target_config.cache_config
+
+
+def test_attention_groups_receive_target_and_draft_configs(monkeypatch):
+    from vllm.v1.worker.gpu import attn_utils
+
+    target_config = SimpleNamespace(parallel_config=object())
+    draft_config = SimpleNamespace(parallel_config=object())
+    captured = {}
+
+    class FakeSpec:
+        has_layer_views = True
+
+    class FakeBackend:
+        def __init__(self, name):
+            self.name = name
+
+        def full_cls_name(self):
+            return self.name
+
+    layers = {
+        "target": SimpleNamespace(
+            get_attn_backend=lambda: FakeBackend("target-backend"), num_heads=1
+        ),
+        "draft": SimpleNamespace(
+            get_attn_backend=lambda: FakeBackend("draft-backend"), num_heads=1
+        ),
+    }
+
+    class FakeGroup:
+        def __init__(self, backend, layer_names, kv_cache_spec, kv_cache_group_id):
+            self.layer_names = list(layer_names)
+            self.metadata_builders = []
+
+        def create_metadata_builders(self, vllm_config, **kwargs):
+            captured[self.layer_names[0]] = vllm_config
+
+    monkeypatch.setattr(attn_utils, "AttentionGroup", FakeGroup)
+    monkeypatch.setattr(
+        attn_utils,
+        "get_layers_from_vllm_config",
+        lambda config, layer_type, names: {name: layers[name] for name in names},
+    )
+    monkeypatch.setattr(attn_utils, "get_shared_kv_cache_layers", lambda config: {})
+    monkeypatch.setattr(
+        attn_utils, "add_kv_sharing_layers_to_kv_cache_groups", lambda *args: None
+    )
+    monkeypatch.setattr(
+        attn_utils, "get_kv_sharing_fast_prefill_eligible_layers", lambda *args: set()
+    )
+    monkeypatch.setattr(attn_utils, "prepare_kernel_block_sizes", lambda *args: [16])
+    monkeypatch.setattr(attn_utils, "get_num_ubatches", lambda config: 1)
+    monkeypatch.setattr(attn_utils, "get_attn_cg_support", lambda *args: "support")
+
+    cache_config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(layer_names=["target", "draft"], kv_cache_spec=FakeSpec())
+        ]
+    )
+    attn_utils.init_attn_backend(
+        cache_config,
+        target_config,
+        device=None,
+        draft_layer_names={"draft"},
+        draft_vllm_config=draft_config,
+    )
+
+    assert captured == {"target": target_config, "draft": draft_config}
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_ring_synthesis_covers_context_and_draft_queries():
     from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (

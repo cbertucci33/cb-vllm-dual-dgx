@@ -158,12 +158,19 @@ class DFlashSpeculator(DraftModelSpeculator):
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
-        # The draft's attention differs from the target's in causality.
+        # The draft's attention differs from the target's in causality,
+        # backend, and potentially KV-cache dtype.
         config = copy.copy(super().attn_vllm_config)
         config.attention_config = replace(
             self.vllm_config.attention_config,
             use_non_causal=self.requires_non_causal,
+            backend=self.speculative_config.attention_backend,
         )
+        if self.speculative_config.kv_cache_dtype is not None:
+            config.cache_config = replace(
+                self.vllm_config.cache_config,
+                cache_dtype=self.speculative_config.kv_cache_dtype,
+            )
         return config
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:

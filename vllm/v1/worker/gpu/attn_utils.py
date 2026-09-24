@@ -189,6 +189,7 @@ def init_attn_backend(
     device: torch.device,
     active_layer_names: set[str] | None = None,
     draft_layer_names: set[str] | None = None,
+    draft_vllm_config: VllmConfig | None = None,
 ) -> tuple[list[list[AttentionGroup]], AttentionCGSupportInfo, list[int]]:
     # Phase 1: discover attention groups for each kv cache group.
     attn_groups: list[list[AttentionGroup]] = []
@@ -256,14 +257,23 @@ def init_attn_backend(
         if kv_cache_group_id < len(kernel_block_sizes):
             kernel_block_size = kernel_block_sizes[kv_cache_group_id]
         for group in groups:
+            group_vllm_config = vllm_config
+            if (
+                draft_vllm_config is not None
+                and draft_layer_names is not None
+                and set(group.layer_names).issubset(draft_layer_names)
+            ):
+                group_vllm_config = draft_vllm_config
             group.create_metadata_builders(
-                vllm_config=vllm_config,
+                vllm_config=group_vllm_config,
                 device=device,
                 kernel_block_size=kernel_block_size,
                 # Microbatches build attention metadata concurrently, and some
                 # builders keep the prepared metadata on themselves (MLA stores
                 # it on the prefill backend), so each ubatch needs its own.
-                num_metadata_builders=get_num_ubatches(vllm_config.parallel_config),
+                num_metadata_builders=get_num_ubatches(
+                    group_vllm_config.parallel_config
+                ),
             )
             # The microbatches' builders share the workspace: they all issue
             # attention on the one compute stream the threads hand off, so the
