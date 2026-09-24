@@ -182,6 +182,7 @@ def main() -> None:
             "reasoning_parser": "glm45",
         },
         "runtime_contract": {
+            "load_format": "instanttensor",
             "attention_backend": "FLASHINFER_MLA_SPARSE_SM120",
             "target_cache_dtype": "fp8_ds_mla",
             "draft_cache_dtype": "fp8_e4m3",

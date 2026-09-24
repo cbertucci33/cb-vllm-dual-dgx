@@ -51,6 +51,7 @@ B12X_MM_SIGNATURE = (
     ("kwargs", "VAR_KEYWORD"),
 )
 REQUIRED_RUNTIME_CONTRACT = {
+    "load_format": "instanttensor",
     "attention_backend": "FLASHINFER_MLA_SPARSE_SM120",
     "target_cache_dtype": "fp8_ds_mla",
     "draft_cache_dtype": "fp8_e4m3",
@@ -309,10 +310,6 @@ def verify_build() -> dict[str, str]:
 def verify_runtime() -> dict[str, str]:
     import torch
     from b12x.gemm import mxfp8_linear
-    from b12x.integration.vllm.loader import (
-        B12xModelLoader,
-        register_b12x_loader,
-    )
     from flashinfer.mla import _sparse_mla_sm120 as sparse_mla_sm120
     from flashinfer.topk import get_topk_module
     from sparkinfer.moe import trellis_moe
@@ -349,8 +346,6 @@ def verify_runtime() -> dict[str, str]:
     for name in ("is_supported", "pack_weight", "mm"):
         if not hasattr(mxfp8_linear, name):
             raise RuntimeError(f"pinned B12X MXFP8 API lacks {name}")
-    if not inspect.isclass(B12xModelLoader) or not callable(register_b12x_loader):
-        raise RuntimeError("B12X vLLM loader plugin contract is unavailable")
     require_signature(
         mxfp8_linear.pack_weight,
         B12X_PACK_WEIGHT_SIGNATURE,
