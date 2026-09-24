@@ -151,6 +151,27 @@ def test_dflash2_projection_layers_receive_draft_quant_config(
     assert captured == [quant_config, quant_config]
 
 
+def test_mxfp8_context_kv_rows_are_dequantized_for_plain_linear():
+    from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
+
+    model = object.__new__(DFlashQwen3Model)
+    torch.nn.Module.__init__(model)
+    model.hidden_norm = torch.nn.Linear(1, 1, bias=False, dtype=torch.bfloat16)
+
+    source = torch.linspace(-3, 3, 6 * 32, dtype=torch.bfloat16).view(6, 32)
+    weight = source.to(torch.float8_e4m3fn)
+    scales = torch.full((6, 1), 127, dtype=torch.uint8)
+    attn = SimpleNamespace(
+        q_size=2,
+        qkv_proj=SimpleNamespace(weight=weight, weight_scale=scales),
+    )
+
+    rows = model._kv_projection_rows(attn)
+
+    assert rows.dtype is torch.bfloat16
+    torch.testing.assert_close(rows, weight[2:].to(torch.bfloat16))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_fp8_draft_head_logits_track_bf16_reference():
     from vllm.model_executor.layers.fp8_draft_head import (
