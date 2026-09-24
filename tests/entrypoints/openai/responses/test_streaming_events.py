@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from types import SimpleNamespace
-
-from openai.types.responses import ResponseFunctionWebSearch
+from openai.types.responses import ResponseFunctionWebSearch, response_text_delta_event
 from openai_harmony import Message, Role
 
 from vllm.entrypoints.generate.base.protocol import (
@@ -62,13 +60,15 @@ def test_simple_streaming_ids_and_final_logprobs():
     content_open = emit_simple_content_open(content_state)
     assert content_open[0].item.id.startswith("msg_")
 
-    input_logprob = SimpleNamespace(
+    input_logprob = response_text_delta_event.Logprob(
         token="é",
         logprob=-0.25,
-        top_logprobs=[SimpleNamespace(token="e", logprob=-0.5)],
+        top_logprobs=[
+            response_text_delta_event.LogprobTopLogprob(token="e", logprob=-0.5)
+        ],
     )
     content_delta = emit_simple_content_delta(content_state, "é", [input_logprob])[0]
-    assert content_delta.logprobs[0].bytes == list("é".encode())
+    assert content_delta.logprobs[0].token == "é"
     content_done = emit_simple_content_done(content_state)
     output_text = content_done[-1].item.content[0]
     assert output_text.logprobs is not None
