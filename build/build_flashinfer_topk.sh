@@ -75,5 +75,5 @@ if not spec.jit_library_path.is_file():
 shutil.copy2(spec.jit_library_path, output / "flashinfer-topk-sm121.so")
 PY
 
-sha256sum "$output/flashinfer-topk-sm121.so" \
-  > "$output/flashinfer-topk-sm121.sha256"
+sha256sum "$output_dir/flashinfer-topk-sm121.so" \
+  > "$output_dir/flashinfer-topk-sm121.sha256"
