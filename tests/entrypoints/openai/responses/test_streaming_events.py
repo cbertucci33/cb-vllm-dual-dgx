@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 from openai.types.responses import ResponseFunctionWebSearch
 from openai_harmony import Message, Role
 
@@ -11,9 +13,14 @@ from vllm.entrypoints.generate.base.protocol import (
 )
 from vllm.entrypoints.openai.responses.streaming_events import (
     SimpleStreamingEventProcessor,
+    SimpleStreamingState,
     StreamingState,
     _StateType,
     emit_browser_tool_events,
+    emit_simple_content_delta,
+    emit_simple_content_done,
+    emit_simple_content_open,
+    emit_simple_reasoning_open,
     split_delta,
 )
 
@@ -41,10 +48,35 @@ def test_browser_find_uses_responses_action_type():
 
 
 def _make_tool_call(
-    index: int, name: str | None = None, arguments: str | None = None
+    index: int,
+    name: str | None = None,
+    arguments: str | None = None,
+    call_id: str | None = None,
 ) -> DeltaToolCall:
     fn = DeltaFunctionCall(name=name, arguments=arguments)
-    return DeltaToolCall(index=index, function=fn)
+    return DeltaToolCall(index=index, function=fn, id=call_id)
+
+
+def test_simple_streaming_ids_and_final_logprobs():
+    content_state = SimpleStreamingState()
+    content_open = emit_simple_content_open(content_state)
+    assert content_open[0].item.id.startswith("msg_")
+
+    input_logprob = SimpleNamespace(
+        token="é",
+        logprob=-0.25,
+        top_logprobs=[SimpleNamespace(token="e", logprob=-0.5)],
+    )
+    emit_simple_content_delta(content_state, "é", [input_logprob])
+    content_done = emit_simple_content_done(content_state)
+    output_text = content_done[-1].item.content[0]
+    assert output_text.logprobs is not None
+    assert output_text.logprobs[0].bytes == list("é".encode())
+    assert output_text.logprobs[0].top_logprobs[0].bytes == [ord("e")]
+
+    reasoning_state = SimpleStreamingState()
+    reasoning_open = emit_simple_reasoning_open(reasoning_state)
+    assert reasoning_open[0].item.id.startswith("rs_")
 
 
 class TestSplitDelta:
@@ -121,6 +153,23 @@ class TestProcessorCompoundDeltas:
         ]
         assert len(added) == 2
         assert len(deltas) == 2
+
+    def test_caller_tool_call_id_is_preserved(self):
+        tool_call = _make_tool_call(
+            0,
+            name="get_weather",
+            arguments='{"city":"SF"}',
+            call_id="call_client_supplied",
+        )
+
+        processor = SimpleStreamingEventProcessor()
+        events = _run_through_processor(
+            processor, DeltaMessage(tool_calls=[tool_call])
+        )
+
+        added = next(e for e in events if e.type == "response.output_item.added")
+        assert added.item.id.startswith("fc_")
+        assert added.item.call_id == "call_client_supplied"
 
     def test_split_name_and_args_same_index(self):
         """Regression: parsers like KimiK2 emit name and args as separate

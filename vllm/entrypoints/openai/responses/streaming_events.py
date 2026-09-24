@@ -55,6 +55,10 @@ from openai.types.responses import (
     response_text_delta_event,
 )
 from openai.types.responses.response_output_item import McpCall
+from openai.types.responses.response_output_text import Logprob as OutputTextLogprob
+from openai.types.responses.response_output_text import (
+    LogprobTopLogprob as OutputTextTopLogprob,
+)
 from openai.types.responses.response_reasoning_item import (
     Content as ResponseReasoningTextContent,
 )
@@ -823,16 +827,39 @@ class SimpleStreamingState:
     tool_call_namespace: str | None = None
     tool_call_index: int | None = None
     has_emitted_tool_call_delta: bool = False
+    accumulated_logprobs: list[OutputTextLogprob] = field(default_factory=list)
     current_state: _StateType = field(default_factory=lambda: _StateType.NONE)
+
+
+def _output_text_logprobs(
+    logprobs: list[response_text_delta_event.Logprob],
+) -> list[OutputTextLogprob]:
+    return [
+        OutputTextLogprob(
+            token=lp.token,
+            logprob=lp.logprob,
+            bytes=list(lp.token.encode("utf-8", errors="replace")),
+            top_logprobs=[
+                OutputTextTopLogprob(
+                    token=top.token,
+                    logprob=top.logprob,
+                    bytes=list(top.token.encode("utf-8", errors="replace")),
+                )
+                for top in lp.top_logprobs
+            ],
+        )
+        for lp in logprobs
+    ]
 
 
 def emit_simple_content_open(
     state: SimpleStreamingState,
 ) -> list[StreamingResponsesResponse]:
     state.current_state = _StateType.CONTENT
-    state.current_item_id = random_uuid()
+    state.current_item_id = f"msg_{random_uuid()}"
     state.content_index = 0
     state.accumulated_text = ""
+    state.accumulated_logprobs = []
     return [
         ResponseOutputItemAddedEvent(
             type="response.output_item.added",
@@ -868,6 +895,8 @@ def emit_simple_content_delta(
     logprobs: list[response_text_delta_event.Logprob] | None = None,
 ) -> list[StreamingResponsesResponse]:
     state.accumulated_text += delta
+    if logprobs:
+        state.accumulated_logprobs.extend(_output_text_logprobs(logprobs))
     return [
         ResponseTextDeltaEvent(
             type="response.output_text.delta",
@@ -888,6 +917,7 @@ def emit_simple_content_done(
         type="output_text",
         text=state.accumulated_text,
         annotations=[],
+        logprobs=state.accumulated_logprobs or None,
     )
     events: list[StreamingResponsesResponse] = [
         ResponseTextDoneEvent(
@@ -917,7 +947,6 @@ def emit_simple_content_done(
                 role="assistant",
                 content=[part] if state.accumulated_text else [],
                 status="completed",
-                summary=[],
             ),
         ),
     ]
@@ -930,7 +959,7 @@ def emit_simple_reasoning_open(
     state: SimpleStreamingState,
 ) -> list[StreamingResponsesResponse]:
     state.current_state = _StateType.REASONING
-    state.current_item_id = random_uuid()
+    state.current_item_id = f"rs_{random_uuid()}"
     state.content_index = 0
     state.accumulated_text = ""
     return [
@@ -1023,10 +1052,11 @@ def emit_simple_tool_call_open(
     name: str,
     index: int | None,
     namespace: str | None = None,
+    call_id: str | None = None,
 ) -> list[StreamingResponsesResponse]:
     state.current_state = _StateType.TOOL_CALL
-    state.current_item_id = random_uuid()
-    state.tool_call_id = f"call_{random_uuid()}"
+    state.current_item_id = f"fc_{random_uuid()}"
+    state.tool_call_id = call_id or f"call_{random_uuid()}"
     state.tool_call_name = name
     state.tool_call_namespace = namespace
     state.tool_call_index = index
@@ -1249,6 +1279,7 @@ class SimpleStreamingEventProcessor:
                 call_name.name,
                 tool_call.index,
                 call_name.namespace,
+                tool_call.id,
             )
         return handlers.open_fn(self.state)
 

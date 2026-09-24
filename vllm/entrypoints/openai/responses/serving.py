@@ -12,6 +12,7 @@ from typing import Any, Final, cast
 from fastapi import Request
 from openai.types.responses import (
     ResponseOutputItem,
+    ResponseOutputItemDoneEvent,
     ResponseOutputMessage,
     ResponseOutputText,
     ResponseStatus,
@@ -1335,6 +1336,9 @@ class OpenAIServingResponses(GenerateBaseServing):
                 )
             )
 
+            streamed_items: list[ResponseOutputItem] | None = (
+                None if self.use_harmony else []
+            )
             try:
                 async for event_data in processor(
                     request,
@@ -1347,6 +1351,10 @@ class OpenAIServingResponses(GenerateBaseServing):
                     created_time,
                     _increment_sequence_number_and_return,
                 ):
+                    if streamed_items is not None and isinstance(
+                        event_data, ResponseOutputItemDoneEvent
+                    ):
+                        streamed_items.append(event_data.item)
                     yield event_data
             except GenerationError as e:
                 error_json = self._convert_generation_error_to_streaming_response(e)
@@ -1371,6 +1379,11 @@ class OpenAIServingResponses(GenerateBaseServing):
                 request_metadata,
                 created_time=created_time,
             )
+            if (
+                streamed_items is not None
+                and isinstance(final_response, ResponsesResponse)
+            ):
+                final_response.output = streamed_items
             yield _increment_sequence_number_and_return(
                 ResponseCompletedEvent(
                     type="response.completed",
