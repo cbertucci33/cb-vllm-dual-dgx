@@ -715,6 +715,28 @@ def dcp_world_size_for_kv_cache_spec(spec: KVCacheSpec, dcp_world_size: int) -> 
     return 1
 
 
+def get_draft_replay_reserve(kv_cache_groups: Sequence[KVCacheGroupSpec]) -> int:
+    """Return target tokens that must be replayed to rebuild private draft KV."""
+    return max(
+        (
+            group.kv_cache_spec.sliding_window
+            for group in kv_cache_groups
+            if type(group.kv_cache_spec) is DFlashSWASpec
+        ),
+        default=0,
+    )
+
+
+def get_draft_replay_boundary(
+    num_prompt_tokens: int,
+    draft_replay_reserve: int,
+    scheduler_block_size: int,
+) -> int:
+    """Return the last restorable target-state boundary for a draft window."""
+    max_replay = max(num_prompt_tokens - 1 - draft_replay_reserve, 0)
+    return max_replay // scheduler_block_size * scheduler_block_size
+
+
 def resolve_kv_cache_block_sizes(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,

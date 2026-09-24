@@ -31,6 +31,11 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import make_zmq_path
+from vllm.v1.core.kv_cache_utils import (
+    get_draft_replay_boundary,
+    get_draft_replay_reserve,
+    resolve_kv_cache_block_sizes,
+)
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -72,6 +77,12 @@ class NixlBaseConnectorScheduler:
         self.block_size = vllm_config.cache_config.block_size
         self.engine_id: EngineId = engine_id
         self.kv_cache_config = kv_cache_config
+        self.scheduler_block_size, _ = resolve_kv_cache_block_sizes(
+            kv_cache_config, vllm_config
+        )
+        self.draft_replay_reserve = get_draft_replay_reserve(
+            kv_cache_config.kv_cache_groups
+        )
         self.side_channel_host = envs.VLLM_NIXL_SIDE_CHANNEL_HOST
         self.side_channel_port = (
             envs.VLLM_NIXL_SIDE_CHANNEL_PORT
@@ -385,9 +396,20 @@ class NixlBaseConnectorScheduler:
     def _get_remote_prefill_token_count(self, num_prompt_tokens: int) -> int:
         """D-side only. Returns N-1 for Mamba models since the decoder
         always recomputes the last token and must start from h(N-1)."""
-        if self._has_mamba and num_prompt_tokens > 1:
-            return num_prompt_tokens - 1
-        return num_prompt_tokens
+        producer_prompt_tokens = (
+            num_prompt_tokens - 1
+            if self._has_mamba and num_prompt_tokens > 1
+            else num_prompt_tokens
+        )
+        if self.draft_replay_reserve:
+            # The producer request is already truncated to this token count.
+            # Restore a boundary it materialized, then replay the draft window.
+            return get_draft_replay_boundary(
+                producer_prompt_tokens,
+                self.draft_replay_reserve,
+                self.scheduler_block_size,
+            )
+        return producer_prompt_tokens
 
     def _truncate_mamba_request_for_prefill(self, request: "Request") -> None:
         """P-side only: drop the last prompt token so the prefiller computes

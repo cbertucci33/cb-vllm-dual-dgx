@@ -13,6 +13,7 @@ from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
+    get_draft_replay_reserve,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     SingleTypeKVCacheManager,
@@ -83,6 +84,7 @@ class MooncakeStoreCoordinator:
         use_eagle: bool = False,
         retention_interval: int | None = None,
         dcp_world_size: int = 1,
+        draft_replay_reserve: int | None = None,
     ) -> None:
         # Mirrors core's resolve_kv_cache_block_sizes: the hash unit only has
         # to divide groups that participate in prefix caching. Non-shareable
@@ -113,6 +115,9 @@ class MooncakeStoreCoordinator:
         self.enable_partial_hash_hits = partial_hash_hits_enabled(
             kv_cache_groups, hash_block_size, dcp_world_size
         )
+        if draft_replay_reserve is None:
+            draft_replay_reserve = get_draft_replay_reserve(kv_cache_groups)
+        self.draft_replay_reserve = draft_replay_reserve
         self.use_eagle = use_eagle
         # Mirror vLLM core's KVCacheCoordinator.retention_interval.
         self.retention_interval = retention_interval

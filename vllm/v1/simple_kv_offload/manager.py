@@ -30,6 +30,7 @@ from vllm.v1.core.kv_cache_utils import (
     dcp_world_size_for_kv_cache_spec,
     generate_block_hash_extra_keys,
     get_block_hash,
+    get_draft_replay_reserve,
     get_group_id,
     make_block_hash_with_group_id,
     maybe_convert_block_hash,
@@ -199,6 +200,9 @@ class SimpleCPUOffloadScheduler:
             hash_block_size=self.hash_block_size,
             allow_partial_hash_hits=not lazy_offload,
         )
+        self.cpu_coordinator.draft_replay_reserve = get_draft_replay_reserve(
+            self.cpu_kv_cache_config.kv_cache_groups
+        )
         self.group_block_sizes = self.cpu_coordinator.group_block_sizes
         # FA group's own resolved block_size; divides scheduler_block_size (the
         # LCM) but is NOT assumed to equal it.
@@ -353,7 +357,12 @@ class SimpleCPUOffloadScheduler:
             return 0, False
         # Must recompute at least the last token, matching the logic in
         # kv_cache_manager.get_computed_blocks().
-        max_hit_len = request.num_tokens - 1 - num_computed_tokens
+        max_hit_len = (
+            request.num_tokens
+            - 1
+            - self.cpu_coordinator.draft_replay_reserve
+            - num_computed_tokens
+        )
         if max_hit_len <= 0:
             return 0, False
         cpu_hit_blocks, hit_length, _ = self.cpu_coordinator.find_longest_cache_hit(

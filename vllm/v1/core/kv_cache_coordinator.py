@@ -12,6 +12,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
     dcp_world_size_for_kv_cache_spec,
+    get_draft_replay_boundary,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
@@ -94,6 +95,7 @@ class KVCacheCoordinator(ABC):
         )
         self.scheduler_block_size = scheduler_block_size
         self.num_reprefillable_tokens = max(0, num_prefill_lookahead - 1)
+        self.draft_replay_reserve = 0
 
         self.block_pool = BlockPool(
             num_gpu_blocks=kv_cache_config.num_blocks,
@@ -325,6 +327,14 @@ class KVCacheCoordinator(ABC):
         resend's hit to 0. The alignment is the scheduler block size, not the
         finer hash granularity, which would over-estimate the reach.
         """
+        if self.draft_replay_reserve:
+            return (
+                get_draft_replay_boundary(
+                    request.num_prompt_tokens,
+                    self.draft_replay_reserve,
+                    self.scheduler_block_size,
+                ),
+            )
         if not self.eagle_group_ids:
             return (request.num_prompt_tokens - 1,)
         block = self.scheduler_block_size

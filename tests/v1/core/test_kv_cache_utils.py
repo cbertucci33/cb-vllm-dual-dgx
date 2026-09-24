@@ -44,6 +44,8 @@ from vllm.v1.core.kv_cache_utils import (
     estimate_max_model_len,
     generate_block_hash_extra_keys,
     generate_scheduler_kv_cache_config,
+    get_draft_replay_boundary,
+    get_draft_replay_reserve,
     get_kv_cache_capacity,
     get_kv_cache_configs,
     get_kv_cache_groups,
@@ -62,6 +64,7 @@ from vllm.v1.hisparse.layout import (
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     CircularBufferSpec,
+    DFlashSWASpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
     HiSparseHotSpec,
@@ -90,6 +93,23 @@ from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
 from vllm.v1.request import Request
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_dflash_replay_reserve_uses_last_safe_aligned_boundary():
+    spec = DFlashSWASpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float16,
+        sliding_window=96,
+        private_ring=True,
+    )
+    groups = [KVCacheGroupSpec(["draft"], spec)]
+
+    reserve = get_draft_replay_reserve(groups)
+    assert reserve == 96
+    assert get_draft_replay_boundary(257, reserve, 64) == 128
+    assert get_draft_replay_boundary(64, reserve, 64) == 0
 
 
 @pytest.mark.parametrize("gpu_block_size", [32, 64])

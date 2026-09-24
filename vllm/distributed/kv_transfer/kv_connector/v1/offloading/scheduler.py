@@ -29,6 +29,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.kv_cache_utils import get_draft_replay_reserve
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
 from vllm.v1.kv_cache_interface import (
@@ -172,6 +173,7 @@ class SchedulerOffloadConfig(NamedTuple):
     num_workers: int
     offload_prompt_only: bool
     supports_partial_tail: bool
+    draft_replay_reserve: int
     alignment_tokens: int | None = None
     retention_interval: int | None = None
     dcp_world_size: int = 1
@@ -305,6 +307,9 @@ class SchedulerOffloadConfig(NamedTuple):
             and not any(config.is_eagle_group for config in kv_group_configs)
             and vllm_config.parallel_config.decode_context_parallel_size == 1
         )
+        draft_replay_reserve = get_draft_replay_reserve(
+            kv_cache_config.kv_cache_groups
+        )
 
         if retention_interval is not None:
             if retention_interval < 0:
@@ -330,6 +335,7 @@ class SchedulerOffloadConfig(NamedTuple):
             tokens_per_hash=spec.tokens_per_hash,
             offload_prompt_only=spec.offload_prompt_only,
             supports_partial_tail=supports_partial_tail,
+            draft_replay_reserve=draft_replay_reserve,
             alignment_tokens=alignment_tokens,
             retention_interval=retention_interval,
             dcp_world_size=vllm_config.parallel_config.decode_context_parallel_size,
@@ -762,7 +768,10 @@ class OffloadingConnectorScheduler:
         happens until num_hit_tokens converges.
         """
         num_computed_tokens = req_status.num_locally_computed_tokens
-        max_hit_size_tokens: int = req_status.req.num_tokens
+        max_hit_size_tokens = max(
+            req_status.req.num_tokens - self.config.draft_replay_reserve,
+            0,
+        )
         if max_num_new_tokens is not None:
             max_hit_size_tokens = min(
                 max_hit_size_tokens, num_computed_tokens + max_num_new_tokens
@@ -962,7 +971,13 @@ class OffloadingConnectorScheduler:
         complete_boundary = local_tokens + complete_hit
         tokens_per_hash = self.config.tokens_per_hash
         block_end = complete_boundary + self._partial_tail_block_size
-        max_boundary = min(req_status.req.num_prompt_tokens - 1, block_end - 1)
+        replay_limit = max(
+            req_status.req.num_prompt_tokens
+            - 1
+            - self.config.draft_replay_reserve,
+            0,
+        )
+        max_boundary = min(replay_limit, block_end - 1)
         if max_num_new_tokens is not None:
             max_boundary = min(max_boundary, local_tokens + max_num_new_tokens)
         max_boundary = round_down(max_boundary, tokens_per_hash)

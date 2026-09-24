@@ -71,6 +71,7 @@ from vllm.utils.torch_utils import is_non_overlapping_and_dense
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
+    get_draft_replay_reserve,
     maybe_convert_block_hash,
     resolve_dcp_kv_cache_spec,
     resolve_kv_cache_block_sizes,
@@ -1685,6 +1686,9 @@ class MooncakeStoreWorker:
             and callable(getattr(spec_cfg, "use_eagle_block_drop", None))
             else False
         )
+        draft_replay_reserve = get_draft_replay_reserve(
+            kv_cache_config.kv_cache_groups
+        )
         self.coord = MooncakeStoreCoordinator(
             self._kv_cache_groups,
             scheduler_block_size=self.block_size,
@@ -1692,6 +1696,7 @@ class MooncakeStoreWorker:
             use_eagle=use_eagle_block_drop,
             retention_interval=kv_cache_config.prefix_cache_retention_interval,
             dcp_world_size=self.dcp_size,
+            draft_replay_reserve=draft_replay_reserve,
         )
         self.store_tp_size, store_namespace, store_layout_cls = (
             self._select_store_layout(extra_config)
@@ -2257,7 +2262,13 @@ class MooncakeStoreWorker:
         if self._capacity_only:
             return MooncakeLookupResult(0)
 
-        token_len = self.coord.align_lookup_length(num_tokens)
+        lookup_limit = num_tokens
+        if self.coord.draft_replay_reserve:
+            lookup_limit = max(
+                num_tokens - 1 - self.coord.draft_replay_reserve,
+                0,
+            )
+        token_len = self.coord.align_lookup_length(lookup_limit)
         if not block_hashes or token_len <= 0:
             return MooncakeLookupResult(0)
 
