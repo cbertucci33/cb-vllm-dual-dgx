@@ -1,0 +1,130 @@
+diff --git a/setup.py b/setup.py
+index 65d7065..8f1c237 100644
+--- a/setup.py
++++ b/setup.py
+@@ -3,0 +4 @@ import os
++import platform
+@@ -59,0 +61,9 @@ sources = [
++if platform.machine().lower() not in {"amd64", "x86_64"}:
++    x86_only_sources = {
++        os.path.join(sources_dir, "avx2_target.cpp"),
++        os.path.join(sources_dir, "avx512_target.cpp"),
++        os.path.join(sources_dir, "parallel", "all_reduce_cpu_avx2.cpp"),
++        os.path.join(sources_dir, "parallel", "all_reduce_cpu_avx512.cpp"),
++    }
++    sources = [source for source in sources if source not in x86_only_sources]
++
+@@ -85 +95,3 @@ setup(
+-    name="exllamav3",
++    # vLLM consumes only the native extension. Keep unrelated standalone
++    # ExLlamaV3 packages and their serving dependencies out of this image.
++    name="exllamav3-ext-vllm",
+@@ -87,22 +99 @@ setup(
+-    packages=[
+-        "exllamav3",
+-        "exllamav3.generator",
+-        "exllamav3.generator.sampler",
+-        "exllamav3.generator.filter",
+-        "exllamav3.conversion",
+-        "exllamav3.conversion.standard_cal_data",
+-        "exllamav3.integration",
+-        "exllamav3.architecture",
+-        "exllamav3.architecture.mm_processing",
+-        "exllamav3.model",
+-        "exllamav3.modules",
+-        "exllamav3.modules.attention_fn",
+-        "exllamav3.modules.arch_specific",
+-        "exllamav3.modules.gated_delta_net_fn",
+-        "exllamav3.modules.quant",
+-        "exllamav3.modules.quant.exl3_lib",
+-        "exllamav3.tokenizer",
+-        "exllamav3.cache",
+-        "exllamav3.loader",
+-        "exllamav3.util",
+-    ],
++    packages=[],
+@@ -112,21 +103,2 @@ setup(
+-    install_requires=[
+-        "torch>=2.6.0",
+-        "flash_attn>=2.7.4.post1",
+-        "tokenizers>=0.21.1",
+-        "numpy>=2.1.0",
+-        "rich",
+-        "typing_extensions",
+-        "ninja",
+-        "safetensors>=0.3.2",
+-        "pyyaml",
+-        "marisa_trie",
+-        "kbnf>=0.4.2",
+-        "formatron>=0.5.0",
+-        "pydantic",
+-        "xformers",
+-        "flash-linear-attention>=0.5.0",
+-    ],
+-    include_package_data=True,
+-    package_data = {
+-        "": ["py.typed"],
+-    },
++    install_requires=[],
++    include_package_data=False,
+diff --git a/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_unsupported.cpp b/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_unsupported.cpp
+new file mode 100644
+index 0000000..379645e
+--- /dev/null
++++ b/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_unsupported.cpp
+@@ -0,0 +1,55 @@
++#include <stdexcept>
++
++#include "../avx2_target.h"
++#include "../avx512_target.h"
++#include "all_reduce_cpu_avx2.h"
++#include "all_reduce_cpu_avx512.h"
++
++bool is_avx2_supported()
++{
++    return false;
++}
++
++bool is_avx512_supported()
++{
++    return false;
++}
++
++void enable_fast_fp() {}
++void enable_fast_fp_avx2() {}
++void enable_fast_fp_avx512() {}
++
++[[noreturn]] static void unsupported_cpu_reduce()
++{
++    throw std::runtime_error(
++        "ExLlamaV3's native CPU all-reduce backend requires x86 AVX2"
++    );
++}
++
++void perform_cpu_reduce(
++    PGContext*, size_t, uint32_t, uint8_t*, size_t
++)
++{
++    unsupported_cpu_reduce();
++}
++
++void perform_cpu_reduce_avx2(
++    PGContext*, size_t, uint32_t, uint8_t*, size_t
++)
++{
++    unsupported_cpu_reduce();
++}
++
++void perform_cpu_reduce_avx512(
++    PGContext*, size_t, uint32_t, uint8_t*, size_t
++)
++{
++    unsupported_cpu_reduce();
++}
++
++void bf16_add_inplace_avx512(
++    uint16_t*, const uint16_t*, size_t
++)
++{
++    unsupported_cpu_reduce();
++}

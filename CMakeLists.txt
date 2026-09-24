@@ -1565,6 +1565,11 @@ if (VLLM_GPU_LANG STREQUAL "HIP")
 endif()
 
 # For CUDA and HIP builds also build the triton_kernels external package.
+if(VLLM_BUILD_CORE_EXTENSION_ONLY)
+  message(STATUS "VLLM_BUILD_CORE_EXTENSION_ONLY is set; skipping optional external projects")
+  return()
+endif()
+
 if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     include(cmake/external_projects/triton_kernels.cmake)
 endif()

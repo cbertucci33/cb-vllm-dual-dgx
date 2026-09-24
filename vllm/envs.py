@@ -190,6 +190,13 @@ if TYPE_CHECKING:
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
+    VLLM_EXL3_TRELLIS_MIN_M: str | None = None
+    VLLM_EXL3_TRELLIS_MAX_M: str | None = None
+    VLLM_EXL3_TRELLIS_BLOCK_M: str | None = None
+    VLLM_EXL3_PREFILL_BLOCK_M: str | None = None
+    VLLM_EXL3_EXT_PATH: str | None = None
+    VLLM_EXL3_ABI_SHIM: str | None = None
+    VLLM_NVFP4_MLA_SCALES_FILE: str | None = None
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
     VLLM_TPU_USING_PATHWAYS: bool = False
@@ -2170,6 +2177,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Each op additionally checks its own shape / dtype constraints and falls
     # back to the eager path when they do not hold.
     "VLLM_ENABLE_HPC_OPS": lambda: bool(int(os.getenv("VLLM_ENABLE_HPC_OPS", "0"))),
+    # EXL3 Trellis planning knobs and native extension locations. The EXL3
+    # backend validates numeric values at its call boundary.
+    "VLLM_EXL3_TRELLIS_MIN_M": lambda: os.getenv("VLLM_EXL3_TRELLIS_MIN_M"),
+    "VLLM_EXL3_TRELLIS_MAX_M": lambda: os.getenv("VLLM_EXL3_TRELLIS_MAX_M"),
+    "VLLM_EXL3_TRELLIS_BLOCK_M": lambda: os.getenv("VLLM_EXL3_TRELLIS_BLOCK_M"),
+    "VLLM_EXL3_PREFILL_BLOCK_M": lambda: os.getenv("VLLM_EXL3_PREFILL_BLOCK_M"),
+    "VLLM_EXL3_EXT_PATH": lambda: os.getenv("VLLM_EXL3_EXT_PATH"),
+    "VLLM_EXL3_ABI_SHIM": lambda: os.getenv("VLLM_EXL3_ABI_SHIM"),
+    "VLLM_NVFP4_MLA_SCALES_FILE": lambda: os.getenv(
+        "VLLM_NVFP4_MLA_SCALES_FILE"
+    ),
 }
 
 
