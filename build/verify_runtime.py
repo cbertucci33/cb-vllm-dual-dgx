@@ -56,7 +56,6 @@ REQUIRED_RUNTIME_CONTRACT = {
     "target_cache_dtype": "fp8_ds_mla",
     "draft_cache_dtype": "fp8_e4m3",
     "linear_backend": "b12x",
-    "b12x_max_m": 16,
 }
 
 REQUIRED_TOPK_EXPORTS = (

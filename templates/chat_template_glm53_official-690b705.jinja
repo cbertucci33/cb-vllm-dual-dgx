@@ -145,16 +145,16 @@ For each function call, output the function name and arguments within the follow
 {%- elif m.role == 'assistant' -%}
 <|assistant|>
 {%- set content = visible_text(m.content) %}
-{%- if m.reasoning_content is string %}
+{%- if m.reasoning_content is string and m.reasoning_content.strip() %}
     {%- set reasoning_content = m.reasoning_content %}
+{%- elif m.reasoning is string and m.reasoning.strip() %}
+    {%- set reasoning_content = m.reasoning %}
 {%- elif '</think>' in content %}
     {%- set reasoning_content = content.split('</think>')[0].split('<think>')[-1] %}
     {%- set content = content.split('</think>')[-1] %}
 {%- endif %}
-{%- if (not clear_thinking or loop.index0 > ns.last_user_index) and reasoning_content is defined -%}
+{%- if (not clear_thinking or loop.index0 > ns.last_user_index) and reasoning_content is defined and reasoning_content.strip() -%}
 {{ '<think>' + reasoning_content +  '</think>'}}
-{%- else -%}
-{{ '<think></think>' }}
 {%- endif -%}
 {%- if content.strip() -%}
 {{ content.strip() }}

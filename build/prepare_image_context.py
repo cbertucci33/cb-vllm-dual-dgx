@@ -176,6 +176,7 @@ def main() -> None:
         },
         "chat_template": {
             "source_revision": "690b705278a3a58e538fcb37c2ca8b5f9511213c",
+            "adaptation": "omit-empty-history-reasoning-blocks-and-preserve-plaintext-reasoning",
             "sha256": template_hash,
             "image_path": "/opt/glm53/chat_template.jinja",
             "tool_call_parser": "glm47",
@@ -187,7 +188,6 @@ def main() -> None:
             "target_cache_dtype": "fp8_ds_mla",
             "draft_cache_dtype": "fp8_e4m3",
             "linear_backend": "b12x",
-            "b12x_max_m": 16,
         },
         "build": {
             "torch_cuda_arch_list": versions["TORCH_CUDA_ARCH_LIST"],
