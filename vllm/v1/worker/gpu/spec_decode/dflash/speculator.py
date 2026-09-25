@@ -10,6 +10,12 @@ from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.warmup.jit_warmup import WarmupChoices
+from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    DispatchSpec,
+    TritonWarmupTensor,
+    triton_kernel_dispatcher_with_warmup,
+)
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID, record_kv_cache_layout
@@ -169,6 +175,18 @@ class DFlashSpeculator(DraftModelSpeculator):
         if layout is not None:
             record_kv_cache_layout(self._draft_vllm_config.cache_config, layout)
         return self._draft_vllm_config
+
+    def register_jit_warmups(self) -> None:
+        """Register warmups after subclasses finalize their input geometry."""
+        _prepare_dflash_inputs_warmup.register_warmup(
+            parallel_drafting_token_id=self.parallel_drafting_token_id,
+            num_query_per_req=self.num_query_per_req,
+            num_speculative_steps=self.num_speculative_steps,
+            max_num_reqs=self.max_num_reqs,
+            max_num_tokens=self.max_num_tokens,
+            max_model_len=self.max_model_len,
+            sample_from_anchor=self.sample_from_anchor,
+        )
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         wants_full = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
@@ -765,6 +783,118 @@ def _prepare_dflash_inputs_kernel(
                 block = i + tl.arange(0, BLOCK_SIZE)
                 mask = block < max_num_tokens
                 tl.store(out_query_slot_mapping_ptr + block, PAD_SLOT_ID, mask=mask)
+
+
+def _prepare_dflash_inputs_warmup_inputs(
+    *,
+    parallel_drafting_token_id: int,
+    num_query_per_req: int,
+    num_speculative_steps: int,
+    max_num_reqs: int,
+    max_num_tokens: int,
+    max_model_len: int,
+    sample_from_anchor: bool,
+) -> dict[str, Any]:
+    int32 = TritonWarmupTensor(torch.int32)
+    int64 = TritonWarmupTensor(torch.int64)
+    fp32 = TritonWarmupTensor(torch.float32)
+    # Triton specializes scalar integers by exact 0/1 or by their divisibility
+    # class. Draft cache groups can use either a divisible or generic block
+    # geometry, so cover both classes without depending on cache initialization.
+    block_table_stride: Any = WarmupChoices(16, 2)
+    cache_block_size: Any = WarmupChoices(16, 2)
+    triton_block_size: Any = WarmupChoices(16, 32, 64, 128, 256)
+    return dict(
+        out_input_ids=int32,
+        out_query_positions=int64,
+        out_query_start_loc=int32,
+        out_seq_lens=int32,
+        out_query_slot_mapping=int64,
+        out_context_positions=int64,
+        out_context_slot_mapping=int64,
+        out_sample_indices=int64,
+        out_sample_pos=int64,
+        out_sample_idx_mapping=int32,
+        out_temperature=fp32,
+        out_seeds=int64,
+        target_positions=int64,
+        target_query_start_loc=TritonWarmupTensor(torch.int32, shape=(2,)),
+        idx_mapping=int64,
+        last_sampled=int64,
+        next_prefill_tokens=int32,
+        num_sampled=int32,
+        num_rejected=int32,
+        temperature=fp32,
+        seeds=int64,
+        block_table=int32,
+        block_table_stride=block_table_stride,
+        parallel_drafting_token_id=parallel_drafting_token_id,
+        block_size=cache_block_size,
+        num_query_per_req=num_query_per_req,
+        num_speculative_steps=num_speculative_steps,
+        max_num_reqs=max_num_reqs,
+        max_num_tokens=max_num_tokens,
+        max_model_len=max_model_len,
+        cp_rank=0,
+        sample_from_anchor=sample_from_anchor,
+        pad_slot_id=PAD_SLOT_ID,
+        cp_size=1,
+        cp_interleave=1,
+        triton_block_size=triton_block_size,
+    )
+
+
+@triton_kernel_dispatcher_with_warmup(
+    kernel=_prepare_dflash_inputs_kernel,
+    warmup_inputs=_prepare_dflash_inputs_warmup_inputs,
+)
+def _prepare_dflash_inputs_warmup(
+    *,
+    out_input_ids: torch.Tensor,
+    out_query_positions: torch.Tensor,
+    out_query_start_loc: torch.Tensor,
+    out_seq_lens: torch.Tensor,
+    out_query_slot_mapping: torch.Tensor,
+    out_context_positions: torch.Tensor,
+    out_context_slot_mapping: torch.Tensor,
+    out_sample_indices: torch.Tensor,
+    out_sample_pos: torch.Tensor,
+    out_sample_idx_mapping: torch.Tensor,
+    out_temperature: torch.Tensor,
+    out_seeds: torch.Tensor,
+    target_positions: torch.Tensor,
+    target_query_start_loc: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    last_sampled: torch.Tensor,
+    next_prefill_tokens: torch.Tensor,
+    num_sampled: torch.Tensor,
+    num_rejected: torch.Tensor,
+    temperature: torch.Tensor,
+    seeds: torch.Tensor,
+    block_table: torch.Tensor,
+    block_table_stride: int,
+    parallel_drafting_token_id: int,
+    block_size: int,
+    num_query_per_req: int,
+    num_speculative_steps: int,
+    max_num_reqs: int,
+    max_num_tokens: int,
+    max_model_len: int,
+    cp_rank: int,
+    sample_from_anchor: bool,
+    pad_slot_id: int,
+    cp_size: int,
+    cp_interleave: int,
+    triton_block_size: int,
+) -> DispatchSpec:
+    num_reqs = target_query_start_loc.shape[0] - 1
+    return (num_reqs, 1), dict(
+        SAMPLE_FROM_ANCHOR=sample_from_anchor,
+        PAD_SLOT_ID=pad_slot_id,
+        CP_SIZE=cp_size,
+        CP_INTERLEAVE=cp_interleave,
+        BLOCK_SIZE=triton_block_size,
+    )
 
 
 def prepare_dflash_inputs(

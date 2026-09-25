@@ -19,19 +19,20 @@ logger = init_logger(__name__)
 
 
 def _collect_warmup_units(
-    model: torch.nn.Module,
+    models: Iterable[torch.nn.Module],
     token_counts: tuple[int, ...],
     output_dtype: torch.dtype,
 ) -> Iterable[B12xWarmupUnit]:
     units: dict[object, B12xWarmupUnit] = {}
-    for layer in model.modules():
-        provider = getattr(layer, "b12x_warmup_provider", None)
-        get_unit = getattr(provider, "get_b12x_warmup_unit", None)
-        if not callable(get_unit):
-            continue
-        unit = get_unit(layer, token_counts, output_dtype)
-        assert isinstance(unit, B12xWarmupUnit)
-        units.setdefault(unit.key, unit)
+    for model in models:
+        for layer in model.modules():
+            provider = getattr(layer, "b12x_warmup_provider", None)
+            get_unit = getattr(provider, "get_b12x_warmup_unit", None)
+            if not callable(get_unit):
+                continue
+            unit = get_unit(layer, token_counts, output_dtype)
+            assert isinstance(unit, B12xWarmupUnit)
+            units.setdefault(unit.key, unit)
     return units.values()
 
 
@@ -76,8 +77,16 @@ def b12x_warmup(worker: "Worker", cudagraph_capture_sizes: list[int]) -> None:
         max_tokens=max_tokens,
         cudagraph_capture_sizes=serving_sizes,
     )
+    # The GB10 MXFP8 profile uses exact A16 row routes. Compile one unprofiled
+    # medium-prefill row so its quantized BK64 fallback cannot JIT in service.
+    token_counts = tuple(sorted({*token_counts, 1536}))
+
+    models = [worker.get_model()]
+    draft_model = worker.get_draft_model()
+    if draft_model is not None:
+        models.append(draft_model)
     units = _collect_warmup_units(
-        worker.get_model(),
+        models,
         token_counts,
         output_dtype,
     )

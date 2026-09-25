@@ -631,6 +631,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             draft_attn_layer_names = self.speculator.draft_attn_layer_names
         # Metadata builders select attention kernels that need JIT warmup.
         with self.jit_warmup_registry.activate():
+            register_jit_warmups = getattr(
+                self.speculator, "register_jit_warmups", None
+            )
+            if callable(register_jit_warmups):
+                register_jit_warmups()
             (
                 self.attn_groups,
                 attn_cg_support,
