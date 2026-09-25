@@ -1050,7 +1050,6 @@ def _topp_split_stats_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
     batch_size: Any = WarmupIntRange(
         1, min(_max_sampler_batch_size(vllm_config), _SPLIT_MAX_BATCH) + 1
     )
-    has_k: Any = WarmupChoices(False, True)
     logits = TritonWarmupTensor(
         torch.float32,
         shape=(batch_size, vocab_size),
@@ -1059,7 +1058,7 @@ def _topp_split_stats_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
     return dict(
         logits=logits,
         stats=TritonWarmupTensor(torch.float32),
-        k=TritonWarmupTensor(torch.int32) if has_k else None,
+        k=WarmupChoices(None, TritonWarmupTensor(torch.int32)),
         p=TritonWarmupTensor(torch.float32),
         num_sm=num_sm,
     )
@@ -1340,7 +1339,6 @@ def _topp_split_step_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
         1, min(_max_sampler_batch_size(vllm_config), _SPLIT_MAX_BATCH) + 1
     )
     round: Any = WarmupIntRange(0, _SPLIT_ROUNDS)
-    has_k: Any = WarmupChoices(False, True)
     logits = TritonWarmupTensor(
         torch.float32,
         shape=(batch_size, vocab_size),
@@ -1350,7 +1348,7 @@ def _topp_split_step_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
         logits=logits,
         stats=TritonWarmupTensor(torch.float32),
         parts=TritonWarmupTensor(torch.float32),
-        k=TritonWarmupTensor(torch.int32) if has_k else None,
+        k=WarmupChoices(None, TritonWarmupTensor(torch.int32)),
         p=TritonWarmupTensor(torch.float32),
         round=round,
         num_sm=num_sm,
@@ -1521,7 +1519,6 @@ def _topp_split_mask_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
     batch_size: Any = WarmupIntRange(
         1, min(_max_sampler_batch_size(vllm_config), _SPLIT_MAX_BATCH) + 1
     )
-    has_k: Any = WarmupChoices(False, True)
     logits = TritonWarmupTensor(
         torch.float32,
         shape=(batch_size, vocab_size),
@@ -1531,7 +1528,7 @@ def _topp_split_mask_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
         logits=logits,
         stats=TritonWarmupTensor(torch.float32),
         parts=TritonWarmupTensor(torch.float32),
-        k=TritonWarmupTensor(torch.int32) if has_k else None,
+        k=WarmupChoices(None, TritonWarmupTensor(torch.int32)),
         p=TritonWarmupTensor(torch.float32),
         mask_value=float("-inf"),
         num_sm=num_sm,

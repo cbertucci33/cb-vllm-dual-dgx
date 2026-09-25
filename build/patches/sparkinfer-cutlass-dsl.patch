@@ -19,3 +19,52 @@ index c214b6d..f8b26d5 100644
    "apache-tvm-ffi>=0.1.6,!=0.1.8,!=0.1.8.post0,<0.2",
    "rich>=13",
    "transformers>=4.51",
+diff --git a/sparkinfer/moe/_shared/kernels/w4a16/route_pack.py b/sparkinfer/moe/_shared/kernels/w4a16/route_pack.py
+--- a/sparkinfer/moe/_shared/kernels/w4a16/route_pack.py
++++ b/sparkinfer/moe/_shared/kernels/w4a16/route_pack.py
+@@ -115,2 +115,4 @@
+-@triton.jit
++@triton.jit(
++    do_not_specialize=["live_numel", "max_packed_routes", "max_route_blocks"]
++)
+ def _pack_topk_routes_post_prefix_kernel(
+@@ -120,8 +122,8 @@
+     live_numel,
+     BLOCK_SIZE: tl.constexpr,
+     NUM_EXPERTS: tl.constexpr,
+-    MAX_PACKED_ROUTES: tl.constexpr,
+-    MAX_ROUTE_BLOCKS: tl.constexpr,
++    max_packed_routes,
++    max_route_blocks,
+     BLOCK_T: tl.constexpr,
+ ):
+     pid = tl.program_id(0)
+@@ -129,13 +131,13 @@
+     tl.store(
+         packed_route_indices + offsets,
+         live_numel,
+-        mask=offsets < MAX_PACKED_ROUTES,
++        mask=offsets < max_packed_routes,
+     )
+
+     block_rows = offsets * BLOCK_SIZE
+     block_experts = tl.full((BLOCK_T,), -1, dtype=tl.int32)
+-    valid_blocks = offsets < MAX_ROUTE_BLOCKS
++    valid_blocks = offsets < max_route_blocks
+     for expert in tl.range(0, NUM_EXPERTS):
+         start = tl.load(expert_offsets + expert)
+         end = tl.load(expert_offsets + expert + 1)
+         active = valid_blocks & (block_rows >= start) & (block_rows < end)
+@@ -485,10 +487,10 @@
+             block_expert_ids,
+             expert_offsets,
+             numel,
++            max_packed_routes,
++            max_route_blocks,
+             BLOCK_SIZE=int(block_size),
+             NUM_EXPERTS=int(num_experts),
+-            MAX_PACKED_ROUTES=max_packed_routes,
+-            MAX_ROUTE_BLOCKS=max_route_blocks,
+             BLOCK_T=_POST_PREFIX_BLOCK_T,
+             num_warps=4,
+         )
