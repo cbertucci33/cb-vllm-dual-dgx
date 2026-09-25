@@ -66,69 +66,71 @@ def _warm_cache_checkpoint_store(
             sum(layer.in_proj_qkvbfg_a.output_partition_sizes)
         )
         recurrent_row_size = int(recurrent_state[0].numel())
-        key = (
-            conv_state.dtype,
-            recurrent_state.dtype,
-            tuple(conv_state.stride()),
-            int(recurrent_state.stride(0)),
-            state_len,
-            width,
-            projected_row_size,
-            recurrent_row_size,
-        )
-        if key in warmed:
-            continue
-
-        # Runtime passes the qkv slice of the merged qkv|b|f_a|g_a projection.
-        # Preserve the merged projection's row stride while limiting the view
-        # width to qkv so Triton warms the exact runtime specialization.
-        x = torch.empty_strided(
-            (1, width),
-            (projected_row_size, 1),
-            dtype=conv_state.dtype,
-            device=device,
-        )
-        checkpoint_state = torch.empty(
-            (1, *recurrent_state.shape[1:]),
-            dtype=recurrent_state.dtype,
-            device=device,
-        )
-        query_start_loc = torch.zeros(2, dtype=torch.int32, device=device)
-        checkpoint_offsets = torch.zeros(1, dtype=torch.int32, device=device)
-        checkpoint_state_indices = torch.full(
-            (1,), NULL_BLOCK_ID, dtype=torch.int32, device=device
-        )
-        block_size = 256
-        _store_cache_checkpoints_kernel[
-            (
-                1,
-                triton.cdiv(
-                    max(width * state_len, recurrent_row_size), block_size
-                ),
+        # Runtime can pass either the qkv view of the merged qkv|b|f_a|g_a
+        # projection or a materialized contiguous qkv row after replay/cache
+        # handling. Triton specializes x_stride_0, so both layouts must be
+        # compiled before readiness.
+        for x_row_stride in {projected_row_size, width}:
+            key = (
+                conv_state.dtype,
+                recurrent_state.dtype,
+                tuple(conv_state.stride()),
+                int(recurrent_state.stride(0)),
+                state_len,
+                width,
+                x_row_stride,
+                recurrent_row_size,
             )
-        ](
-            x,
-            conv_state,
-            checkpoint_state,
-            recurrent_state,
-            query_start_loc,
-            checkpoint_offsets,
-            checkpoint_state_indices,
-            x.stride(0),
-            x.stride(1),
-            conv_state.stride(0),
-            conv_state.stride(1),
-            conv_state.stride(2),
-            checkpoint_state.stride(0),
-            recurrent_state.stride(0),
-            checkpoint_offsets.stride(0),
-            state_len,
-            width,
-            recurrent_row_size,
-            NULL_BLOCK_ID,
-            block_size,
-        )
-        warmed.add(key)
+            if key in warmed:
+                continue
+
+            x = torch.empty_strided(
+                (1, width),
+                (x_row_stride, 1),
+                dtype=conv_state.dtype,
+                device=device,
+            )
+            checkpoint_state = torch.empty(
+                (1, *recurrent_state.shape[1:]),
+                dtype=recurrent_state.dtype,
+                device=device,
+            )
+            query_start_loc = torch.zeros(2, dtype=torch.int32, device=device)
+            checkpoint_offsets = torch.zeros(1, dtype=torch.int32, device=device)
+            checkpoint_state_indices = torch.full(
+                (1,), NULL_BLOCK_ID, dtype=torch.int32, device=device
+            )
+            block_size = 256
+            _store_cache_checkpoints_kernel[
+                (
+                    1,
+                    triton.cdiv(
+                        max(width * state_len, recurrent_row_size), block_size
+                    ),
+                )
+            ](
+                x,
+                conv_state,
+                checkpoint_state,
+                recurrent_state,
+                query_start_loc,
+                checkpoint_offsets,
+                checkpoint_state_indices,
+                x.stride(0),
+                x.stride(1),
+                conv_state.stride(0),
+                conv_state.stride(1),
+                conv_state.stride(2),
+                checkpoint_state.stride(0),
+                recurrent_state.stride(0),
+                checkpoint_offsets.stride(0),
+                state_len,
+                width,
+                recurrent_row_size,
+                NULL_BLOCK_ID,
+                block_size,
+            )
+            warmed.add(key)
 
     if warmed:
         logger.info("Warmed %d GLM-5.3 cache checkpoint kernel key(s).", len(warmed))

@@ -77,6 +77,27 @@ def b12x_warmup(worker: "Worker", cudagraph_capture_sizes: list[int]) -> None:
         max_tokens=max_tokens,
         cudagraph_capture_sizes=serving_sizes,
     )
+    speculative_config = worker.vllm_config.speculative_config
+    if speculative_config is not None and speculative_config.method in (
+        "dflash",
+        "dspark",
+    ):
+        # Parallel drafting runs the dense draft projections on flattened
+        # request groups, not on the target runner's capture-size rows. Cover
+        # every live concurrency for both the sampled-token span and the
+        # anchor-plus-sampled query span. These are the two B12X policy classes
+        # observed compiling on the first DFlash request after readiness.
+        num_speculative_tokens = int(speculative_config.num_speculative_tokens)
+        max_num_seqs = int(worker.scheduler_config.max_num_seqs)
+        dflash_rows = {
+            num_reqs * tokens_per_req
+            for num_reqs in range(1, max_num_seqs + 1)
+            for tokens_per_req in (
+                num_speculative_tokens,
+                num_speculative_tokens + 1,
+            )
+        }
+        token_counts = tuple(sorted({*token_counts, *dflash_rows}))
     # The GB10 profile measures 1,536 rows for every GLM geometry. Compile the
     # selected policy during startup so medium prefills cannot JIT in service.
     token_counts = tuple(sorted({*token_counts, 1536}))

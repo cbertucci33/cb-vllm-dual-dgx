@@ -754,7 +754,7 @@ def _prepare_dflash_inputs_kernel(
         tl.store(out_seeds_ptr + req_state_idx, tl.load(seeds_ptr + req_state_idx))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_reqs"])
 def _pad_dflash_buffers_kernel(
     out_query_start_loc_ptr,
     out_seq_lens_ptr,
