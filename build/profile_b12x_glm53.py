@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
-import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -60,13 +59,23 @@ def read_json(path: Path) -> Mapping[str, object]:
 
 
 def git_head(source_root: Path) -> str:
-    return subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=source_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+    git_dir = source_root / ".git"
+    head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+    if not head.startswith("ref: "):
+        return head
+    ref = head.removeprefix("ref: ")
+    loose_ref = git_dir / ref
+    if loose_ref.is_file():
+        return loose_ref.read_text(encoding="utf-8").strip()
+    packed_refs = git_dir / "packed-refs"
+    if packed_refs.is_file():
+        for line in packed_refs.read_text(encoding="utf-8").splitlines():
+            if line.startswith("#") or line.startswith("^"):
+                continue
+            revision, name = line.split(" ", 1)
+            if name == ref:
+                return revision
+    raise RuntimeError(f"cannot resolve {ref} in {git_dir}")
 
 
 def planner_records(
