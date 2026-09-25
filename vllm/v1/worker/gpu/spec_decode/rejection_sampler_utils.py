@@ -41,7 +41,12 @@ def _compute_global_logsumexp(
         other=0.0,
     )
     global_max = tl.max(maxes, axis=0)
-    global_lse = global_max + tl.log(tl.sum(sumexps * tl.exp(maxes - global_max)))
+    # An all-negative-infinity row makes maxes - global_max NaN. Anchor the
+    # exponent at zero so the row resolves to a clean -inf logsumexp.
+    safe_global_max = tl.where(global_max == float("-inf"), 0.0, global_max)
+    global_lse = global_max + tl.log(
+        tl.sum(sumexps * tl.exp(maxes - safe_global_max))
+    )
     return global_lse
 
 

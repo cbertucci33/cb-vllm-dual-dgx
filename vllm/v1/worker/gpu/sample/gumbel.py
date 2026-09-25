@@ -12,6 +12,9 @@ from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 # available — on the CPU worker path `tl` is a placeholder whose `constexpr`
 # attribute is `None`, and `tl.constexpr(...)` would crash at import time.
 _TL_RAND_MIN = tl.constexpr(4.6566127342e-10) if HAS_TRITON else 4.6566127342e-10
+_FP64_ONE_MINUS_EPS = (
+    tl.constexpr(0.9999999999999999) if HAS_TRITON else 0.9999999999999999
+)
 
 # Offset salt keeping the draft's Gumbel noise disjoint from the target's.
 # Verification is a probability-ratio test, not a Gumbel coupling, so a proposal
@@ -120,6 +123,9 @@ def gumbel_noised_argmax(
         gumbel_seed = tl.randint(seed, pos)
         if USE_FP64:
             u = tl_rand64(gumbel_seed, keys, includes_zero=False)
+            # A maximum-word draw can round to exactly 1.0 in fp64 and make
+            # the Gumbel noise +inf. Match the block-argmax path's clamp.
+            u = tl.minimum(u, _FP64_ONE_MINUS_EPS)
             gumbel_noise = -tl.log(-tl.log(u))
         else:
             u = tl_rand32(gumbel_seed, keys, includes_zero=False)
