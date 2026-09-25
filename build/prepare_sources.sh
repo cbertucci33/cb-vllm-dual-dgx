@@ -61,9 +61,12 @@ git -C "$cutlass_repo" archive --format=tar.gz --prefix=cutlass/ \
 cp "$repo_root/build/patches/sparkinfer-cutlass-dsl.patch" "$output_dir/"
 cp "$repo_root/build/patches/exllamav3-aarch64.patch" "$output_dir/"
 cp "$repo_root/build/patches/b12x-cutlass-dsl.patch" "$output_dir/"
+cp "$repo_root/build/profiles/nvidia.gb10.48sm.json.gz" "$output_dir/"
+cp "$repo_root/build/profiles/nvidia.gb10.48sm.evidence.json.gz" "$output_dir/"
 (
   cd "$output_dir"
-  sha256sum ./*.tar.gz ./*.patch > source-sha256.txt
+  sha256sum ./*.tar.gz ./*.patch ./nvidia.gb10.48sm.json.gz \
+    ./nvidia.gb10.48sm.evidence.json.gz > source-sha256.txt
 )
 
 printf '%s\n' "$vllm_commit" > "$output_dir/vllm-commit.txt"

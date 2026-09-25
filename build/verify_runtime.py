@@ -288,6 +288,14 @@ def verify_build() -> dict[str, str]:
         raise RuntimeError("B12X pack_weight source signature mismatch")
     if source_signature(b12x_linear, "blockscaled_mm") != B12X_MM_SIGNATURE:
         raise RuntimeError("B12X mm source signature mismatch")
+    b12x_profile = (
+        b12x_root / "policy/_profiles/data/nvidia.gb10.48sm.json.gz"
+    )
+    expected_profile_hash = provenance.get("source_sha256", {}).get(
+        "nvidia.gb10.48sm.json.gz"
+    )
+    if not expected_profile_hash or sha256(b12x_profile) != expected_profile_hash:
+        raise RuntimeError("packaged B12X GB10 profile hash mismatch")
 
     if provenance.get("runtime_contract") != REQUIRED_RUNTIME_CONTRACT:
         raise RuntimeError("packaged GLM runner contract mismatch")

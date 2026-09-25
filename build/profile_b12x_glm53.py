@@ -17,13 +17,13 @@ from b12x.policy.generation import (
     build_axis_tree,
     decision_node_to_dict,
 )
+from b12x.policy.generation.progress import RichProgressReporter
 from b12x.policy.generation.providers.blockscaled import (
     QUERY_FIELDS,
     ROW_COUNTS,
     BlockscaledPrecisionGenerator,
     precision_cases,
 )
-from b12x.policy.generation.progress import RichProgressReporter
 from b12x.policy.generation.runner import (
     estimate_generators,
     generate_profile_artifact,
@@ -32,7 +32,6 @@ from b12x.policy.generation.runner import (
 )
 from b12x.policy.serialization import profile_from_dict
 from b12x.policy.types import FrozenMapping
-
 
 EXPECTED_B12X_COMMIT = "00b69ac22e21413622c4ecd98f607a2c3e015161"
 
@@ -103,7 +102,9 @@ def planner_records(
         raise TypeError("exact planner node is malformed")
     records: list[DecisionRecord] = []
     for branch in branches:
-        if not isinstance(branch, Mapping) or not isinstance(branch.get("node"), Mapping):
+        if not isinstance(branch, Mapping) or not isinstance(
+            branch.get("node"), Mapping
+        ):
             raise TypeError("exact planner branch is malformed")
         records.extend(
             planner_records(

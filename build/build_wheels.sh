@@ -26,6 +26,8 @@ tar -xzf "$source_dir"/b12x-*.tar.gz -C "$work_dir"
 (cd "$work_dir/sparkinfer" && patch -p1 < "$source_dir/sparkinfer-cutlass-dsl.patch")
 (cd "$work_dir/exllamav3" && patch -p1 < "$source_dir/exllamav3-aarch64.patch")
 (cd "$work_dir/b12x" && patch -p1 < "$source_dir/b12x-cutlass-dsl.patch")
+cp "$source_dir/nvidia.gb10.48sm.json.gz" \
+  "$work_dir/b12x/b12x/policy/_profiles/data/nvidia.gb10.48sm.json.gz"
 
 flashinfer_manifest=$(dirname "$flashinfer_wheel")/flashinfer-wheel.sha256
 if [[ ! -f $flashinfer_manifest ]]; then
