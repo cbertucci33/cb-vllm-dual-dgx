@@ -192,6 +192,7 @@ def main() -> None:
         "build": {
             "torch_cuda_arch_list": versions["TORCH_CUDA_ARCH_LIST"],
             "flashinfer_cuda_arch_list": versions["FLASHINFER_CUDA_ARCH_LIST"],
+            "vllm_dgx_sm121_only": versions["VLLM_DGX_SM121_ONLY"] == "ON",
             "max_jobs": versions["MAX_JOBS"],
             "vllm_core_max_jobs": versions["VLLM_CORE_MAX_JOBS"],
             "nvcc_threads": versions["NVCC_THREADS"],

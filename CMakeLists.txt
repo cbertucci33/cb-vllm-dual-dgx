@@ -31,6 +31,10 @@ endif()
 
 # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
 set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")
+option(
+  VLLM_DGX_SM121_ONLY
+  "Build the internal DGX Spark core extension without legacy CUDA/PTX fallbacks"
+  OFF)
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "Target device: ${VLLM_TARGET_DEVICE}")
 
@@ -211,6 +215,10 @@ else()
   message(FATAL_ERROR "Can't find CUDA or HIP installation.")
 endif()
 
+if(VLLM_DGX_SM121_ONLY AND NOT VLLM_GPU_LANG STREQUAL "CUDA")
+  message(FATAL_ERROR "VLLM_DGX_SM121_ONLY requires the CUDA backend")
+endif()
+
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   #
@@ -226,6 +234,20 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   warn_if_ptx_arch_requested("${CUDA_ARCH_FLAGS}")
   extract_unique_cuda_archs_ascending(CUDA_ARCHS "${CUDA_ARCH_FLAGS}")
   message(STATUS "CUDA target architectures: ${CUDA_ARCHS}")
+  if(VLLM_DGX_SM121_ONLY)
+    list(LENGTH CUDA_ARCHS VLLM_DGX_ARCH_COUNT)
+    if(NOT VLLM_DGX_ARCH_COUNT EQUAL 1)
+      message(FATAL_ERROR
+        "VLLM_DGX_SM121_ONLY requires TORCH_CUDA_ARCH_LIST=12.1a; "
+        "requested architectures: ${CUDA_ARCHS}")
+    endif()
+    list(GET CUDA_ARCHS 0 VLLM_DGX_ARCH)
+    if(NOT VLLM_DGX_ARCH STREQUAL "12.1a")
+      message(FATAL_ERROR
+        "VLLM_DGX_SM121_ONLY requires TORCH_CUDA_ARCH_LIST=12.1a; "
+        "requested architecture: ${VLLM_DGX_ARCH}")
+    endif()
+  endif()
   # Filter the target architectures by the supported supported archs
   # since for some files we will build for all CUDA_ARCHS.
   cuda_archs_loose_intersection(CUDA_ARCHS
@@ -632,7 +654,11 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       cuda_archs_loose_intersection(MARLIN_FP8_ARCHS "8.9;12.0a;12.1a" "${CUDA_ARCHS}")
     endif()
     # marlin arches for other files
-    cuda_archs_loose_intersection(MARLIN_OTHER_ARCHS "7.5;8.0+PTX" "${CUDA_ARCHS}")
+    if(VLLM_DGX_SM121_ONLY)
+      set(MARLIN_OTHER_ARCHS "12.0f")
+    else()
+      cuda_archs_loose_intersection(MARLIN_OTHER_ARCHS "7.5;8.0+PTX" "${CUDA_ARCHS}")
+    endif()
 
     if (MARLIN_OTHER_ARCHS)
 
@@ -897,8 +923,12 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   # For the cutlass_scaled_mm kernels we want to build the c2x (CUTLASS 2.x)
   # kernels for the remaining archs that are not already built for 3x.
   # (Build 8.9 for FP8)
-  cuda_archs_loose_intersection(SCALED_MM_2X_ARCHS
-    "7.5;8.0;8.7;8.9+PTX" "${CUDA_ARCHS}")
+  if(VLLM_DGX_SM121_ONLY)
+    set(SCALED_MM_2X_ARCHS)
+  else()
+    cuda_archs_loose_intersection(SCALED_MM_2X_ARCHS
+      "7.5;8.0;8.7;8.9+PTX" "${CUDA_ARCHS}")
+  endif()
   # subtract out the archs that are already built for 3x
   list(REMOVE_ITEM SCALED_MM_2X_ARCHS ${SCALED_MM_3X_ARCHS})
   if (SCALED_MM_2X_ARCHS)
@@ -1168,7 +1198,11 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   endif()
 
   # Hadacore kernels
-  cuda_archs_loose_intersection(HADACORE_ARCHS "8.0+PTX;9.0+PTX" "${CUDA_ARCHS}")
+  if(VLLM_DGX_SM121_ONLY)
+    set(HADACORE_ARCHS "12.0f")
+  else()
+    cuda_archs_loose_intersection(HADACORE_ARCHS "8.0+PTX;9.0+PTX" "${CUDA_ARCHS}")
+  endif()
   if(HADACORE_ARCHS)
     set(HADACORE_SRCS "csrc/libtorch_stable/quantization/hadamard/hadacore/hadamard_transform_cuda.cu")
     set_gencode_flags_for_srcs(
@@ -1342,7 +1376,11 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     cuda_archs_loose_intersection(MARLIN_MOE_FP8_ARCHS "8.9;12.0a;12.1a" "${CUDA_ARCHS}")
   endif()
   # moe marlin arches for other files
-  cuda_archs_loose_intersection(MARLIN_MOE_OTHER_ARCHS "7.5;8.0+PTX" "${CUDA_ARCHS}")
+  if(VLLM_DGX_SM121_ONLY)
+    set(MARLIN_MOE_OTHER_ARCHS "12.0f")
+  else()
+    cuda_archs_loose_intersection(MARLIN_MOE_OTHER_ARCHS "7.5;8.0+PTX" "${CUDA_ARCHS}")
+  endif()
   if (MARLIN_MOE_OTHER_ARCHS)
 
     #

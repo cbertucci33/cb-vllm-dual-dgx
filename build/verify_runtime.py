@@ -8,6 +8,7 @@ import importlib.metadata
 import inspect
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -113,6 +114,27 @@ def require_cuda_architecture(path: Path, architecture: str) -> None:
         raise RuntimeError(f"{path.name} lacks {architecture} CUDA code")
 
 
+def require_only_sm12_cuda_code(path: Path) -> None:
+    targets: dict[str, set[int]] = {}
+    for kind, option in (("ELF", "--list-elf"), ("PTX", "--list-ptx")):
+        result = subprocess.run(
+            ["/usr/local/cuda/bin/cuobjdump", option, str(path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        targets[kind] = {
+            int(target) for target in re.findall(r"\.sm_(\d+)\.", result.stdout)
+        }
+    invalid = {
+        kind: sorted(target for target in values if target // 10 != 12)
+        for kind, values in targets.items()
+        if any(target // 10 != 12 for target in values)
+    }
+    if invalid:
+        raise RuntimeError(f"{path.name} contains non-SM12 CUDA code: {invalid}")
+
+
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -195,6 +217,7 @@ def verify_build() -> dict[str, str]:
     vllm_root = site_root / "vllm"
     core_extension = require_one(vllm_root, "_C_stable_libtorch*.so")
     require_cuda_architecture(core_extension, "sm_120")
+    require_only_sm12_cuda_code(core_extension)
     flashkda_extension = require_one(vllm_root, "_flashkda_C*.so")
     require_cuda_architecture(flashkda_extension, "sm_120")
     require_one(vllm_root, "_rust_tool_parser*.so")
@@ -299,6 +322,8 @@ def verify_build() -> dict[str, str]:
 
     if provenance.get("runtime_contract") != REQUIRED_RUNTIME_CONTRACT:
         raise RuntimeError("packaged GLM runner contract mismatch")
+    if provenance.get("build", {}).get("vllm_dgx_sm121_only") is not True:
+        raise RuntimeError("runner provenance does not require an SM121-only core")
     template_path = Path(provenance["chat_template"]["image_path"])
     if sha256(template_path) != provenance["chat_template"]["sha256"]:
         raise RuntimeError("packaged GLM chat template hash mismatch")

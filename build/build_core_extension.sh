@@ -36,6 +36,7 @@ cmake -S "$work_dir/vllm" -B "$work_dir/vllm-build" -G Ninja \
   -DVLLM_PYTHON_PATH="$python_path" \
   -DVLLM_CUTLASS_SRC_DIR="$work_dir/cutlass" \
   -DVLLM_BUILD_CORE_EXTENSION_ONLY=ON \
+  -DVLLM_DGX_SM121_ONLY="$VLLM_DGX_SM121_ONLY" \
   -DNVCC_THREADS="$NVCC_THREADS" \
   -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
 cmake --build "$work_dir/vllm-build" --target _C_stable_libtorch \
