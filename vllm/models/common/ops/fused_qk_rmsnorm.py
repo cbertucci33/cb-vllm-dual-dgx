@@ -110,7 +110,8 @@ class FusedQKVRMSNormKernel(VllmTritonJitKernel["FusedQKVRMSNormKernel.CompileKe
         )
 
     def get_warmup_keys(self, vllm_config: Any) -> list[CompileKey]:
-        hf_config = vllm_config.model_config.hf_config
+        model_config = vllm_config.model_config
+        hf_config = model_config.hf_text_config
         q_size = int(getattr(hf_config, "q_lora_rank", 0) or 0)
         # GLM-5.3 stores the compressed KV width in kv_lora_rank and leaves
         # head_dim at zero. The runtime call receives that compressed width,
@@ -121,21 +122,50 @@ class FusedQKVRMSNormKernel(VllmTritonJitKernel["FusedQKVRMSNormKernel.CompileKe
             or getattr(hf_config, "kv_lora_rank", 0)
             or 0
         )
-        if q_size <= 0 or kv_size <= 0:
-            return []
+        keys: list[FusedQKVRMSNormKernel.CompileKey] = []
+        if q_size > 0 and kv_size > 0:
+            input_stride = q_size + kv_size
+            keys.extend(
+                self._trace_dispatch(self.dispatch)(
+                    dtype=model_config.dtype,
+                    q_size=q_size,
+                    kv_size=kv_size,
+                    q_in_stride=input_stride,
+                    q_out_stride=(input_stride, q_size),
+                    kv_in_stride=input_stride,
+                    kv_out_stride=(input_stride, kv_size),
+                    eps=float(hf_config.rms_norm_eps),
+                    launch_pdl=current_platform.is_arch_support_pdl(),
+                )
+            )
 
-        input_stride = q_size + kv_size
-        return self._trace_dispatch(self.dispatch)(
-            dtype=vllm_config.model_config.dtype,
-            q_size=q_size,
-            kv_size=kv_size,
-            q_in_stride=input_stride,
-            q_out_stride=(input_stride, q_size),
-            kv_in_stride=input_stride,
-            kv_out_stride=(input_stride, kv_size),
-            eps=float(hf_config.rms_norm_eps),
-            launch_pdl=current_platform.is_arch_support_pdl(),
-        )
+        # GLM-5.3 vision applies the same fused kernel to contiguous per-head
+        # q/k rows. Include that distinct 64/64 stride signature in startup
+        # warmup so the first image request does not compile it in-band.
+        vision_config = getattr(model_config.hf_config, "vision_config", None)
+        if vision_config is not None:
+            hidden_size = int(getattr(vision_config, "hidden_size", 0) or 0)
+            num_heads = int(
+                getattr(vision_config, "num_heads", 0)
+                or getattr(vision_config, "num_attention_heads", 0)
+                or 0
+            )
+            if hidden_size > 0 and num_heads > 0 and hidden_size % num_heads == 0:
+                head_size = hidden_size // num_heads
+                keys.extend(
+                    self._trace_dispatch(self.dispatch)(
+                        dtype=model_config.dtype,
+                        q_size=head_size,
+                        kv_size=head_size,
+                        q_in_stride=head_size,
+                        q_out_stride=head_size,
+                        kv_in_stride=head_size,
+                        kv_out_stride=head_size,
+                        eps=float(vision_config.rms_norm_eps),
+                        launch_pdl=current_platform.is_arch_support_pdl(),
+                    )
+                )
+        return keys
 
     def warmup_inputs(self, compile_key: CompileKey) -> dict[str, Any]:
         return dict(

@@ -9,7 +9,10 @@ from vllm.config import CacheConfig
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.models.common.ops import fused_q_kv_rmsnorm
+from vllm.models.common.ops import (
+    _FUSED_Q_KV_RMSNORM_KERNEL,
+    fused_q_kv_rmsnorm,
+)
 from vllm.platforms import current_platform
 
 if TYPE_CHECKING:
@@ -110,6 +113,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         # When True, fuse the q_a and kv_a RMSNorms into a single kernel launch
         # (MLA layers with q-LoRA). Opt-in; default False preserves other models.
         self.fuse_qkv_rmsnorm = fuse_qkv_rmsnorm
+        if self.fuse_qkv_rmsnorm:
+            _FUSED_Q_KV_RMSNORM_KERNEL.register_warmup()
         # qrep is active when the query projection is a DCP-group-sharded layer
         # that materializes the full group head set locally.
         q_proj_layer = self.q_b_proj if self.q_lora_rank is not None else self.q_proj
