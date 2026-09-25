@@ -117,23 +117,31 @@ class FusedQKVRMSNormKernel(VllmTritonJitKernel["FusedQKVRMSNormKernel.CompileKe
         # head_dim at zero. The runtime call receives that compressed width,
         # so warm the same compile key instead of deferring compilation to the
         # first request.
-        kv_size = int(
-            getattr(hf_config, "head_dim", 0)
-            or getattr(hf_config, "kv_lora_rank", 0)
-            or 0
+        configured_head_dim = int(getattr(hf_config, "head_dim", 0) or 0)
+        kv_size = configured_head_dim or int(
+            getattr(hf_config, "kv_lora_rank", 0) or 0
         )
         keys: list[FusedQKVRMSNormKernel.CompileKey] = []
         if q_size > 0 and kv_size > 0:
-            input_stride = q_size + kv_size
+            # GLM's fused projection retains the RoPE slice beside q/kv, so
+            # both views step over q + kv + rope values between token rows.
+            # Architectures with a concrete head_dim already include their
+            # complete KV projection width there.
+            rope_size = (
+                0
+                if configured_head_dim
+                else int(getattr(hf_config, "qk_rope_head_dim", 0) or 0)
+            )
+            input_stride = q_size + kv_size + rope_size
             keys.extend(
                 self._trace_dispatch(self.dispatch)(
                     dtype=model_config.dtype,
                     q_size=q_size,
                     kv_size=kv_size,
                     q_in_stride=input_stride,
-                    q_out_stride=(input_stride, q_size),
+                    q_out_stride=q_size,
                     kv_in_stride=input_stride,
-                    kv_out_stride=(input_stride, kv_size),
+                    kv_out_stride=kv_size,
                     eps=float(hf_config.rms_norm_eps),
                     launch_pdl=current_platform.is_arch_support_pdl(),
                 )
