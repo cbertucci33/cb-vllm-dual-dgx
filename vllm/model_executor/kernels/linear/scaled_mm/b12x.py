@@ -275,13 +275,20 @@ class B12xTensorFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
     ) -> B12xWarmupUnit:
         packed_weight = layer.b12x_tensor_fp8_packed_weight
         device = torch.device(packed_weight.values.device)
+        # On GB10, deep-K tensor-FP8 GEMMs have two BK128 prefill policies
+        # adjacent to the bounded 1,536--2,048-row BK64 policy. Cache-hit and
+        # chunked prefills can enter either regime even when the full request
+        # and maximum-size warmups select different kernels.
+        tensor_fp8_token_counts = tuple(
+            sorted({*token_counts, 1024, 3072})
+        )
 
         def compile() -> None:
             tensor_fp8 = _import_b12x_tensor_fp8()
             assert tensor_fp8 is not None
             tensor_fp8.prewarm(
                 packed_weight,
-                token_counts,
+                tensor_fp8_token_counts,
                 out_dtype=output_dtype,
                 stream=current_stream().cuda_stream,
             )
