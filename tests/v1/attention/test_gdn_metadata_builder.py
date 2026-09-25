@@ -129,6 +129,7 @@ def _create_gdn_builder(
     mamba_cache_mode: str = "none",
     num_prefill_checkpoint_blocks: int = 0,
     prefix_match_unit: int | None = None,
+    device: torch.device = DEVICE,
 ) -> GDNAttentionMetadataBuilder:
     """Create a GDNAttentionMetadataBuilder with minimal config."""
     vllm_config = create_vllm_config(
@@ -158,7 +159,7 @@ def _create_gdn_builder(
         kv_cache_spec=mamba_spec,
         layer_names=["layer.0"],
         vllm_config=vllm_config,
-        device=DEVICE,
+        device=device,
     )
 
 
@@ -209,15 +210,18 @@ def test_has_initial_state_after_reclassification():
     assert meta.has_initial_state[0].item() is True
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_internal_checkpoint_metadata_targets_last_aligned_boundary():
+    device = torch.device("cuda")
     builder = _create_gdn_builder(
         mamba_cache_mode="align",
         num_prefill_checkpoint_blocks=1,
         prefix_match_unit=BLOCK_SIZE,
+        device=device,
     )
     batch = BatchSpec(seq_lens=[50, 32], query_lens=[50, 16])
     common = create_common_attn_metadata(
-        batch, BLOCK_SIZE, DEVICE, arange_block_indices=True
+        batch, BLOCK_SIZE, device, arange_block_indices=True
     )
 
     meta = builder.build(common_prefix_len=0, common_attn_metadata=common)
@@ -225,11 +229,11 @@ def test_internal_checkpoint_metadata_targets_last_aligned_boundary():
     assert meta.checkpoint is not None
     torch.testing.assert_close(
         meta.checkpoint.state_indices,
-        torch.tensor([2, NULL_BLOCK_ID], dtype=torch.int32),
+        torch.tensor([2, NULL_BLOCK_ID], dtype=torch.int32, device=device),
     )
     torch.testing.assert_close(
         meta.checkpoint.checkpoint_offsets,
-        torch.tensor([48, 0], dtype=torch.int32),
+        torch.tensor([48, 0], dtype=torch.int32, device=device),
     )
 
 
