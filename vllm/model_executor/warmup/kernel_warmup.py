@@ -158,6 +158,55 @@ def _autotune_kimi_k3_kda_qkvg(model: torch.nn.Module) -> None:
         module.autotune_kda_qkvg(model)
 
 
+def _warmup_dflash_rejection_sampling(worker: "Worker") -> None:
+    """Warm the target-side DFlash rejection kernels with live geometry."""
+    runner = worker.model_runner
+    spec_config = runner.vllm_config.speculative_config
+    if spec_config is None or not spec_config.use_dflash():
+        return
+
+    from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
+        rejection_sample,
+    )
+
+    num_speculative_steps = int(spec_config.num_speculative_tokens)
+    num_logits = num_speculative_steps + 1
+    device = runner.device
+    target_logits = torch.zeros(
+        (num_logits, runner.vocab_size),
+        dtype=runner.dtype,
+        device=device,
+    )
+    draft_sampled = torch.zeros(num_logits, dtype=torch.int32, device=device)
+    cu_num_logits = torch.tensor(
+        [0, num_logits], dtype=torch.int32, device=device
+    )
+    pos = torch.arange(num_logits, dtype=torch.int64, device=device)
+    idx_mapping = torch.zeros(1, dtype=torch.int64, device=device)
+    expanded_idx_mapping = torch.zeros(
+        num_logits, dtype=torch.int64, device=device
+    )
+    expanded_local_pos = torch.arange(
+        num_logits, dtype=torch.int32, device=device
+    )
+    temperature = torch.ones(1, dtype=torch.float32, device=device)
+    seed = torch.zeros(1, dtype=torch.int64, device=device)
+    rejection_sample(
+        target_logits,
+        None,
+        draft_sampled,
+        cu_num_logits,
+        pos,
+        idx_mapping,
+        expanded_idx_mapping,
+        expanded_local_pos,
+        temperature,
+        seed,
+        num_speculative_steps,
+    )
+    logger.info("Warmed target-side DFlash rejection sampling kernels.")
+
+
 def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
         minimax_m3_msa_warmup,
@@ -178,6 +227,12 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
             registry = (
                 worker.model_runner.jit_warmup_registry  # type: ignore[attr-defined]
             )
+            from vllm.v1.sample.ops.topk_topp_sampler import (
+                register_top_k_top_p_warmups,
+            )
+
+            with registry.activate():
+                register_top_k_top_p_warmups()
             registry.warmup()
         except Exception:
             logger.exception(
@@ -200,6 +255,7 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     # Run next so input-prep kernels JIT against pristine runner state.
     if enable_jit_warmup:
         glm5next_triton_warmup(worker.model_runner)
+        _warmup_dflash_rejection_sampling(worker)
         kimi_k3_triton_warmup(worker)
         watermark_sample_warmup(worker)
         qwen4_exp_qsa_triton_warmup(worker)

@@ -62,6 +62,9 @@ def _warm_cache_checkpoint_store(
             conv_state = conv_state.transpose(-1, -2)
         state_len = int(layer.conv_size - 1)
         width = int(3 * layer.local_projection_size)
+        projected_row_size = int(
+            sum(layer.in_proj_qkvbfg_a.output_partition_sizes)
+        )
         recurrent_row_size = int(recurrent_state[0].numel())
         key = (
             conv_state.dtype,
@@ -70,12 +73,21 @@ def _warm_cache_checkpoint_store(
             int(recurrent_state.stride(0)),
             state_len,
             width,
+            projected_row_size,
             recurrent_row_size,
         )
         if key in warmed:
             continue
 
-        x = torch.empty((1, width), dtype=conv_state.dtype, device=device)
+        # Runtime passes the qkv slice of the merged qkv|b|f_a|g_a projection.
+        # Preserve the merged projection's row stride while limiting the view
+        # width to qkv so Triton warms the exact runtime specialization.
+        x = torch.empty_strided(
+            (1, width),
+            (projected_row_size, 1),
+            dtype=conv_state.dtype,
+            device=device,
+        )
         checkpoint_state = torch.empty(
             (1, *recurrent_state.shape[1:]),
             dtype=recurrent_state.dtype,
