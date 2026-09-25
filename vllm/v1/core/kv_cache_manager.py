@@ -234,6 +234,12 @@ class KVCacheManager:
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
 
+    def get_replay_boundary(self, request: Request) -> int:
+        """Return the exact target-state boundary a later request can restore."""
+        boundaries = self.coordinator.get_replay_boundaries(request)
+        assert len(boundaries) == 1
+        return boundaries[0]
+
     @property
     def usage(self) -> float:
         """Get the KV cache usage.
@@ -957,6 +963,10 @@ class KVCacheManager:
             offloads.append((group_id, block.block_id, boundary_tokens))
         return offloads
 
-    def new_step_starts(self) -> None:
-        """Notify the coordinator that a new step is starting."""
-        self.coordinator.new_step_starts()
+    def new_step_starts(self, step_seq: int = 0) -> None:
+        """Record the fence sequence for state hashes published this pass."""
+        self.coordinator.new_step_starts(step_seq)
+
+    def commit_step(self, step_seq: int) -> None:
+        """Make state hashes from completed GPU steps eligible for hits."""
+        self.coordinator.commit_step(step_seq)

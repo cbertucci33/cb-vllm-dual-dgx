@@ -315,6 +315,7 @@ class Scheduler(SchedulerInterface):
                 self.cache_config.enable_mamba_fine_grained_prefix_cache
             ),
         )
+        self.draft_replay_reserve = self.kv_cache_manager.draft_replay_reserve
         # Bind after construction so connectors can access the cache manager.
         if self.connector is not None:
             self.connector.bind_kv_cache_manager(self.kv_cache_manager)
@@ -504,6 +505,11 @@ class Scheduler(SchedulerInterface):
             and junction <= request.num_prompt_tokens
             else block_floored
         )
+        replay_boundary = (
+            self.kv_cache_manager.get_replay_boundary(request)
+            if self.draft_replay_reserve
+            else 0
+        )
         stops = (
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
@@ -520,6 +526,10 @@ class Scheduler(SchedulerInterface):
             # Marconi shared-prefix junction: cache its state so sibling
             # requests sharing the prefix can reuse it.
             junction_stop if start < junction < end else 0,
+            # DFlash's private draft window must be replayed after a target
+            # cache restore. Materialize the exact restorable target-state
+            # boundary before the final prefill chunk advances that page.
+            replay_boundary if start < replay_boundary < end else 0,
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
@@ -599,7 +609,9 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
-        self.kv_cache_manager.new_step_starts()
+        # State hashes published during this pass are not safe to hit until
+        # the GPU step assigned this fence sequence has completed.
+        self.kv_cache_manager.new_step_starts(self.sched_step_seq + 1)
 
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
         # all prefill compute unless saturated.
@@ -1448,7 +1460,7 @@ class Scheduler(SchedulerInterface):
 
         # Advance the fence only for non-empty steps (those that actually
         # write KV and have their output processed later in update_from_output).
-        if self.defer_block_free and total_num_scheduled_tokens > 0:
+        if total_num_scheduled_tokens > 0:
             self.sched_step_seq += 1
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
@@ -1888,9 +1900,11 @@ class Scheduler(SchedulerInterface):
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
-        if self.defer_block_free and scheduler_output.total_num_scheduled_tokens > 0:
+        if scheduler_output.total_num_scheduled_tokens > 0:
             self.processed_step_seq += 1
-            self._drain_deferred_frees()
+            self.kv_cache_manager.commit_step(self.processed_step_seq)
+            if self.defer_block_free:
+                self._drain_deferred_frees()
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
