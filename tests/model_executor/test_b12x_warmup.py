@@ -114,8 +114,13 @@ def test_b12x_mxfp8_warmup_unit(monkeypatch) -> None:
     unit = kernel.get_b12x_warmup_unit(layer, (1, 8), torch.float16)
     unit.compile()
 
-    assert [args[0].shape for args, _ in calls] == [(1, 128), (8, 128)]
-    assert [kwargs["expected_m"] for _, kwargs in calls] == [1, 8]
+    assert [args[0].shape for args, _ in calls] == [
+        (1, 128),
+        (8, 128),
+        (1024, 128),
+        (3072, 128),
+    ]
+    assert [kwargs["expected_m"] for _, kwargs in calls] == [1, 8, 1024, 3072]
 
 
 def test_b12x_tensor_fp8_warmup_unit(monkeypatch) -> None:

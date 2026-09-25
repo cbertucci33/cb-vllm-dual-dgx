@@ -112,11 +112,16 @@ class B12xMxfp8LinearKernel(Mxfp8LinearKernel):
     ) -> B12xWarmupUnit:
         packed_weight = layer.b12x_mxfp8_packed_weight
         device = torch.device(packed_weight.weight.values.device)
+        # GB10 deep-K MXFP8 GEMMs select distinct BK128 prefill policies on
+        # either side of the bounded 1,536--2,048-row BK64 regime. Cache-hit
+        # and chunked prefills can enter both even when capture and maximum
+        # serving sizes select different kernels.
+        mxfp8_token_counts = tuple(sorted({*token_counts, 1024, 3072}))
 
         def compile() -> None:
             mxfp8 = _import_b12x_mxfp8()
             assert mxfp8 is not None
-            for tokens in token_counts:
+            for tokens in mxfp8_token_counts:
                 source = torch.zeros(
                     (tokens, int(packed_weight.in_features)),
                     dtype=output_dtype,
