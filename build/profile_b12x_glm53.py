@@ -153,7 +153,16 @@ def replace_blockscaled_component(
             range_fields=frozenset(),
         )
     )
-    merged_component["coverage"] = measured_component.get("coverage", {})
+    base_coverage = base_component.get("coverage", {})
+    measured_coverage = measured_component.get("coverage", {})
+    if not isinstance(base_coverage, Mapping) or not isinstance(
+        measured_coverage, Mapping
+    ):
+        raise TypeError("blockscaled profile coverage must be an object")
+    merged_component["coverage"] = {
+        **base_coverage,
+        "glm53_mxfp8_extension": dict(measured_coverage),
+    }
 
     merged_components = [
         merged_component
