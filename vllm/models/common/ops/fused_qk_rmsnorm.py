@@ -112,7 +112,15 @@ class FusedQKVRMSNormKernel(VllmTritonJitKernel["FusedQKVRMSNormKernel.CompileKe
     def get_warmup_keys(self, vllm_config: Any) -> list[CompileKey]:
         hf_config = vllm_config.model_config.hf_config
         q_size = int(getattr(hf_config, "q_lora_rank", 0) or 0)
-        kv_size = int(getattr(hf_config, "head_dim", 0) or 0)
+        # GLM-5.3 stores the compressed KV width in kv_lora_rank and leaves
+        # head_dim at zero. The runtime call receives that compressed width,
+        # so warm the same compile key instead of deferring compilation to the
+        # first request.
+        kv_size = int(
+            getattr(hf_config, "head_dim", 0)
+            or getattr(hf_config, "kv_lora_rank", 0)
+            or 0
+        )
         if q_size <= 0 or kv_size <= 0:
             return []
 

@@ -239,7 +239,7 @@ def verify_build() -> dict[str, str]:
     if provenance.get("schema_version") != 2:
         raise RuntimeError("runner provenance schema mismatch")
     runner = provenance.get("runner", {})
-    if runner.get("version") != "3.1" or not runner.get("source"):
+    if runner.get("version") != "3.2" or not runner.get("source"):
         raise RuntimeError("runner release provenance mismatch")
     for model_name in ("target", "dflash"):
         model = provenance.get("models", {}).get(model_name, {})

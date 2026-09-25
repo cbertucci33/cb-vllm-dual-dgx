@@ -15,6 +15,7 @@ from b12x.policy.generation import (
     GenerationContext,
     GenerationSettings,
     build_axis_tree,
+    decision_node_to_dict,
 )
 from b12x.policy.generation.providers.blockscaled import (
     QUERY_FIELDS,
@@ -144,10 +145,12 @@ def replace_blockscaled_component(
         key = tuple(record.query[field] for field in QUERY_FIELDS)
         by_query[key] = record
     merged_component = dict(base_component)
-    merged_component["planner"] = build_axis_tree(
-        tuple(by_query.values()),
-        field_order=QUERY_FIELDS,
-        range_fields=frozenset(),
+    merged_component["planner"] = decision_node_to_dict(
+        build_axis_tree(
+            tuple(by_query.values()),
+            field_order=QUERY_FIELDS,
+            range_fields=frozenset(),
+        )
     )
     merged_component["coverage"] = measured_component.get("coverage", {})
 
