@@ -77,8 +77,8 @@ def b12x_warmup(worker: "Worker", cudagraph_capture_sizes: list[int]) -> None:
         max_tokens=max_tokens,
         cudagraph_capture_sizes=serving_sizes,
     )
-    # The GB10 MXFP8 profile uses exact A16 row routes. Compile one unprofiled
-    # medium-prefill row so its quantized BK64 fallback cannot JIT in service.
+    # The GB10 profile measures 1,536 rows for every GLM geometry. Compile the
+    # selected policy during startup so medium prefills cannot JIT in service.
     token_counts = tuple(sorted({*token_counts, 1536}))
 
     models = [worker.get_model()]

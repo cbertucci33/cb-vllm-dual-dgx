@@ -47,6 +47,11 @@ GLM53_GEOMETRIES = (
     (256, 4096),
 )
 
+# The serving scheduler can present a 1,536-token prefill to every projection
+# above. B12X routes rows exactly, so this row must be measured rather than
+# relying on the quantized fallback compiled during startup.
+GLM53_ROW_COUNTS = tuple(sorted({*ROW_COUNTS, 1536}))
+
 
 def read_json(path: Path) -> Mapping[str, object]:
     payload = path.read_bytes()
@@ -199,7 +204,7 @@ def main() -> None:
     generator = BlockscaledPrecisionGenerator(
         cases=precision_cases(
             geometries=GLM53_GEOMETRIES,
-            counts=ROW_COUNTS,
+            counts=GLM53_ROW_COUNTS,
             recipes=("mxfp8",),
         )
     )
