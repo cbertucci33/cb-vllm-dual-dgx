@@ -8,6 +8,7 @@ ARG FLASHINFER_COMMIT
 ARG SPARKINFER_COMMIT
 ARG EXLLAMAV3_COMMIT
 ARG B12X_COMMIT
+ARG FLASHKDA_COMMIT
 ARG RUNNER_VERSION
 ARG RUNNER_SOURCE_URL
 
@@ -26,6 +27,8 @@ RUN cd /opt/glm53-runner-artifacts \
     && sha256sum -c artifact-sha256.txt \
     && install -m 0755 ./_C_stable_libtorch*.so \
        /usr/local/lib/python3.12/dist-packages/vllm/_C_stable_libtorch.abi3.so \
+    && install -m 0755 ./_flashkda_C*.so \
+       /usr/local/lib/python3.12/dist-packages/vllm/_flashkda_C.abi3.so \
     && /usr/bin/python3 -m pip uninstall -y flashinfer-jit-cache flashinfer-cubin \
     && /usr/bin/python3 -m pip install --no-deps --force-reinstall ./*.whl \
     && install -D -m 0755 ./flashinfer-topk-sm121.so \
@@ -40,4 +43,5 @@ LABEL org.opencontainers.image.source="${RUNNER_SOURCE_URL}" \
       io.glm53runner.flashinfer.revision="${FLASHINFER_COMMIT}" \
       io.glm53runner.sparkinfer.revision="${SPARKINFER_COMMIT}" \
       io.glm53runner.exllamav3.revision="${EXLLAMAV3_COMMIT}" \
-      io.glm53runner.b12x.revision="${B12X_COMMIT}"
+      io.glm53runner.b12x.revision="${B12X_COMMIT}" \
+      io.glm53runner.flashkda.revision="${FLASHKDA_COMMIT}"

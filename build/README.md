@@ -61,6 +61,7 @@ build/prepare_sources.sh \
   /srv/glm53/build/checkouts/exllamav3 \
   /srv/glm53/build/checkouts/b12x \
   /srv/glm53/build/checkouts/cutlass \
+  /srv/glm53/build/checkouts/flashkda \
   /srv/glm53/build/source-archives
 ```
 
@@ -117,6 +118,9 @@ run_builder "build/build_wheels.sh \
 run_builder 'build/build_core_extension.sh \
   /work/source-archives /work/build-deps /work/artifacts'
 
+run_builder 'build/build_flashkda_extension.sh \
+  /work/source-archives /work/build-deps /work/artifacts'
+
 build/finalize_artifacts.sh "$work/artifacts"
 ```
 
@@ -147,6 +151,7 @@ docker build \
   --build-arg SPARKINFER_COMMIT="$SPARKINFER_COMMIT" \
   --build-arg EXLLAMAV3_COMMIT="$EXLLAMAV3_COMMIT" \
   --build-arg B12X_COMMIT="$B12X_COMMIT" \
+  --build-arg FLASHKDA_COMMIT="$FLASHKDA_COMMIT" \
   --build-arg RUNNER_VERSION="$RUNNER_VERSION" \
   --build-arg RUNNER_SOURCE_URL="$RUNNER_SOURCE_URL" \
   -t glm53-flash-exl3:internal-v3.1 \

@@ -15,6 +15,14 @@ if [[ ${#core_extensions[@]} -ne 1 ]]; then
   exit 1
 fi
 
+mapfile -t flashkda_extensions < <(
+  find "$artifact_dir" -maxdepth 1 -type f -name '_flashkda_C*.so'
+)
+if [[ ${#flashkda_extensions[@]} -ne 1 ]]; then
+  echo "expected one FlashKDA extension, found ${#flashkda_extensions[@]}" >&2
+  exit 1
+fi
+
 shopt -s nullglob
 wheels=("$artifact_dir"/*.whl)
 if [[ ${#wheels[@]} -lt 4 ]]; then
@@ -29,6 +37,6 @@ fi
 
 (
   cd "$artifact_dir"
-  sha256sum ./*.whl ./_C_stable_libtorch*.so \
+  sha256sum ./*.whl ./_C_stable_libtorch*.so ./_flashkda_C*.so \
     ./flashinfer-topk-sm121.so > artifact-sha256.txt
 )

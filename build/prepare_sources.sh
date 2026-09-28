@@ -5,8 +5,8 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(git -C "$script_dir/.." rev-parse --show-toplevel)
 source "$repo_root/build/versions.env"
 
-if [[ $# -ne 6 ]]; then
-  echo "usage: $0 FLASHINFER_REPO SPARKINFER_REPO EXLLAMAV3_REPO B12X_REPO CUTLASS_REPO OUTPUT_DIR" >&2
+if [[ $# -ne 7 ]]; then
+  echo "usage: $0 FLASHINFER_REPO SPARKINFER_REPO EXLLAMAV3_REPO B12X_REPO CUTLASS_REPO FLASHKDA_REPO OUTPUT_DIR" >&2
   exit 2
 fi
 
@@ -15,7 +15,8 @@ sparkinfer_repo=$2
 exllamav3_repo=$3
 b12x_repo=$4
 cutlass_repo=$5
-output_dir=$6
+flashkda_repo=$6
+output_dir=$7
 mkdir -p "$output_dir"
 
 require_commit() {
@@ -38,6 +39,11 @@ require_commit "$sparkinfer_repo" "$SPARKINFER_COMMIT"
 require_commit "$exllamav3_repo" "$EXLLAMAV3_COMMIT"
 require_commit "$b12x_repo" "$B12X_COMMIT"
 require_commit "$cutlass_repo" "$VLLM_CUTLASS_COMMIT"
+require_commit "$flashkda_repo" "$FLASHKDA_COMMIT"
+if [[ $(git -C "$flashkda_repo/cutlass" rev-parse HEAD) != "$FLASHKDA_CUTLASS_COMMIT" ]]; then
+  echo "FlashKDA CUTLASS source mismatch" >&2
+  exit 1
+fi
 
 vllm_commit=$(git -C "$repo_root" rev-parse HEAD)
 if [[ -n $(git -C "$repo_root" status --porcelain) ]]; then
@@ -57,6 +63,11 @@ git -C "$b12x_repo" archive --format=tar.gz --prefix=b12x/ \
   -o "$output_dir/b12x-$B12X_COMMIT.tar.gz" "$B12X_COMMIT"
 git -C "$cutlass_repo" archive --format=tar.gz --prefix=cutlass/ \
   -o "$output_dir/cutlass-$VLLM_CUTLASS_COMMIT.tar.gz" "$VLLM_CUTLASS_COMMIT"
+git -C "$flashkda_repo" archive --format=tar.gz --prefix=flashkda/ \
+  -o "$output_dir/flashkda-$FLASHKDA_COMMIT.tar.gz" "$FLASHKDA_COMMIT"
+git -C "$flashkda_repo/cutlass" archive --format=tar.gz --prefix=flashkda/cutlass/ \
+  -o "$output_dir/flashkda-cutlass-$FLASHKDA_CUTLASS_COMMIT.tar.gz" \
+  "$FLASHKDA_CUTLASS_COMMIT"
 
 cp "$repo_root/build/patches/sparkinfer-cutlass-dsl.patch" "$output_dir/"
 cp "$repo_root/build/patches/exllamav3-aarch64.patch" "$output_dir/"

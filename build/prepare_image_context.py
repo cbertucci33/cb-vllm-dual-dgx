@@ -104,8 +104,7 @@ def main() -> None:
     )
     shutil.copy2(script_dir / "verify_runtime.py", args.output_dir)
     template = (
-        script_dir.parent
-        / "templates/chat_template_glm53_official-690b705.jinja"
+        script_dir.parent / "templates/chat_template_glm53_official-690b705.jinja"
     )
     template_hash = sha256(template)
     shutil.copy2(template, args.output_dir / "chat_template.jinja")
@@ -130,6 +129,8 @@ def main() -> None:
             "flashinfer_cutlass": versions["FLASHINFER_CUTLASS_COMMIT"],
             "flashinfer_spdlog": versions["FLASHINFER_SPDLOG_COMMIT"],
             "vllm_cutlass": versions["VLLM_CUTLASS_COMMIT"],
+            "flashkda": versions["FLASHKDA_COMMIT"],
+            "flashkda_cutlass": versions["FLASHKDA_CUTLASS_COMMIT"],
             "sparkinfer": versions["SPARKINFER_COMMIT"],
             "exllamav3": versions["EXLLAMAV3_COMMIT"],
             "b12x": versions["B12X_COMMIT"],

@@ -39,6 +39,9 @@ fetch_commit https://github.com/local-inference-lab/b12x.git \
   "$B12X_COMMIT" "$output_dir/b12x"
 fetch_commit https://github.com/NVIDIA/cutlass.git \
   "$VLLM_CUTLASS_COMMIT" "$output_dir/cutlass"
+fetch_commit https://github.com/vllm-project/FlashKDA.git \
+  "$FLASHKDA_COMMIT" "$output_dir/flashkda"
+git -C "$output_dir/flashkda" submodule update --init --recursive --depth 1
 
 declare -A flashinfer_submodules=(
   [3rdparty/cccl]="$FLASHINFER_CCCL_COMMIT"
@@ -53,5 +56,11 @@ for path in "${!flashinfer_submodules[@]}"; do
     exit 1
   fi
 done
+
+actual_flashkda_cutlass=$(git -C "$output_dir/flashkda/cutlass" rev-parse HEAD)
+if [[ $actual_flashkda_cutlass != "$FLASHKDA_CUTLASS_COMMIT" ]]; then
+  echo "FlashKDA CUTLASS submodule is $actual_flashkda_cutlass, expected $FLASHKDA_CUTLASS_COMMIT" >&2
+  exit 1
+fi
 
 echo "fetched all pinned source checkouts into $output_dir"

@@ -35,6 +35,10 @@ option(
   VLLM_DGX_SM121_ONLY
   "Build the internal DGX Spark core extension without legacy CUDA/PTX fallbacks"
   OFF)
+option(
+  VLLM_BUILD_FLASHKDA_EXTENSION_ONLY
+  "Build only the FlashKDA optional extension"
+  OFF)
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "Target device: ${VLLM_TARGET_DEVICE}")
 
@@ -1603,6 +1607,14 @@ if (VLLM_GPU_LANG STREQUAL "HIP")
 endif()
 
 # For CUDA and HIP builds also build the triton_kernels external package.
+if(VLLM_BUILD_FLASHKDA_EXTENSION_ONLY)
+  if(NOT VLLM_GPU_LANG STREQUAL "CUDA")
+    message(FATAL_ERROR "FlashKDA requires a CUDA build")
+  endif()
+  include(cmake/external_projects/flashkda.cmake)
+  return()
+endif()
+
 if(VLLM_BUILD_CORE_EXTENSION_ONLY)
   message(STATUS "VLLM_BUILD_CORE_EXTENSION_ONLY is set; skipping optional external projects")
   return()
