@@ -11,6 +11,9 @@ match a pure-PyTorch recurrence, and reject layouts it cannot address.
 import pytest
 import torch
 
+from vllm.models.glm5next.amd.ops.third_party.kda import (
+    fused_recurrent_kda as fused_recurrent_kda_amd,
+)
 from vllm.models.glm5next.nvidia.ops.third_party.kda import fused_recurrent_kda
 from vllm.platforms import current_platform
 
@@ -20,6 +23,10 @@ pytestmark = pytest.mark.skipif(
 
 H, D = 16, 128
 LOWER_BOUND = -5.0
+SPEC_DECODE_IMPLS = {
+    "nvidia": fused_recurrent_kda,
+    "amd": fused_recurrent_kda_amd,
+}
 
 
 def naive_recurrent_kda(
@@ -184,3 +191,96 @@ def test_fused_recurrent_kda_rejects_unaddressable_layouts():
         broken["cu_seqlens"] = None if q.shape[0] > 1 else inputs["cu_seqlens"]
         with pytest.raises(AssertionError, match=r"torch.Size"):
             run_kernel(broken, state)
+
+
+def _run_spec_decode_case(
+    impl: str,
+    accepted: list[int],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_seqs, query_len, heads, dim = len(accepted), 3, 2, 128
+    total_tokens = num_seqs * query_len
+    q = torch.randn(1, total_tokens, heads, dim, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    state_indices = torch.arange(
+        1, total_tokens + 1, dtype=torch.int32, device="cuda"
+    ).view(num_seqs, query_len)
+    state = torch.randn(
+        total_tokens + 1,
+        heads,
+        dim,
+        dim,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    output = torch.full_like(v, torch.nan)
+    actual, actual_state = SPEC_DECODE_IMPLS[impl](
+        q=q,
+        k=k,
+        v=v,
+        g=-torch.rand_like(q),
+        beta=torch.rand(1, total_tokens, heads, dtype=torch.float32, device="cuda"),
+        initial_state=state.clone(),
+        cu_seqlens=torch.arange(
+            0,
+            total_tokens + 1,
+            query_len,
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        ssm_state_indices=state_indices,
+        num_accepted_tokens=torch.tensor(accepted, dtype=torch.int32, device="cuda"),
+        out=output,
+    )
+    assert actual.data_ptr() == output.data_ptr()
+    return actual, actual_state, state, state_indices
+
+
+@pytest.mark.parametrize("impl", SPEC_DECODE_IMPLS)
+@pytest.mark.parametrize("num_accepted", [0, 4])
+@torch.inference_mode()
+def test_fused_recurrent_kda_invalid_accepted_count_fails_closed(
+    impl: str,
+    num_accepted: int,
+):
+    torch.manual_seed(2026)
+    actual, actual_state, state, _ = _run_spec_decode_case(impl, [num_accepted])
+    torch.testing.assert_close(actual, torch.zeros_like(actual))
+    torch.testing.assert_close(actual_state, state)
+
+
+@pytest.mark.parametrize("impl", SPEC_DECODE_IMPLS)
+@pytest.mark.parametrize(("invalid_seq", "num_accepted"), [(0, 4), (1, 0)])
+@torch.inference_mode()
+def test_fused_recurrent_kda_invalid_count_spares_neighbor(
+    impl: str,
+    invalid_seq: int,
+    num_accepted: int,
+):
+    torch.manual_seed(2026)
+    reference, reference_state, state, state_indices = _run_spec_decode_case(
+        impl, [2, 2]
+    )
+    torch.manual_seed(2026)
+    accepted = [2, 2]
+    accepted[invalid_seq] = num_accepted
+    actual, actual_state, _, _ = _run_spec_decode_case(impl, accepted)
+
+    query_len = state_indices.shape[1]
+    expected = reference.clone()
+    expected[:, invalid_seq * query_len : (invalid_seq + 1) * query_len] = 0
+    expected_state = reference_state.clone()
+    own_rows = state_indices[invalid_seq].long()
+    expected_state[own_rows] = state[own_rows]
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_state, expected_state)
+
+
+@pytest.mark.parametrize("impl", SPEC_DECODE_IMPLS)
+@torch.inference_mode()
+def test_fused_recurrent_kda_valid_accepted_count_updates_state(impl: str):
+    torch.manual_seed(2026)
+    actual, actual_state, state, _ = _run_spec_decode_case(impl, [2])
+    assert not torch.isnan(actual).any()
+    assert not torch.equal(actual, torch.zeros_like(actual))
+    assert not torch.equal(actual_state, state)
