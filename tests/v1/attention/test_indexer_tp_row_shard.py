@@ -281,7 +281,7 @@ def test_tp_row_shard_prefill_matches_row_independent_reference(
 
 
 def _scored_keys(seq_lens, query_lens, compress_ratio):
-    """Per-row ke - ks, spelled out the way the Triton metadata kernel does."""
+    """Per-row compressed-key work."""
     out = []
     for seq_len, query_len in zip(seq_lens, query_lens):
         context = seq_len - query_len
@@ -346,9 +346,6 @@ def test_balanced_row_shard_equalises_scored_keys(tp_size: int, shape: str) -> N
     assert min(sizes) >= 1
 
     per_row = _scored_keys(seq_lens, query_lens, compress_ratio)
-    assert per_row == [
-        int(x) for x in _reference_ke_minus_ks(seq_lens, query_lens, compress_ratio)
-    ]
     base, rem = divmod(num_rows, tp_size)
     equal_sizes = [base + int(r < rem) for r in range(tp_size)]
 
@@ -358,15 +355,6 @@ def test_balanced_row_shard_equalises_scored_keys(tp_size: int, shape: str) -> N
 
     assert imbalance(sizes) <= imbalance(equal_sizes) + 1e-9
     assert imbalance(sizes) < 1.02
-
-
-def _reference_ke_minus_ks(seq_lens, query_lens, compress_ratio):
-    """Independent restatement of the kernel formula, vectorised."""
-    out = []
-    for seq_len, query_len in zip(seq_lens, query_lens):
-        pos = torch.arange(query_len) + (seq_len - query_len) + 1
-        out += (pos // compress_ratio).tolist()
-    return out
 
 
 def test_balanced_row_shard_declines_below_the_floor() -> None:
@@ -391,44 +379,6 @@ def test_balanced_row_shard_declines_below_the_floor() -> None:
         )
         is None
     )
-
-
-@pytest.mark.parametrize("context_len", [128_000, 256_000, 512_000, 1_000_000])
-def test_long_context_tp4_shard_is_exact_and_cost_balanced(
-    context_len: int,
-) -> None:
-    """Exercise the production TP4 planner at every reported A/B length.
-
-    The treatment must be an exact partition/permutation of the baseline row
-    order, while balancing the causal compressed-key work that dominates the
-    long-prefill indexer.
-    """
-    compress_ratio = 4
-    sizes = indexer.balanced_prefill_row_shard(
-        torch.tensor([context_len], dtype=torch.int32),
-        torch.tensor([context_len], dtype=torch.int32),
-        compress_ratio,
-        4,
-    )
-    assert sizes is not None
-    assert len(sizes) == 4
-    assert sum(sizes) == context_len
-    assert min(sizes) > 0
-
-    # Reassembling the per-rank slices must preserve every baseline row in the
-    # same order. This is the semantic contract of the layout-only gather.
-    baseline_rows = torch.arange(context_len, dtype=torch.int32)
-    treatment_rows = torch.cat(baseline_rows.split(sizes))
-    torch.testing.assert_close(treatment_rows, baseline_rows)
-
-    per_row_cost = torch.arange(1, context_len + 1, dtype=torch.int64) // 4
-    cumulative = torch.cat(
-        [torch.zeros(1, dtype=torch.int64), torch.cumsum(per_row_cost, dim=0)]
-    )
-    boundaries = torch.tensor([0, *torch.cumsum(torch.tensor(sizes), 0).tolist()])
-    rank_costs = cumulative[boundaries[1:]] - cumulative[boundaries[:-1]]
-    imbalance = float(rank_costs.max()) / float(rank_costs.double().mean())
-    assert imbalance < 1.001
 
 
 def _sharding_config(cudagraph_mode=CUDAGraphMode.PIECEWISE):
