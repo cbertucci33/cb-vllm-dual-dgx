@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheLayout,
     KVCacheTensor,
+    MambaSpec,
     MLAAttentionSpec,
     SparseCacheRole,
     compute_layout_strides,
@@ -177,6 +178,100 @@ def test_attention_checks_preserve_global_and_target_scoped_support():
         )
         == "_DraftBackend"
     )
+
+
+def test_build_attn_metadata_reuses_mamba_and_propagates_token_map():
+    """Same-spec Mamba groups reuse metadata and all groups share the token map."""
+
+    class ReusingBuilder:
+        supports_update_block_table = True
+
+        def __init__(self, result):
+            self.result = result
+            self.build_calls = 0
+            self.update_calls = []
+
+        def build(self, *, common_prefix_len, common_attn_metadata, **kwargs):
+            assert common_prefix_len == 0
+            assert not kwargs
+            self.build_calls += 1
+            common_attn_metadata._token_to_req_indices_cache = token_map
+            return self.result
+
+        def update_block_table(self, metadata, block_table, slot_mapping):
+            self.update_calls.append((metadata, block_table, slot_mapping))
+            return self.result
+
+    class ObservingBuilder:
+        supports_update_block_table = False
+
+        def __init__(self):
+            self.seen_token_map = None
+
+        def build(self, *, common_prefix_len, common_attn_metadata, **kwargs):
+            assert common_prefix_len == 0
+            assert not kwargs
+            self.seen_token_map = common_attn_metadata._token_to_req_indices_cache
+            return "observed"
+
+    mamba_spec = MambaSpec(
+        block_size=16,
+        shapes=((16, 64),),
+        dtypes=(torch.float16,),
+        mamba_cache_mode="none",
+    )
+    dense_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float16,
+    )
+    first_builder = ReusingBuilder("first")
+    second_builder = ReusingBuilder("second")
+    observer = ObservingBuilder()
+
+    def group(name, spec, builder):
+        return SimpleNamespace(
+            layer_names=[name],
+            kv_cache_spec=spec,
+            get_metadata_builder=lambda _index: builder,
+        )
+
+    attn_groups = [
+        [group("mamba.0", mamba_spec, first_builder)],
+        [group("mamba.1", mamba_spec, second_builder)],
+        [group("dense", dense_spec, observer)],
+    ]
+    block_tables = [
+        torch.tensor([[group_index]], dtype=torch.int32) for group_index in range(3)
+    ]
+    slot_mappings = torch.tensor([[10], [11], [12]], dtype=torch.int64)
+    token_map = torch.tensor([0], dtype=torch.int32)
+    kv_cache_config = SimpleNamespace(kv_cache_groups=[object(), object(), object()])
+
+    metadata = attn_utils.build_attn_metadata(
+        attn_groups=attn_groups,  # type: ignore[arg-type]
+        num_reqs=1,
+        num_tokens=1,
+        query_start_loc_gpu=torch.tensor([0, 1], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
+        max_query_len=1,
+        seq_lens=torch.tensor([1], dtype=torch.int32),
+        max_seq_len=1,
+        block_tables=block_tables,
+        slot_mappings=slot_mappings,
+        kv_cache_config=kv_cache_config,  # type: ignore[arg-type]
+    )
+
+    assert first_builder.build_calls == 1
+    assert second_builder.build_calls == 0
+    assert len(second_builder.update_calls) == 1
+    source, updated_block_table, updated_slot_mapping = second_builder.update_calls[0]
+    assert source == "first"
+    assert updated_block_table is block_tables[1]
+    torch.testing.assert_close(updated_slot_mapping, slot_mappings[1])
+    assert observer.seen_token_map is token_map
+    assert metadata == {"mamba.0": "first", "mamba.1": "second", "dense": "observed"}
 
 
 def test_get_kv_sharing_fast_prefill_eligible_layers(monkeypatch: pytest.MonkeyPatch):
