@@ -50,6 +50,28 @@ logger = init_logger(__name__)
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 
 
+def can_use_split_kv(
+    max_seqlen_q: int,
+    num_seqs: int,
+    seq_threshold_3D: int | None,
+    num_par_softmax_segments: int | None,
+    softmax_segm_output: torch.Tensor | None,
+    softmax_segm_max: torch.Tensor | None,
+    softmax_segm_expsum: torch.Tensor | None,
+) -> bool:
+    """One definition of 3D split-KV eligibility for launcher and builders."""
+    return not (
+        seq_threshold_3D is None
+        or num_par_softmax_segments is None
+        or softmax_segm_output is None
+        or softmax_segm_max is None
+        or softmax_segm_expsum is None
+        or max_seqlen_q > 1
+        or num_seqs > seq_threshold_3D
+        or is_batch_invariant
+    )
+
+
 @triton.jit
 def kernel_unified_attention_diffkv(
     # Output destinations.  In 2D mode we write the final result into
