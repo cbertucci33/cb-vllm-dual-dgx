@@ -659,19 +659,11 @@ def test_kda_spec_invalid_accepted_count_is_fail_closed(
     torch.testing.assert_close(actual_state, state_before)
 
 
-@pytest.mark.parametrize(
-    ("impl", "uniform_sequence_length"),
-    [
-        pytest.param("nvidia", None, id="nvidia"),
-        pytest.param("amd", None, id="amd-dynamic-length"),
-        pytest.param("amd", 3, id="amd-static-length"),
-    ],
-)
+@pytest.mark.parametrize("impl", SPEC_DECODE_FWD_IMPLS.keys())
 @pytest.mark.parametrize(("invalid_seq", "num_accepted"), [(0, 4), (1, 0)])
 @torch.inference_mode()
 def test_kda_spec_invalid_accepted_count_spares_neighbor(
     impl: str,
-    uniform_sequence_length: int | None,
     invalid_seq: int,
     num_accepted: int,
 ):
@@ -689,11 +681,6 @@ def test_kda_spec_invalid_accepted_count_spares_neighbor(
     state_indices = torch.arange(1, T + 1, dtype=torch.int32, device=DEVICE)
     state_indices = state_indices.view(2, L)
     state = torch.randn(T + 1, H, D, D, dtype=torch.float32, device=DEVICE)
-    extra_args = (
-        {"uniform_sequence_length": uniform_sequence_length}
-        if uniform_sequence_length is not None
-        else {}
-    )
 
     def run(accepted: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
         return SPEC_DECODE_FWD_IMPLS[impl](
@@ -709,7 +696,6 @@ def test_kda_spec_invalid_accepted_count_spares_neighbor(
                 accepted, dtype=torch.int32, device=DEVICE
             ),
             out=torch.full_like(v, torch.nan),
-            **extra_args,
         )
 
     reference, reference_state = run([2, 2])
