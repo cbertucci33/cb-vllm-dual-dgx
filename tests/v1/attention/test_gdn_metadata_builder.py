@@ -239,8 +239,14 @@ def test_update_block_table_matches_build(
     )
     for builder in (src, dst, ref):
         builder.vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
+    source_common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
     common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
     if mamba_cache_mode == "align":
+        src.mamba_aligned_state_indices = _cpu_aligned_state_indices(
+            source_common.block_table_tensor,
+            source_common.seq_lens,
+            src.kv_cache_spec,
+        )
         dst.mamba_aligned_state_indices = ref.mamba_aligned_state_indices = (
             _cpu_aligned_state_indices(
                 common.block_table_tensor, common.seq_lens, ref.kv_cache_spec
@@ -248,7 +254,7 @@ def test_update_block_table_matches_build(
         )
     draft_tokens = test_case.num_decode_draft_tokens
     expected = _build(ref, batch, draft_tokens, common.block_table_tensor)
-    source = _build(src, batch, draft_tokens)
+    source = _build(src, batch, draft_tokens, source_common.block_table_tensor)
     fields = (
         "spec_state_indices_tensor",
         "non_spec_state_indices_tensor",
