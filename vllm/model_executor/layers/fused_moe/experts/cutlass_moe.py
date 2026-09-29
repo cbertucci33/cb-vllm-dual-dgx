@@ -415,9 +415,9 @@ class CutlassExpertsFp8(CutlassExpertsFp8Base):
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
-        # STANDARD format applies expert_map in moe_permute before grouped GEMM.
-        # The CUTLASS kernel itself only sees local expert ids. Some all2all
-        # backends are incompatible with this prepare/finalize path.
+        # EP is supported only with allgather_reducescatter (expert_map remapping).
+        # DeepEP HT and FlashInfer NVLink prepare/finalize use incompatible
+        # post-dispatch layouts for Standard-format grouped GEMM.
         return not (
             moe_parallel_config.use_fi_nvl_two_sided_kernels
             or moe_parallel_config.use_deepep_ht_kernels
@@ -744,6 +744,9 @@ class CutlassExpertsFp4(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
+        # EP is supported only with allgather_reducescatter (expert_map remapping).
+        # DeepEP HT and FlashInfer NVLink prepare/finalize use incompatible
+        # post-dispatch layouts for Standard-format grouped GEMM.
         return not (
             moe_parallel_config.use_fi_nvl_two_sided_kernels
             or moe_parallel_config.use_deepep_ht_kernels
@@ -1057,6 +1060,9 @@ class CutlassExpertsMxfp4(mk.FusedMoEExpertsModular):
     def _supports_parallel_config(
         moe_parallel_config: FusedMoEParallelConfig,
     ) -> bool:
+        # EP is supported only with allgather_reducescatter (expert_map remapping).
+        # DeepEP HT and FlashInfer NVLink prepare/finalize use incompatible
+        # post-dispatch layouts for Standard-format grouped GEMM.
         return not (
             moe_parallel_config.use_fi_nvl_two_sided_kernels
             or moe_parallel_config.use_deepep_ht_kernels
