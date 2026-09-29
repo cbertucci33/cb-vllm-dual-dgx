@@ -198,6 +198,16 @@ def _build(
     return builder.build(common_prefix_len=0, common_attn_metadata=common, **kwargs)
 
 
+def _cpu_aligned_state_indices(
+    block_table: torch.Tensor, seq_lens: torch.Tensor, spec: MambaSpec
+) -> torch.Tensor:
+    """Reference the CUDA align gather without launching Triton on CPU tensors."""
+    num_slots = 1 + spec.num_speculative_blocks
+    starts = ((seq_lens - 1) // spec.block_size).clamp_min(0)
+    columns = starts[:, None] + torch.arange(num_slots, dtype=torch.int32)
+    return block_table.gather(1, columns.to(torch.int64))
+
+
 @pytest.mark.parametrize(
     "test_case", GDN_BUILD_TEST_CASES.values(), ids=GDN_BUILD_TEST_CASES.keys()
 )
@@ -232,8 +242,8 @@ def test_update_block_table_matches_build(
     common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
     if mamba_cache_mode == "align":
         dst.mamba_aligned_state_indices = ref.mamba_aligned_state_indices = (
-            mamba_get_block_table_tensor(
-                common.block_table_tensor, common.seq_lens, ref.kv_cache_spec, "align"
+            _cpu_aligned_state_indices(
+                common.block_table_tensor, common.seq_lens, ref.kv_cache_spec
             )
         )
     draft_tokens = test_case.num_decode_draft_tokens
