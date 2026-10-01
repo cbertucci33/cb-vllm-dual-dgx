@@ -29,6 +29,9 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 
 if TYPE_CHECKING:
+    from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+        RoutedExpertsSink,
+    )
     from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExperts
 
 
@@ -116,6 +119,8 @@ class RoutedExperts(PluggableLayer):
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
         self.e_score_correction_bias = e_score_correction_bias
+        # Set by bind_routed_experts_capturer for monolithic kernels.
+        self.routing_sink: RoutedExpertsSink | None = None
         self.apply_router_weight_on_input = apply_router_weight_on_input
         # End random parameters
         self._loaded_expert_biases: set[str] = set()
