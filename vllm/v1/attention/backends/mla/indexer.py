@@ -722,7 +722,8 @@ def compute_kpool_tail_slot_mapping(
     req = req.clamp_(min=0, max=num_reqs - 1)
     own_block = block_table[:num_reqs, 0].index_select(0, req).to(torch.int64)
     pos = positions[:num_actual_tokens].to(torch.int64)
-    out[:num_actual_tokens] = own_block * ring + torch.remainder(pos, ring)
+    slots = own_block * ring + torch.remainder(pos, ring)
+    out[:num_actual_tokens] = torch.where(own_block != 0, slots, -1)
     return out
 
 
