@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GLM-5.3-Flash vision tower and multimodal processor."""
 
+import math
 from collections.abc import Mapping
 from functools import cached_property, partial
 
@@ -656,6 +657,24 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
         if (override := mm_kwargs.get("max_pixels")) is not None:
             return int(override)
         return self._processor_pixel_budget(self.get_hf_processor().video_processor)[1]
+
+    def get_image_size_with_most_features(self) -> ImageSize:
+        """Return a canvas that reaches the processor's exact token ceiling."""
+        vision_config = self.get_hf_config().vision_config
+        factor = (
+            vision_config.patch_size
+            * vision_config.spatial_merge_size
+            * self.get_hf_processor().image_processor.patch_expand_factor
+        )
+        pixels_per_token = vision_config.temporal_patch_size * factor * factor
+        max_tokens = max(1, self._get_image_max_pixels() // pixels_per_token)
+        short_side = math.isqrt(max_tokens)
+        while max_tokens % short_side:
+            short_side -= 1
+        return ImageSize(
+            width=(max_tokens // short_side) * factor,
+            height=short_side * factor,
+        )
 
     def _get_vision_info(
         self,
