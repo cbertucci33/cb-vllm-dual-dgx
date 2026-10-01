@@ -5,7 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from math import prod
-from typing import TYPE_CHECKING, final
+from typing import final
 
 import torch
 
@@ -23,6 +23,9 @@ from vllm.model_executor.layers.fused_moe.config import (
     RoutingMethodType,
 )
 from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    RoutedExpertsSink,
+)
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
     SharedExpertsOrder,
@@ -42,12 +45,6 @@ from vllm.v1.worker.ubatching import (
     dbo_yield,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
-
-if TYPE_CHECKING:
-    from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
-        RoutedExpertsSink,
-    )
-
 
 logger = init_logger(__name__)
 
@@ -1530,7 +1527,7 @@ class FusedMoEKernelMonolithicImpl:
         e_score_correction_bias: torch.Tensor | None = None,
         routed_scaling_factor: float | None = None,
         topk_group: int | None = None,
-        routing_sink: "RoutedExpertsSink | None" = None,
+        routing_sink: RoutedExpertsSink | None = None,
     ) -> torch.Tensor | UnfinalizedMoEOutput:
         """
         Same as forward(), except uses router_logits as opposed
@@ -1686,7 +1683,7 @@ class FusedMoEKernel:
         e_score_correction_bias: torch.Tensor | None = None,
         routed_scaling_factor: float | None = None,
         topk_group: int | None = None,
-        routing_sink: "RoutedExpertsSink | None" = None,
+        routing_sink: RoutedExpertsSink | None = None,
     ) -> torch.Tensor | UnfinalizedMoEOutput:
         assert isinstance(self.impl, FusedMoEKernelMonolithicImpl)
         return self.impl.apply(
