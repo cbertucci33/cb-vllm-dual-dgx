@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
+from dataclasses import replace
 from itertools import islice
 
 import torch
@@ -485,8 +486,7 @@ class MiMoV2FlashDecoderLayer(nn.Module):
         v_scale = getattr(config, "attention_value_scale", None)
         # cache_config.sliding_window holds MiMo's SWA window; global layers
         # would otherwise fall back to it in Attention.
-        cache_config = vllm_config.cache_config
-        cache_config.sliding_window = None
+        cache_config = replace(vllm_config.cache_config, sliding_window=None)
 
         if self.is_compressed_softmax_layer():
             self.self_attn = MiMoV2Attention(
