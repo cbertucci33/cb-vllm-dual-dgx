@@ -169,6 +169,42 @@ def test_module_load_shared_params_that_are_not_tied_embeddings():
     assert torch.all(mod.gate.weight == torch.Tensor([[1, 2], [3, 4]]))
 
 
+@pytest.mark.cpu_test
+def test_auto_loader_normalizes_rank_sliced_weight_names():
+    class RankSlicedConfig:
+        _ignore_unexpected_suffixes: list[str] = []
+
+        @staticmethod
+        def get_cache_scale_mapper():
+            return WeightsMapper()
+
+        @staticmethod
+        def get_checkpoint_weight_mapper():
+            return WeightsMapper()
+
+        @staticmethod
+        def normalize_rank_sliced_weight_name(name: str) -> str | None:
+            if name == "weight.rank0.trellis":
+                return "weight"
+            if name == "weight.rank1.trellis":
+                return None
+            return name
+
+    mod = torch.nn.Linear(2, 2, bias=False)
+    mod.quant_config = RankSlicedConfig()
+    loaded = AutoWeightsLoader(mod).load_weights(
+        iter(
+            [
+                ("weight.rank0.trellis", torch.full((2, 2), 3.0)),
+                ("weight.rank1.trellis", torch.full((2, 2), 9.0)),
+            ]
+        )
+    )
+
+    assert loaded == {"weight"}
+    assert torch.all(mod.weight == 3.0)
+
+
 class raise_if_cuda_sync:
     def __enter__(self):
         self.previous_debug_mode = torch.cuda.get_sync_debug_mode()

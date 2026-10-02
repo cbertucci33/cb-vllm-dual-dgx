@@ -437,6 +437,15 @@ class AutoWeightsLoader:
             mapper |= quant_config.get_checkpoint_weight_mapper()
             ignore_unexpected_suffixes = quant_config._ignore_unexpected_suffixes
             self.ignore_unexpected_suffixes.extend(ignore_unexpected_suffixes)
+            normalize_rank_sliced_name = getattr(
+                quant_config, "normalize_rank_sliced_weight_name", None
+            )
+            if normalize_rank_sliced_name is not None:
+                weights = (
+                    (normalized, weight)
+                    for name, weight in weights
+                    if (normalized := normalize_rank_sliced_name(name)) is not None
+                )
         mapper |= self.REMOVE_UNUSED_ROTARY_EMBEDS_MAPPER
 
         weights = mapper.apply(weights)
