@@ -912,6 +912,13 @@ class Exl3LinearMethod(LinearMethodBase):
         for shard_id in layer.exl3_shard_ids:
             if shard_id in already_sharded:
                 continue
+            if cls._is_padded_qkv_value_shard(layer, shard_id):
+                # EXL3 applies its output transform in 256-row blocks.  An
+                # asymmetric V projection padded to the Q/K head width may not
+                # have a block-aligned TP partition (for example 768 / TP2).
+                # Keep the small V projection replicated, remove per-head
+                # padding after GEMM, then select the rank-local heads.
+                continue
             size = cls._output_shard_size(layer, shard_id)
             start = cls._qkv_output_start(layer, shard_id, size)
             layer.svh.exl3_tensors[shard_id] = (
@@ -923,6 +930,39 @@ class Exl3LinearMethod(LinearMethodBase):
                 start=start,
                 size=size,
             )
+
+    @staticmethod
+    def _is_padded_qkv_value_shard(
+        layer: torch.nn.Module, shard_id: ShardId
+    ) -> bool:
+        if not isinstance(layer, QKVParallelLinear) or shard_id != "v":
+            return False
+        if layer.v_head_size >= layer.head_size:
+            return False
+        source_n = layer.svh.exl3_tensors[shard_id].numel()
+        logical_n = layer.total_num_kv_heads * layer.v_head_size
+        padded_n = layer.total_num_kv_heads * layer.head_size
+        if source_n == logical_n:
+            return False
+        if source_n != padded_n:
+            raise ValueError(
+                "EXL3 asymmetric QKV V projection has an unsupported output "
+                f"width: source={source_n}, logical={logical_n}, "
+                f"head-padded={padded_n}"
+            )
+        return True
+
+    @classmethod
+    def _trim_and_shard_padded_qkv_value(
+        cls, layer: torch.nn.Module, output: torch.Tensor
+    ) -> torch.Tensor:
+        output = output.view(
+            *output.shape[:-1], layer.total_num_kv_heads, layer.head_size
+        )
+        output = output[..., : layer.v_head_size]
+        shard_rank = layer.exl3_tp_rank // layer.num_kv_head_replicas
+        output = output.narrow(-2, shard_rank * layer.num_kv_heads, layer.num_kv_heads)
+        return output.flatten(-2)
 
     @classmethod
     def _expand_tuple_output_shards(cls, layer: torch.nn.Module) -> set[int]:
@@ -1022,6 +1062,8 @@ class Exl3LinearMethod(LinearMethodBase):
             shard_id in layer.mcg.exl3_tensors,
             shard_id in layer.mul1.exl3_tensors,
         )
+        if Exl3LinearMethod._is_padded_qkv_value_shard(layer, shard_id):
+            return Exl3LinearMethod._trim_and_shard_padded_qkv_value(layer, output)
         logical_n = Exl3LinearMethod._output_shard_size(layer, shard_id)
         if output.shape[-1] < logical_n:
             raise ValueError(
