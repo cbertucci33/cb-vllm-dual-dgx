@@ -1,3 +1,21 @@
+# cb-vllm-dual-dgx
+
+`cb-vllm-dual-dgx` is a downstream vLLM runner for two-node NVIDIA DGX Spark
+deployments. It tracks vLLM 0.30 and packages the CUDA, distributed-runtime,
+EXL3, and hybrid-model work needed by the supported deployment profiles.
+
+Release 6 moves the project beyond its original GLM-only and vLLM 0.29 scope.
+It keeps the qualified GLM and DFlash paths, adds generic rank-sliced EXL3
+loading for compatible tensor-parallel MoE checkpoints, and retains the
+two-node DGX Spark build contract. See [RELEASES.md](RELEASES.md) for the
+release history and upgrade notes.
+
+This is a downstream integration, not an official vLLM distribution. Follow
+the pinned source and build instructions in each release. Model-specific
+templates, checkpoints, and acceptance criteria remain model-specific.
+
+---
+
 <!-- markdownlint-disable MD001 MD041 -->
 <p align="center">
   <picture>
