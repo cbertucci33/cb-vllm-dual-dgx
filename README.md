@@ -50,17 +50,11 @@ Changes in this release:
   [#58450](https://github.com/vllm-project/vllm/pull/58450), and
   [#58762](https://github.com/vllm-project/vllm/pull/58762).
 
-### Current capacity figures
+### Performance status
 
-The current two-rank GLM operating profile uses 800,000 maximum model tokens,
-two sequences, FP8 DS-MLA KV cache, and 9.44 GB of KV reservation per rank.
-At that setting, vLLM reported 1,174,545 KV-cache tokens, or 1.47 times the
-configured model length. This is a capacity observation, not a Release 6
-throughput benchmark.
-
-The measured production throughput and DFlash2 acceptance figures below are
-retained from the Release 5 two-node deployment. Release 6 has not yet produced
-a comparable production benchmark, so this README makes no new throughput claim.
+Release 6 performance is at minimum in line with Release 5. Further performance
+testing is in progress. The measured Release 5 throughput and DFlash2 acceptance
+figures remain below as the latest complete published results.
 
 ## Basic deployment
 
@@ -109,10 +103,9 @@ source revision, rank-sliced checkpoint, DFlash checkpoint, and runtime flags.
 ## Release 5 production measurements
 
 This Release 5 snapshot covers 922 completed organic requests on one two-node
-DGX Spark deployment. The runtime used an 800,000-token model limit, a
-971,162-token cache, and DFlash2 with seven proposals. Prompt length, output
-length, cache warmth, reasoning depth, and concurrency varied. These are
-production observations, not hardware limits or a controlled benchmark.
+DGX Spark deployment. Prompt length, output length, cache warmth, reasoning
+depth, and concurrency varied. These are production observations, not hardware
+limits or a controlled benchmark.
 
 ### Generation throughput
 
