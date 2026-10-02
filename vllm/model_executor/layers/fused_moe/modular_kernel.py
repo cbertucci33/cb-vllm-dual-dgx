@@ -1527,7 +1527,8 @@ class FusedMoEKernelMonolithicImpl:
         e_score_correction_bias: torch.Tensor | None = None,
         routed_scaling_factor: float | None = None,
         topk_group: int | None = None,
-        routing_sink: RoutedExpertsSink | None = None,
+        *,
+        routing_sink: RoutedExpertsSink | None,
     ) -> torch.Tensor | UnfinalizedMoEOutput:
         """
         Same as forward(), except uses router_logits as opposed
@@ -1682,7 +1683,8 @@ class FusedMoEKernel:
         e_score_correction_bias: torch.Tensor | None = None,
         routed_scaling_factor: float | None = None,
         topk_group: int | None = None,
-        routing_sink: RoutedExpertsSink | None = None,
+        *,
+        routing_sink: RoutedExpertsSink | None,
     ) -> torch.Tensor | UnfinalizedMoEOutput:
         assert isinstance(self.impl, FusedMoEKernelMonolithicImpl)
         return self.impl.apply(
