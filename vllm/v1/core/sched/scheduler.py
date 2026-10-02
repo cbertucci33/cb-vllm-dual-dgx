@@ -1758,19 +1758,6 @@ class Scheduler(SchedulerInterface):
                 # already calculated encoder inputs and can skip here.
                 continue
 
-            if not self.is_encoder_decoder:
-                # We are not using the encoder cache for encoder-decoder models,
-                # yet.
-                if item_identifier in mm_hashes_to_schedule:
-                    # The same encoder input has already been scheduled in the
-                    # current step.
-                    continue
-
-                if self.encoder_cache_manager.check_and_update_cache(request, i):
-                    # The encoder input is already computed and cached from a
-                    # previous step.
-                    continue
-
             # If no encoder input chunking is allowed, we do not want to
             # partially schedule a multimodal item. If the scheduled range would
             # only cover part of the mm input, roll back to before the mm item.
@@ -1787,6 +1774,20 @@ class Scheduler(SchedulerInterface):
                     0, start_pos - (num_computed_tokens + shift_computed_tokens)
                 )
                 break
+
+            if not self.is_encoder_decoder:
+                # We are not using the encoder cache for encoder-decoder models,
+                # yet.
+                if item_identifier in mm_hashes_to_schedule:
+                    # The same encoder input has already been scheduled in the
+                    # current step.
+                    continue
+
+                if self.encoder_cache_manager.check_and_update_cache(request, i):
+                    # The encoder input is already computed and cached from a
+                    # previous step.
+                    continue
+
             if not self.encoder_cache_manager.can_allocate(
                 request, i, encoder_compute_budget, num_embeds_to_schedule
             ):
