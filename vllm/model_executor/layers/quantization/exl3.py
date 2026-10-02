@@ -358,10 +358,11 @@ class Exl3Config(QuantizationConfig):
             and rank_sliced.get("format") == _RANK_SLICED_FORMAT
         ):
             self._configure_rank_sliced(rank_sliced)
-            return
 
         # vLLM returns the summary embedded in config.json without consulting
         # get_config_filenames().  Hydrate the per-module records explicitly.
+        # Rank-sliced checkpoints still need these records for dense linears;
+        # only routed-expert storage is described by rank_sliced_metadata.
         if not self.tensor_storage:
             resolved_revision = revision
             if resolved_revision is None and hf_config is not None:

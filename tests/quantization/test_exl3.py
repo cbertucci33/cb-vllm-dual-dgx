@@ -33,6 +33,20 @@ def _rank_sliced_metadata(**overrides):
     return metadata
 
 
+def _dense_storage():
+    return {
+        "lm_head": {
+            "quant_format": "exl3",
+            "stored_tensors": {
+                "lm_head.trellis": {},
+                "lm_head.suh": {},
+                "lm_head.svh": {},
+                "lm_head.mcg": {},
+            },
+        }
+    }
+
+
 def test_rank_sliced_checkpoint_selects_exl3_override():
     hf_config = SimpleNamespace(hybrid_tr3_tail=_rank_sliced_metadata())
 
@@ -68,7 +82,7 @@ def test_rank_sliced_metadata_fails_closed(overrides, message):
 
 
 def test_rank_sliced_metadata_admits_only_declared_moe_layers():
-    config = Exl3Config()
+    config = Exl3Config(tensor_storage=_dense_storage())
     config.maybe_update_config(
         "unused",
         SimpleNamespace(hybrid_tr3_tail=_rank_sliced_metadata()),
@@ -83,8 +97,29 @@ def test_rank_sliced_metadata_admits_only_declared_moe_layers():
     )
 
 
-def test_rank_sliced_weight_name_keeps_only_local_tp_rank(monkeypatch):
+def test_rank_sliced_checkpoint_hydrates_dense_exl3_metadata(monkeypatch):
+    storage = _dense_storage()
+    monkeypatch.setattr(
+        exl3_module,
+        "get_hf_file_to_dict",
+        lambda *args, **kwargs: {"tensor_storage": storage},
+    )
     config = Exl3Config()
+
+    config.maybe_update_config(
+        "checkpoint",
+        SimpleNamespace(
+            hybrid_tr3_tail=_rank_sliced_metadata(),
+            tie_word_embeddings=False,
+        ),
+    )
+
+    assert config.tensor_storage == storage
+    assert config._linear_prefix_is_exl3("language_model.lm_head")
+
+
+def test_rank_sliced_weight_name_keeps_only_local_tp_rank(monkeypatch):
+    config = Exl3Config(tensor_storage=_dense_storage())
     config.maybe_update_config(
         "unused",
         SimpleNamespace(hybrid_tr3_tail=_rank_sliced_metadata()),
@@ -122,9 +157,7 @@ def test_glm5next_target_normalizes_rank_sliced_weights(monkeypatch):
     monkeypatch.setattr(glm5next_model, "AutoWeightsLoader", RecordingLoader)
     target = object.__new__(glm5next_model.Glm5NextForCausalLM)
     torch.nn.Module.__init__(target)
-    target.quant_config = SimpleNamespace(
-        normalize_rank_sliced_weight_name=normalize
-    )
+    target.quant_config = SimpleNamespace(normalize_rank_sliced_weight_name=normalize)
 
     loaded = target.load_weights(
         [

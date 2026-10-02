@@ -343,7 +343,18 @@ def convert_checkpoint(
         _write_json(partial / "config.json", config)
 
         quant = _json(source / "quantization_config.json")
-        quant.pop("tensor_storage", None)
+        # Routed-expert tensor names change during rank slicing, so their old
+        # storage records are invalid. Dense EXL3 records remain byte-identical
+        # and are required for vLLM to instantiate their quantized modules.
+        storage = quant.get("tensor_storage", {})
+        quant["tensor_storage"] = {
+            prefix: entry
+            for prefix, entry in storage.items()
+            if not any(
+                EXPERT_TENSOR_RE.fullmatch(name)
+                for name in entry.get("stored_tensors", {})
+            )
+        }
         quant["serving_reader_qualified"] = False
         quant["rank_sliced"] = _rank_metadata(plan, tp)
         _write_json(partial / "quantization_config.json", quant)

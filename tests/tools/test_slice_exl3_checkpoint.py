@@ -26,8 +26,29 @@ def _sha256(path: Path) -> str:
 
 def _make_checkpoint(path: Path, *, incomplete: bool = False) -> None:
     path.mkdir()
-    tensors = {"model.embed_tokens.weight": torch.arange(12).reshape(3, 4)}
-    storage = {}
+    dense_prefix = "model.layers.0.self_attn.q_proj"
+    tensors = {
+        "model.embed_tokens.weight": torch.arange(12).reshape(3, 4),
+        f"{dense_prefix}.trellis": torch.arange(4 * 4 * 64, dtype=torch.int16).reshape(
+            4, 4, 64
+        ),
+        f"{dense_prefix}.suh": torch.arange(64, dtype=torch.float16),
+        f"{dense_prefix}.svh": torch.arange(64, dtype=torch.float16),
+        f"{dense_prefix}.mcg": torch.tensor(
+            [0xCBAC1FED - (1 << 32)], dtype=torch.int32
+        ),
+    }
+    storage = {
+        dense_prefix: {
+            "quant_format": "exl3",
+            "bits_per_weight": 4,
+            "stored_tensors": {
+                name: {"shape": list(tensor.shape), "dtype": str(tensor.dtype)}
+                for name, tensor in tensors.items()
+                if name.startswith(f"{dense_prefix}.")
+            },
+        }
+    }
     for expert in range(2):
         for projection in ("gate_proj", "up_proj", "down_proj"):
             prefix = f"model.language_model.layers.3.mlp.experts.{expert}.{projection}"
@@ -92,6 +113,8 @@ def test_conversion_is_lossless_and_preserves_source(tmp_path: Path):
     config = json.loads((output / "config.json").read_text())
     assert config["hybrid_tr3_tail"]["tp"] == 2
     assert config["quantization_config"]["serving_reader_qualified"] is False
+    quant = json.loads((output / "quantization_config.json").read_text())
+    assert set(quant["tensor_storage"]) == {"model.layers.0.self_attn.q_proj"}
     assert (output / "tokenizer.json").is_file()
     validate_checkpoint(source, output, tp=2)
 
@@ -129,7 +152,7 @@ def test_plan_rejects_invalid_mcg_marker_dtype(tmp_path: Path):
     _make_checkpoint(source)
     shard = source / "model-00001.safetensors"
     with safe_open(shard, framework="pt", device="cpu") as handle:
-        tensors = {name: handle.get_tensor(name) for name in handle.keys()}
+        tensors = {name: handle.get_tensor(name) for name in handle}
     marker = next(name for name in tensors if name.endswith(".mcg"))
     tensors[marker] = tensors[marker].to(torch.int64)
     save_file(tensors, shard, metadata={"format": "pt"})
