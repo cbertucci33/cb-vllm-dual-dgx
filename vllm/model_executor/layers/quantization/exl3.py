@@ -1069,7 +1069,15 @@ class Exl3MoEParameter(BasevLLMParameter):
     ) -> None:
         key = (int(expert_id), str(shard_id))
         if not self.exl3_preallocate:
-            self.exl3_tensors[key] = loaded_weight.contiguous()
+            # Safetensors yields shard-backed tensor views.  Rank-sliced MoE
+            # payloads are copied into preallocated slabs below, but scalar
+            # MCG markers intentionally use this non-slab path.  Retaining a
+            # contiguous scalar view would retain its entire source shard.
+            self.exl3_tensors[key] = (
+                loaded_weight.clone()
+                if loaded_weight.numel() == 1
+                else loaded_weight.contiguous()
+            )
             return
         if self.exl3_num_experts <= 0 or shard_id not in self.exl3_shard_ids:
             raise ValueError(

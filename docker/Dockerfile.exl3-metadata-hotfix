@@ -5,5 +5,5 @@ COPY vllm/model_executor/layers/quantization/exl3.py \
 COPY vllm/model_executor/models/utils.py \
      /usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/utils.py
 
-LABEL org.opencontainers.image.revision="a01b81abef" \
-      org.opencontainers.image.version="3.8"
+LABEL org.opencontainers.image.revision="pending" \
+      org.opencontainers.image.version="3.9"

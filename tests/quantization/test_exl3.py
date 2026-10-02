@@ -220,6 +220,17 @@ def test_rank_sliced_parameter_preallocates_projection_major_slab(monkeypatch):
     torch.testing.assert_close(param.exl3_tensors[(2, "w3")], w3)
 
 
+def test_moe_scalar_marker_does_not_retain_source_storage():
+    source = torch.tensor([0xCBAC1FED], dtype=torch.int64)
+    param = Exl3MoEParameter(weight_loader=lambda *_: None)
+
+    param.load_exl3_weight(source, expert_id=0, shard_id="mcg")
+
+    stored = param.exl3_tensors[(0, "mcg")]
+    assert stored.data_ptr() != source.data_ptr()
+    assert torch.equal(stored, source)
+
+
 def test_rank_sliced_weights_use_the_planned_sparkinfer_contract(monkeypatch):
     experts = 2
     hidden = intermediate = 128
