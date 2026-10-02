@@ -373,6 +373,13 @@ class Exl3Config(QuantizationConfig):
                 revision=resolved_revision,
             )
             if not config or not config.get("tensor_storage"):
+                # Rank-sliced checkpoints may quantize only routed experts;
+                # their complete EXL3 layout lives in rank_sliced_metadata and
+                # non-routed tensors remain in their native checkpoint dtype.
+                # Dense/expert hybrid checkpoints still provide tensor_storage
+                # and continue through the validation below.
+                if self.rank_sliced_metadata is not None:
+                    return
                 raise ValueError(
                     "EXL3 requires quantization_config.json with a non-empty "
                     "tensor_storage map. For branch-indexed Hugging Face repos, "
