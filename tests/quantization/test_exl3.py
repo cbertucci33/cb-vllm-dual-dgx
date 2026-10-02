@@ -34,16 +34,20 @@ def _rank_sliced_metadata(**overrides):
 
 
 def _dense_storage():
-    return {
-        "lm_head": {
+    def entry(prefix):
+        return {
             "quant_format": "exl3",
             "stored_tensors": {
-                "lm_head.trellis": {},
-                "lm_head.suh": {},
-                "lm_head.svh": {},
-                "lm_head.mcg": {},
+                f"{prefix}.trellis": {},
+                f"{prefix}.suh": {},
+                f"{prefix}.svh": {},
+                f"{prefix}.mcg": {},
             },
         }
+
+    return {
+        "lm_head": entry("lm_head"),
+        "model.layers.0.self_attn.o_proj": entry("model.layers.0.self_attn.o_proj"),
     }
 
 
@@ -95,6 +99,7 @@ def test_rank_sliced_metadata_admits_only_declared_moe_layers():
     assert (
         config.codebook_for_prefix("model.layers.10.mlp.experts.0.gate_proj") == "mcg"
     )
+    assert config.codebook_for_prefix("model.layers.0.self_attn.o_proj") == "mcg"
 
 
 def test_rank_sliced_checkpoint_hydrates_dense_exl3_metadata(monkeypatch):

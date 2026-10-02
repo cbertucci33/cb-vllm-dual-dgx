@@ -593,7 +593,7 @@ class Exl3Config(QuantizationConfig):
         )
 
     def codebook_for_prefix(self, prefix: str) -> str | None:
-        if self.rank_sliced_metadata is not None:
+        if self.rank_sliced_metadata is not None and ".mlp.experts." in prefix:
             match = re.search(r"layers\.(\d+)\b", prefix)
             if match is None:
                 return None
