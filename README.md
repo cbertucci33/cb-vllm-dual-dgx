@@ -51,8 +51,8 @@ Changes in this release:
   [#58762](https://github.com/vllm-project/vllm/pull/58762).
 
 The measured production throughput and DFlash2 acceptance figures below are
-retained from the Release 5 two-node deployment. Release 6 has not yet produced
-a comparable production benchmark, so this README makes no new throughput claim.
+retained from the Release 5 two-node deployment. Release 6 performance is at
+minimum in line with Release 5 and remains under further testing.
 
 ## Basic deployment
 
