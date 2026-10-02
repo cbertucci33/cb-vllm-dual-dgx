@@ -13,6 +13,7 @@ from vllm.model_executor.layers.quantization.exl3 import (
     Exl3Config,
     Exl3MoEMethod,
     Exl3MoEParameter,
+    Exl3Parameter,
 )
 from vllm.models.glm5next.nvidia import model as glm5next_model
 
@@ -141,6 +142,17 @@ def test_rank_sliced_weight_name_keeps_only_local_tp_rank(monkeypatch):
         config.normalize_rank_sliced_weight_name("model.embed_tokens.weight")
         == "model.embed_tokens.weight"
     )
+
+
+def test_rank_sliced_dense_parameter_copies_mapped_weight():
+    source = torch.arange(8, dtype=torch.float16)
+    param = Exl3Parameter(weight_loader=lambda *_: None)
+    param.exl3_copy_on_load = True
+
+    param.load_exl3_weight(source)
+
+    assert param.exl3_tensors[None].data_ptr() != source.data_ptr()
+    assert torch.equal(param.exl3_tensors[None], source)
 
 
 def test_glm5next_target_normalizes_rank_sliced_weights(monkeypatch):

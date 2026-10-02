@@ -640,6 +640,12 @@ class Exl3Parameter(BasevLLMParameter):
         loaded_weight: torch.Tensor,
         shard_id: ShardId = None,
     ) -> None:
+        # A rank-sliced checkpoint stores both TP ranks in each safetensors
+        # shard. Dense EXL3 tensors are otherwise left as views into those
+        # mappings, pinning every full source shard until post-load processing.
+        # Copy only this small dense payload so the mapping can close.
+        if getattr(self, "exl3_copy_on_load", False):
+            loaded_weight = loaded_weight.clone(memory_format=torch.contiguous_format)
         self.exl3_tensors[shard_id] = loaded_weight.contiguous()
 
 
@@ -709,10 +715,9 @@ class Exl3LinearMethod(LinearMethodBase):
         # su/sv are legacy packed sign bitfields.  Modern checkpoints load
         # suh/svh directly.
         for name in ("suh", "svh", "su", "sv", "trellis", "mcg", "mul1"):
-            layer.register_parameter(
-                name,
-                Exl3Parameter(weight_loader=_exl3_weight_loader),
-            )
+            param = Exl3Parameter(weight_loader=_exl3_weight_loader)
+            param.exl3_copy_on_load = self.quant_config.rank_sliced_metadata is not None
+            layer.register_parameter(name, param)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self._materialize_legacy_hadamard(layer)
