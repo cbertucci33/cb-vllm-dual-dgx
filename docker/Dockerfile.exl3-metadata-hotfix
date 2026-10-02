@@ -2,6 +2,8 @@ FROM glm53-flash-exl3:internal-v3.4-06f747bc6a
 
 COPY vllm/model_executor/layers/quantization/exl3.py \
      /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/exl3.py
+COPY vllm/model_executor/models/utils.py \
+     /usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/utils.py
 
-LABEL org.opencontainers.image.revision="4dcad97dcf" \
-      org.opencontainers.image.version="3.6"
+LABEL org.opencontainers.image.revision="e875ff0ad0" \
+      org.opencontainers.image.version="3.7"
