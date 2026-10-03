@@ -37,6 +37,7 @@ class MiMoParser(Qwen3Parser):
                     turn_boundary_tokens=CHATML_TURN_BOUNDARIES,
                 ),
                 arg_converter=_mimo_arg_converter,
+                validate_tool_names=True,
             ),
         )
         super().__init__(tokenizer, tools, **kwargs)

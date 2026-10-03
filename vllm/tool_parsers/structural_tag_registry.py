@@ -118,7 +118,12 @@ def get_model_structural_tag(
     if not tools or tool_choice == "none":
         return None
 
-    if tool_choice == "auto" and not _any_tool_strict(tools):
+    # MiMo's tool format is fragile when generated unconstrained: malformed
+    # function names or missing required parameters can be parsed into an
+    # executable-looking tool call.  Its triggered structural tag preserves
+    # normal text responses under ``auto`` while constraining any tool call,
+    # so use it even when OpenAI clients omit the optional ``strict`` flag.
+    if tool_choice == "auto" and not _any_tool_strict(tools) and model != "mimo":
         return None
 
     dumped_tools = [_dump_tool_for_xgrammar(tool) for tool in tools]

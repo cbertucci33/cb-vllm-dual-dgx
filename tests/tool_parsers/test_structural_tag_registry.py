@@ -659,7 +659,9 @@ def test_xgrammar_function_parameters_are_preserved(
     assert sample_tools_strict[0].function.parameters is not None
 
 
-@pytest.mark.parametrize("model", sorted(XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS))
+@pytest.mark.parametrize(
+    "model", sorted(XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS - {"mimo"})
+)
 def test_auto_tool_choice_skips_structural_tag_without_strict(
     model: str,
     sample_tools: list[ChatCompletionToolsParam],
@@ -672,6 +674,34 @@ def test_auto_tool_choice_skips_structural_tag_without_strict(
     )
 
     assert tag is None
+
+
+def test_mimo_auto_tool_choice_enforces_schema_without_strict(sample_tools):
+    tag = get_model_structural_tag(
+        model="mimo",
+        tools=sample_tools,
+        tool_choice="auto",
+        reasoning=True,
+    )
+
+    assert isinstance(tag, StructuralTag)
+    grammar = Grammar.from_structural_tag(tag)
+    valid = (
+        "<think>checking</think><tool_call><function=get_weather>"
+        "<parameter=city>Paris</parameter></function></tool_call>"
+    )
+    missing_required = (
+        "<think>checking</think><tool_call><function=get_weather>"
+        "</function></tool_call>"
+    )
+    unknown_tool = (
+        "<think>checking</think><tool_call><function=unknown>"
+        "<parameter=city>Paris</parameter></function></tool_call>"
+    )
+
+    assert _is_grammar_accept_string(grammar, valid)
+    assert not _is_grammar_accept_string(grammar, missing_required)
+    assert not _is_grammar_accept_string(grammar, unknown_tool)
 
 
 def test_get_function_parameters_relaxes_function_strict_false():
