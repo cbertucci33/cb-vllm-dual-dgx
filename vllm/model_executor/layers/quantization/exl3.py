@@ -34,6 +34,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
     FusedMoEQuantConfig,
@@ -51,6 +52,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
 
@@ -523,6 +525,11 @@ class Exl3Config(QuantizationConfig):
             if not self._moe_prefix_is_exl3(prefix, layer):
                 return None
             return Exl3MoEMethod(self, layer.moe_config)
+        if isinstance(layer, Attention):
+            # EXL3 quantizes model weights, not the KV cache. Register the
+            # generic KV-cache scale parameters so calibrated k/v scales can
+            # still be loaded when the runtime cache dtype is FP8.
+            return BaseKVCacheMethod(self)
         return None
 
     def _storage_entry(self, prefix: str) -> dict[str, Any] | None:
