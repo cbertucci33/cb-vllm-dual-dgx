@@ -17,7 +17,7 @@ from transformers import Glm5NextTextConfig, Glm5NextVisionConfig
 import vllm.utils.gpu_sync_debug as gsd
 from vllm.model_executor import parameter
 from vllm.model_executor.layers import linear
-from vllm.models.glm5next.common import multimodal
+from vllm.models.glm5next.nvidia import multimodal
 
 HEAD_DIM, ROTARY_DIM, BASE = 64, 32, 10000
 

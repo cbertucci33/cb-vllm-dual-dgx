@@ -8,8 +8,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.models.glm5next.common.kda import Glm5NextLinearAttention
-from vllm.models.glm5next.common.model import (
+from vllm.models.glm5next.nvidia.kda import Glm5NextLinearAttention
+from vllm.models.glm5next.nvidia.model import (
     Glm5NextForCausalLM,
     Glm5NextForConditionalGeneration,
 )
