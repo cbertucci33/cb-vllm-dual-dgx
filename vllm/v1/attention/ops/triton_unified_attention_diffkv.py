@@ -586,6 +586,15 @@ def unified_attention_diffkv(
     tile_size = 32 if not use_3d else (16 if q.element_size() >= 2 else 32)
     if spec_tile is not None:
         tile_size = spec_tile
+    # Triton's SM12x dot instruction requires K >= 32. Both the ordinary
+    # split-KV decode path and the speculative 3D override use TILE_SIZE as K
+    # for P @ V, so clamp after every tile-size override.
+    if (
+        tile_size < 32
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+    ):
+        tile_size = 32
 
     # A Q/K head size that is not a power of two (192 on MiMo-V2) would be padded to the
     # next one (256) for the Q.K^T dot. In the 2D kernel, split it into its largest
