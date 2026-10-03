@@ -9,6 +9,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tests.kernels.attention.test_triton_unified_attention import ref_paged_attn
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import next_power_of_2
 from vllm.utils.torch_utils import (

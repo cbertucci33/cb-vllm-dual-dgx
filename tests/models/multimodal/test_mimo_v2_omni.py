@@ -21,7 +21,7 @@ WINDOW = 8
 SEQ_LENS = [5, 37]
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def vision_attn_env():
     init_distributed_environment(
         world_size=1,
@@ -39,7 +39,7 @@ def vision_attn_env():
 
 
 def _reference(q, k, v, cu_seqlens, sinks, scale):
-    """Dense windowed softmax with the sink added to each sequence's key 0."""
+    """Dense windowed softmax with a null-value sink logit per head."""
     groups = q.shape[1] // k.shape[1]
     out = torch.empty_like(q, dtype=torch.float32)
     for start, end in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist()):
@@ -47,11 +47,12 @@ def _reference(q, k, v, cu_seqlens, sinks, scale):
         ks = k[start:end].float().repeat_interleave(groups, dim=1)
         vs = v[start:end].float().repeat_interleave(groups, dim=1)
         scores = torch.einsum("qhd,khd->hqk", qs, ks) * scale
-        scores[..., 0] += sinks.float().view(-1, 1)
         pos = torch.arange(end - start, device=q.device)
         outside = (pos.view(-1, 1) - pos.view(1, -1)).abs() > WINDOW
         scores.masked_fill_(outside, -torch.inf)
-        out[start:end] = torch.einsum("hqk,khd->qhd", scores.softmax(-1), vs)
+        sink_logits = sinks.float().view(-1, 1, 1).expand(-1, scores.shape[1], 1)
+        weights = torch.cat((sink_logits, scores), dim=-1).softmax(-1)[..., 1:]
+        out[start:end] = torch.einsum("hqk,khd->qhd", weights, vs)
     return out
 
 

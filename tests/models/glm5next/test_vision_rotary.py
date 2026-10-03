@@ -60,13 +60,17 @@ def test_rot_pos_emb_covers_grid_longer_than_8192(monkeypatch, default_vllm_conf
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_image_forward_has_no_implicit_gpu_sync(monkeypatch, default_vllm_config):
-    monkeypatch.setattr(gsd, "_SYNC_CHECK_MODE", "error")
-    monkeypatch.setattr(gsd, "_sync_check_enabled", True)
-    gsd._install_copy_checkers()
     tower = _tiny_tower(monkeypatch, max_position_embeddings=16384).to("cuda")
     # The model runner keeps image_grid_thw on the CPU.
     grid_thw = torch.tensor([[1, 4, 4]])
     pixel_values = torch.randn(16, 3 * 2 * 14 * 14, device="cuda")
+
+    # Compile-time setup is outside the runner's checked hot path. Warm it here
+    # so the assertion below measures only the actual image-forward boundary.
+    tower(pixel_values, grid_thw)
+    monkeypatch.setattr(gsd, "_SYNC_CHECK_MODE", "error")
+    monkeypatch.setattr(gsd, "_sync_check_enabled", True)
+    gsd._install_copy_checkers()
 
     out = gsd.with_gpu_sync_check(tower)(pixel_values, grid_thw)
 
