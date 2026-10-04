@@ -303,7 +303,11 @@ def kernel_unified_attention_diffkv(
             mask=dim_mask_v[None, :] & tile_mask[:, None],
             other=0.0,
         )
-        V = V_load.to(Q.dtype)
+        # Q may be FP8 when static query quantization is enabled. Keep the
+        # score dot in FP8, but do not quantize softmax probabilities to FP8
+        # for P @ V: that introduces avoidable short-prefill output error.
+        # BF16-query routes retain their existing compute dtype.
+        V = V_load.to(tl.bfloat16) if USE_Q_SCALE else V_load.to(Q.dtype)
 
         query_abs_pos = context_len + query_pos[:, None]
         seq_mask = compute_kv_seq_mask(

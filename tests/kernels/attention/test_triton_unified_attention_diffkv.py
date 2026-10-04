@@ -361,12 +361,22 @@ def test_mimo_fp8_diffkv_cache_write_contract() -> None:
     reason="FP8 DiffKV requires CUDA SM89+",
 )
 @pytest.mark.parametrize(
-    ("query_lens", "kv_lens", "window_size", "seq_threshold_3d"),
+    (
+        "query_lens",
+        "kv_lens",
+        "window_size",
+        "seq_threshold_3d",
+        "reverse_blocks",
+        "expected_3d",
+    ),
     [
-        ([63], [294], (-1, -1), 0),
-        ([1], [2011], (-1, -1), 0),
-        ([1], [8193], (-1, -1), 64),
-        ([4], [8195], (127, 0), 64),
+        ([5], [18], (-1, -1), 0, False, False),
+        ([63], [294], (-1, -1), 0, False, False),
+        ([1], [1], (-1, -1), 0, False, False),
+        ([1], [2011], (-1, -1), 0, False, False),
+        ([1], [33], (-1, -1), 64, False, True),
+        ([1], [8193], (-1, -1), 64, False, True),
+        ([4], [8195], (127, 0), 64, True, False),
     ],
 )
 @torch.inference_mode()
@@ -375,6 +385,9 @@ def test_mimo_fp8_diffkv_route_parity(
     kv_lens: list[int],
     window_size: tuple[int, int],
     seq_threshold_3d: int,
+    reverse_blocks: bool,
+    expected_3d: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Cover FP8 prefill, 2D/3D decode, and the sliding-window route."""
     torch.set_default_device(DEVICE_TYPE)
@@ -404,7 +417,10 @@ def test_mimo_fp8_diffkv_route_parity(
     next_block = 0
     for seq_idx, kv_len in enumerate(kv_lens):
         blocks = (kv_len + block_size - 1) // block_size
-        block_tables[seq_idx, :blocks] = torch.arange(next_block, next_block + blocks)
+        block_ids = torch.arange(next_block, next_block + blocks)
+        if reverse_blocks:
+            block_ids = block_ids.flip(0)
+        block_tables[seq_idx, :blocks] = block_ids
         next_block += blocks
     sliding_window = None if window_size == (-1, -1) else window_size[0] + 1
     reference = ref_paged_attn(
@@ -421,6 +437,8 @@ def test_mimo_fp8_diffkv_route_parity(
         seq_threshold_3d, num_query_heads, head_size_v
     )
     actual = torch.empty_like(reference)
+    kernel_run = Mock(wraps=kernel_unified_attention_diffkv.run)
+    monkeypatch.setattr(kernel_unified_attention_diffkv, "run", kernel_run)
     unified_attention_diffkv(
         q=query,
         k=key,
@@ -443,6 +461,7 @@ def test_mimo_fp8_diffkv_route_parity(
         k_descale=k_scale,
         v_descale=v_scale,
     )
+    assert kernel_run.call_args.kwargs["IS_3D"] is expected_3d
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, reference, atol=3e-2, rtol=3e-2)
 
