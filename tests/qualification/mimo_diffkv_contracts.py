@@ -6,6 +6,8 @@ from __future__ import annotations
 from pytest import MonkeyPatch
 
 from tests.kernels.attention.test_triton_unified_attention_diffkv import (
+    test_mimo_diffkv_mixed_metadata_partition_contract,
+    test_mimo_fp8_diffkv_cache_read_and_partition_contract,
     test_mimo_fp8_diffkv_cache_write_contract,
     test_mimo_fp8_diffkv_route_parity,
     test_mimo_static_fp8_query_quantization,
@@ -48,6 +50,12 @@ def main() -> None:
 
     test_mimo_fp8_diffkv_cache_write_contract()
     print("PASS fp8-asymmetric-cache-write")
+
+    _with_monkeypatch(test_mimo_fp8_diffkv_cache_read_and_partition_contract)
+    print("PASS fp8-packed-cache-read-partition-consumption")
+
+    _with_monkeypatch(test_mimo_diffkv_mixed_metadata_partition_contract)
+    print("PASS mixed-decode-prefill-metadata-partition")
 
     for case in ROUTE_CASES:
         _with_monkeypatch(test_mimo_fp8_diffkv_route_parity, *case)

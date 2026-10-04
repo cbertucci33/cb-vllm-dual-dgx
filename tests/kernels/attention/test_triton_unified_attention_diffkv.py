@@ -4,11 +4,13 @@
 Unit tests for the Triton DiffKV unified-attention kernel.
 """
 
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 
+import vllm.v1.attention.backends.triton_attn_diffkv as diffkv_backend
 from tests.kernels.attention.test_triton_unified_attention import ref_paged_attn
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
@@ -21,6 +23,14 @@ from vllm.utils.torch_utils import (
 from vllm.v1.attention.backends.fa_utils import (
     get_flash_attn_version,
     is_flash_attn_varlen_func_available,
+)
+from vllm.v1.attention.backends.triton_attn import (
+    TritonAttentionMetadata,
+    TritonAttentionMetadataBuilder,
+)
+from vllm.v1.attention.backends.triton_attn_diffkv import (
+    TritonAttentionDiffKVImpl,
+    TritonAttentionDiffKVMetadataBuilder,
 )
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash_diffkv,
@@ -354,6 +364,166 @@ def test_mimo_fp8_diffkv_cache_write_contract() -> None:
     for slot in slots[:-1].tolist():
         selected[slot // block_size, slot % block_size] = True
     assert torch.count_nonzero(cache_bytes[~selected]).item() == 0
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.has_device_capability(89),
+    reason="FP8 DiffKV requires CUDA SM89+",
+)
+@torch.inference_mode()
+def test_mimo_fp8_diffkv_cache_read_and_partition_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise packed FP8 views and decode/prefill partition consumption."""
+    torch.set_default_device(DEVICE_TYPE)
+    fp8_dtype = current_platform.fp8_dtype()
+    num_blocks, block_size, num_kv_heads = 2, 16, 2
+    head_size_qk, head_size_v, num_query_heads = 192, 128, 32
+    logical = torch.arange(
+        num_blocks * block_size * num_kv_heads * (head_size_qk + head_size_v),
+        dtype=torch.float32,
+    ).reshape(num_blocks, block_size, num_kv_heads, head_size_qk + head_size_v)
+    logical = ((logical % 31) - 15).to(fp8_dtype)
+    physical_bytes = logical.transpose(1, 2).contiguous().view(torch.uint8)
+
+    segm_output, segm_max, segm_expsum = _alloc_segm_buffers(
+        64, num_query_heads, head_size_v
+    )
+    decode = SimpleNamespace(
+        num_actual_tokens=1,
+        max_query_len=1,
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        seq_lens=torch.tensor([8193], dtype=torch.int32),
+        block_table=torch.tensor([[1, 0]], dtype=torch.int32),
+        seq_threshold_3D=64,
+        num_par_softmax_segments=NUM_PAR_SOFTMAX_SEGMENTS,
+        softmax_segm_output=segm_output,
+        softmax_segm_max=segm_max,
+        softmax_segm_expsum=segm_expsum,
+    )
+    prefill = SimpleNamespace(
+        num_actual_tokens=5,
+        max_query_len=5,
+        query_start_loc=torch.tensor([0, 5], dtype=torch.int32),
+        seq_lens=torch.tensor([18], dtype=torch.int32),
+        block_table=torch.tensor([[0, 1]], dtype=torch.int32),
+        seq_threshold_3D=64,
+        num_par_softmax_segments=NUM_PAR_SOFTMAX_SEGMENTS,
+        softmax_segm_output=segm_output,
+        softmax_segm_max=segm_max,
+        softmax_segm_expsum=segm_expsum,
+    )
+    metadata = SimpleNamespace(use_cascade=False, partitions=(decode, prefill))
+
+    calls: list[dict] = []
+
+    def fake_unified_attention_diffkv(**kwargs):
+        calls.append(kwargs)
+        torch.testing.assert_close(kwargs["k"], logical[..., :head_size_qk])
+        torch.testing.assert_close(kwargs["v"], logical[..., head_size_qk:])
+        kwargs["out"].zero_()
+
+    monkeypatch.setattr(
+        diffkv_backend, "unified_attention_diffkv", fake_unified_attention_diffkv
+    )
+    impl = object.__new__(TritonAttentionDiffKVImpl)
+    impl.kv_cache_dtype = "fp8_e4m3"
+    impl.fp8_dtype = fp8_dtype
+    impl.head_size = head_size_qk
+    impl.scale = head_size_qk**-0.5
+    impl.alibi_slopes = None
+    impl.use_alibi_sqrt = False
+    impl.sliding_window = (-1, -1)
+    impl.logits_soft_cap = 0
+    impl.sinks = None
+    q_scale = torch.tensor(0.037, dtype=torch.float32)
+    k_scale = torch.tensor(0.041, dtype=torch.float32)
+    v_scale = torch.tensor(0.007, dtype=torch.float32)
+    layer = SimpleNamespace(_q_scale=q_scale, _k_scale=k_scale, _v_scale=v_scale)
+    query = torch.zeros(6, num_query_heads, head_size_qk, dtype=fp8_dtype)
+    output = torch.empty(6, num_query_heads, head_size_v, dtype=torch.bfloat16)
+
+    actual = impl.forward(
+        layer,
+        query,
+        torch.empty(0),
+        torch.empty(0),
+        physical_bytes,
+        metadata,
+        output,
+    )
+    assert actual is output
+    assert len(calls) == 2
+    assert calls[0]["q"].shape[0] == 1
+    assert calls[1]["q"].shape[0] == 5
+    assert calls[0]["q_descale"] is q_scale
+    assert calls[0]["k_descale"] is k_scale
+    assert calls[0]["v_descale"] is v_scale
+    assert calls[0]["k"].dtype == fp8_dtype
+    assert calls[0]["v"].dtype == fp8_dtype
+    assert calls[0]["k"].shape == (num_blocks, block_size, num_kv_heads, head_size_qk)
+    assert calls[0]["v"].shape == (num_blocks, block_size, num_kv_heads, head_size_v)
+
+
+@torch.inference_mode()
+def test_mimo_diffkv_mixed_metadata_partition_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Split a long decode from a large prefill when scratch fits decode only."""
+    torch.set_default_device(DEVICE_TYPE)
+    num_query_heads = 32
+    segm_output, segm_max, segm_expsum = _alloc_segm_buffers(64, num_query_heads, 128)
+    base = TritonAttentionMetadata(
+        num_actual_tokens=130,
+        max_query_len=129,
+        query_start_loc=torch.tensor([0, 1, 130], dtype=torch.int32),
+        max_seq_len=8193,
+        seq_lens=torch.tensor([8193, 129], dtype=torch.int32),
+        block_table=torch.zeros(2, 513, dtype=torch.int32),
+        slot_mapping=torch.arange(130, dtype=torch.int64),
+        seq_threshold_3D=64,
+        num_par_softmax_segments=NUM_PAR_SOFTMAX_SEGMENTS,
+        softmax_segm_output=segm_output,
+        softmax_segm_max=segm_max,
+        softmax_segm_expsum=segm_expsum,
+        causal=True,
+        use_cascade=False,
+        common_prefix_len=0,
+        cu_prefix_query_lens=None,
+        prefix_kv_lens=None,
+        suffix_kv_lens=None,
+    )
+    common = SimpleNamespace(
+        max_query_len=129,
+        num_reqs=2,
+        num_actual_tokens=130,
+        query_start_loc_cpu=torch.tensor([0, 1, 130], dtype=torch.int32, device="cpu"),
+    )
+    monkeypatch.setattr(
+        TritonAttentionMetadataBuilder,
+        "build",
+        lambda self, common_prefix_len, common_attn_metadata, fast_build=False: base,
+    )
+    builder = object.__new__(TritonAttentionDiffKVMetadataBuilder)
+    builder.seq_threshold_3D = 64
+    builder.num_par_softmax_segments = NUM_PAR_SOFTMAX_SEGMENTS
+    builder.softmax_segm_output = segm_output
+    builder.softmax_segm_max = segm_max
+    builder.softmax_segm_expsum = segm_expsum
+    builder.reorder_batch_threshold = 1
+
+    metadata = builder.build(0, common)
+    assert len(metadata.partitions) == 2
+    decode, prefill = metadata.partitions
+    assert decode.num_actual_tokens == 1
+    assert decode.max_query_len == 1
+    assert decode.query_start_loc.tolist() == [0, 1]
+    assert decode.seq_lens.tolist() == [8193]
+    assert decode.slot_mapping.tolist() == [0]
+    assert prefill.num_actual_tokens == 129
+    assert prefill.query_start_loc.tolist() == [0, 129]
+    assert prefill.seq_lens.tolist() == [129]
+    assert prefill.slot_mapping.tolist() == list(range(1, 130))
 
 
 @pytest.mark.skipif(
