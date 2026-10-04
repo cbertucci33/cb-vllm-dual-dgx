@@ -117,6 +117,14 @@ hardware limits. Performance work remains active. The Release 5 GLM production
 measurements retained below continue to describe the qualified GLM workload;
 they are not presented as Release 7 MiMo results.
 
+## Model recipes
+
+- [MiMo V2.6 Flash MOPD Heretic EXL3 on two DGX Spark systems](recipes/mimo-v2.6-flash-mopd-heretic-exl3-dgx-spark-tp2.md)
+- [GLM-5.3 Flash Uncensored EXL3 on two DGX Spark systems](recipes/glm-5.3-flash-uncensored-exl3-dgx-spark-tp2.md)
+
+Both recipes include the tested model settings, DFlash configuration, network
+placeholders, rank start order, and post-launch checks.
+
 ## Release 6
 
 Release 6 replatforms the active runner from vLLM 0.29 to vLLM 0.30 and
