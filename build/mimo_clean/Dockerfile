@@ -63,6 +63,14 @@ RUN --mount=type=bind,source=build/mimo_clean/artifacts,target=/mnt/artifacts,re
       | xargs -0 sha256sum > /opt/mimo-runner/native-files.sha256; \
     PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.metadata as m; assert m.version("xgrammar") == "0.2.8"; assert m.version("nccl-extensions") == "0.1.0"; from xgrammar import get_model_structural_tag; assert get_model_structural_tag(model="mimo", tools=[{"type":"function","function":{"name":"probe","parameters":{"type":"object","properties":{}}}}], tool_choice="auto", reasoning=True) is not None'; \
     uv pip freeze --system | sort > /opt/mimo-runner/python-packages.txt; \
+    find \
+      /usr/local/lib/python3.12/dist-packages/xgrammar \
+      /usr/local/lib/python3.12/dist-packages/xgrammar-0.2.8.dist-info \
+      /usr/local/lib/python3.12/dist-packages/nccl \
+      /usr/local/lib/python3.12/dist-packages/nccl_extensions-0.1.0.dist-info \
+      /opt/mimo-runner \
+      -exec touch -h -d "@$SOURCE_DATE_EPOCH" '{}' +; \
+    touch -h -d "@$SOURCE_DATE_EPOCH" /usr/local/lib/python3.12/dist-packages; \
     uv cache clean
 
 LABEL org.opencontainers.image.revision="${VLLM_COMMIT}" \
