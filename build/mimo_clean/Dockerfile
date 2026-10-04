@@ -6,7 +6,6 @@ ARG BASE_IMAGE
 ARG VLLM_COMMIT
 ARG RUNNER_VERSION
 ARG EXLLAMAV3_COMMIT
-ARG B12X_COMMIT
 ARG FLASHINFER_COMMIT
 ARG SPARKINFER_COMMIT
 
@@ -27,7 +26,7 @@ RUN --mount=type=bind,source=build/mimo_clean/artifacts,target=/mnt/artifacts,re
       | tar --null -T - -cf /tmp/vllm-base-native.tar; \
     uv pip uninstall --system vllm; \
     uv pip install --system --no-deps \
-      /mnt/artifacts/vllm-0.30.0+9fbbb6bbf0-cp312-cp312-linux_aarch64.whl; \
+      /mnt/artifacts/vllm-0.30.0+51b74d6d8-cp312-cp312-linux_aarch64.whl; \
     tar -xf /tmp/vllm-base-native.tar -C /usr/local/lib/python3.12/dist-packages; \
     install -m 0755 /mnt/artifacts/_C_stable_libtorch.abi3.so \
       /usr/local/lib/python3.12/dist-packages/vllm/_C_stable_libtorch.abi3.so; \
@@ -43,7 +42,6 @@ RUN --mount=type=bind,source=build/mimo_clean/artifacts,target=/mnt/artifacts,re
       /mnt/artifacts/nvidia_cutlass_dsl_libs_cu13-4.7.1-cp312-cp312-manylinux_2_28_aarch64.whl \
       /mnt/artifacts/nvidia_cutlass_dsl-4.7.1-py3-none-any.whl \
       /mnt/artifacts/flashinfer_python-0.7.0-py3-none-any.whl \
-      /mnt/artifacts/b12x-1.3.0-py3-none-any.whl \
       /mnt/artifacts/exllamav3_ext_vllm-0.0.43-cp312-cp312-linux_aarch64.whl \
       /mnt/artifacts/sparkinfer-1.0.1-py3-none-any.whl; \
     install -D -m 0755 /mnt/artifacts/flashinfer-topk-sm121.so \
@@ -67,7 +65,6 @@ LABEL org.opencontainers.image.revision="${VLLM_COMMIT}" \
       org.opencontainers.image.version="${RUNNER_VERSION}" \
       org.opencontainers.image.base.name="${BASE_IMAGE}" \
       io.mimo.runner.exllamav3.revision="${EXLLAMAV3_COMMIT}" \
-      io.mimo.runner.b12x.revision="${B12X_COMMIT}" \
       io.mimo.runner.flashinfer.revision="${FLASHINFER_COMMIT}" \
       io.mimo.runner.sparkinfer.revision="${SPARKINFER_COMMIT}" \
       io.mimo.runner.clean-build="true"

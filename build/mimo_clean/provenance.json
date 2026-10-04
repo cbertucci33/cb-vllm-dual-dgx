@@ -1,11 +1,10 @@
 {
   "base_image": "vllm/vllm-openai:v0.30.0@sha256:4864d46625cbc3307623e29ac742030655e27249feba7b97ec925ce4cc4dfb56",
-  "vllm_source_revision": "9fbbb6bbf0ae84fe05862be553faf27c03aa12e8",
+  "vllm_source_revision": "51b74d6d83a7468997ebec8eae0be7e0284499d9",
   "vllm_native_source_revision": "fe7a24a943262cd842481ca2b6d24c5ee0ecd340",
   "exllamav3_revision": "c5d9c657966ffeeaa9353f0cc899f18629da4a13",
-  "b12x_revision": "00b69ac22e21413622c4ecd98f607a2c3e015161",
   "flashinfer_revision": "dc04f50c9aa3eabcdaa5feb0934edb3d85e9529a",
   "sparkinfer_revision": "d4438d490691f79022fdfc8149e1c5f161d15445",
-  "wheel_sha256": "22127a5e9951cf7df2c1da6a95b3ab65700e96ae06dce151d495957bee917a0f",
+  "wheel_sha256": "661f8e1792d5242dbbc5fcd767668ad32f0946bd6cc0b42147758f37ee4e0087",
   "production_source_mounts": []
 }
