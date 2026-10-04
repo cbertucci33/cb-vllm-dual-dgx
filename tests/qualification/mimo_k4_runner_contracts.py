@@ -668,8 +668,32 @@ def contract_prefix_replay_and_rollback(target: str, draft: str) -> None:
         num_prompt_tokens,
         "warm-prefill-token-count",
     )
+    warm_target_blocks = first.scheduled_new_reqs[0].block_ids[0]
+    assert len(warm_target_blocks) >= 73
     _update_scheduler(scheduler, first, [[100]])
     assert "warm" in scheduler.finished_req_ids
+
+    partial_prompt_tokens = num_prompt_tokens + 17
+    partial = _make_request("partial", partial_prompt_tokens, 1)
+    scheduler.add_request(partial)
+    partial_hit = scheduler.schedule()
+    _assert_equal(
+        partial_hit.scheduled_new_reqs[0].num_computed_tokens,
+        144,
+        "partial-prefix-restore-boundary",
+    )
+    _assert_equal(
+        partial_hit.num_scheduled_tokens["partial"],
+        partial_prompt_tokens - 144,
+        "partial-prefix-continuation-count",
+    )
+    _assert_equal(
+        partial_hit.scheduled_new_reqs[0].block_ids[0][:9],
+        warm_target_blocks[:9],
+        "partial-prefix-target-block-reuse",
+    )
+    _update_scheduler(scheduler, partial_hit, [[101]])
+    assert "partial" in scheduler.finished_req_ids
 
     resumed = _make_request("resumed", num_prompt_tokens, 8)
     scheduler.add_request(resumed)
@@ -686,6 +710,11 @@ def contract_prefix_replay_and_rollback(target: str, draft: str) -> None:
         replay.scheduled_new_reqs[0].num_computed_tokens,
         128,
         "prefix-restore-boundary",
+    )
+    _assert_equal(
+        replay.scheduled_new_reqs[0].block_ids[0][:8],
+        warm_target_blocks[:8],
+        "warm-prefix-target-block-reuse",
     )
 
     device = torch.device("cuda")
