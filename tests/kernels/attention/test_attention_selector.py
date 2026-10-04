@@ -308,6 +308,16 @@ def test_supported_backend_preserves_dcp_eligibility(backend_name, default_vllm_
     assert backend_cls.validate_configuration(**kwargs) == invalid_without_dcp
 
 
+def test_triton_diffkv_rejects_unimplemented_attention_masks():
+    from vllm.v1.attention.backends.triton_attn_diffkv import (
+        TritonAttentionDiffKVBackend,
+    )
+
+    assert not TritonAttentionDiffKVBackend.supports_non_causal()
+    assert not TritonAttentionDiffKVBackend.supports_mm_prefix()
+    assert not TritonAttentionDiffKVBackend.supports_rswa()
+
+
 @pytest.mark.parametrize("device", ["cpu", "cuda", "hip"])
 def test_fp32_fallback(device: str):
     """Test attention backend selection with fp32."""

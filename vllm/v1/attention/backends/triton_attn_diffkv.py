@@ -184,6 +184,21 @@ class TritonAttentionDiffKVBackend(TritonAttentionBackend):
         # attention is not supported, so gate it here at backend selection.
         return attn_type == AttentionType.DECODER
 
+    @classmethod
+    def supports_non_causal(cls) -> bool:
+        # unified_attention_diffkv currently hard-requires causal attention.
+        return False
+
+    @classmethod
+    def supports_mm_prefix(cls) -> bool:
+        # The DiffKV kernel does not receive multimodal prefix ranges.
+        return False
+
+    @classmethod
+    def supports_rswa(cls) -> bool:
+        # The DiffKV kernel does not receive R-SWA prefix metadata.
+        return False
+
 
 class TritonAttentionDiffKVImpl(TritonAttentionImpl):
     """Triton attention impl for the DiffKV packed KV cache layout."""
