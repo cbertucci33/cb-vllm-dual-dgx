@@ -72,6 +72,7 @@ from vllm.model_executor.models.utils import (
     PPMissingLayer,
     init_vllm_registered_model,
     is_pp_missing_parameter,
+    make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
     sequence_parallel_chunk,
@@ -254,7 +255,16 @@ class Glm5NextMoE(nn.Module):
         hidden_states: torch.Tensor,
         already_sequence_parallel: bool = False,
     ) -> torch.Tensor:
-        num_tokens, hidden_dim = hidden_states.shape
+        # Rank-agnostic: model runners may feed bucketed rank-3
+        # [1, T, hidden] rather than the rank-2 [tokens, hidden] assumed here.
+        # Flatten on the way in and restore the leading dims on the way out;
+        # the ops below (sequence_parallel_chunk, all_gather, the [:num_tokens]
+        # slice) all require tokens to live on dim 0. No-op for rank-2 input.
+        orig_leading_shape = hidden_states.shape[:-1]
+        hidden_dim = hidden_states.shape[-1]
+        if hidden_states.dim() != 2:
+            hidden_states = hidden_states.reshape(-1, hidden_dim)
+        num_tokens = hidden_states.shape[0]
 
         # Chunk the hidden states so they aren't replicated across TP ranks.
         # This avoids duplicate computation in self.experts.
@@ -274,7 +284,7 @@ class Glm5NextMoE(nn.Module):
             )
             final_hidden_states = final_hidden_states[:num_tokens]
 
-        return final_hidden_states.view(num_tokens, hidden_dim)
+        return final_hidden_states.view(*orig_leading_shape, hidden_dim)
 
 
 class Glm5NextDecoderLayer(nn.Module):
@@ -691,9 +701,50 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             vllm_config.parallel_config.use_sequence_parallel_moe
         )
 
+        # Same derivation as Glm5NextDecoderLayer (self.mhc = config.mhc /
+        # self.n = config.mhc_num_residual_streams).
+        self.mhc = bool(config.mhc)
+        if self.mhc:
+            self.mhc_num_residual_streams = config.mhc_num_residual_streams
+            # PP boundary tensor for mHC: the residual streams themselves,
+            # (num_tokens, n_streams, hidden_size). The deferred hc_post state
+            # (post/comb) is materialized into the streams before sending, so
+            # a single key suffices (no separate "residual" copy).
+            self.make_empty_intermediate_tensors = (
+                self._make_empty_mhc_intermediate_tensors
+            )
+        else:
+            # Plain (hidden_states, residual) pair of shape
+            # (num_tokens, hidden_size), like every other dense-residual model.
+            self.make_empty_intermediate_tensors = (
+                make_empty_intermediate_tensors_factory(
+                    ["hidden_states", "residual"], config.hidden_size
+                )
+            )
+
         world_size = get_tensor_model_parallel_world_size()
         assert config.num_attention_heads % world_size == 0, (
             "num_attention_heads must be divisible by world_size"
+        )
+
+    def _make_empty_mhc_intermediate_tensors(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> IntermediateTensors:
+        return IntermediateTensors(
+            {
+                "hidden_states": torch.zeros(
+                    (
+                        batch_size,
+                        self.mhc_num_residual_streams,
+                        self.config.hidden_size,
+                    ),
+                    dtype=dtype,
+                    device=device,
+                ),
+            }
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -734,9 +785,18 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
-            # post/comb (deferred mHC hc_post state) are not propagated across
-            # PP ranks; the receiving rank's first mHC layer uses standalone pre.
+            if self.mhc:
+                # The previous rank sent the materialized residual streams
+                # (num_tokens, n, hidden): its pending hc_post was applied
+                # before the send, so there is no deferred state to fuse.
+                # With residual=None/post=None this rank's first layer takes
+                # the standalone hc_pre path (x = residual = streams), which
+                # is exactly the layer-0 path minus hc_expand (layer_idx != 0
+                # here, so no re-expansion happens).
+                assert hidden_states.dim() == 3, hidden_states.shape
+                residual = None
+            else:
+                residual = intermediate_tensors["residual"]
             post = None
             comb = None
 
@@ -760,14 +820,37 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 )
 
         if not get_pp_group().is_last_rank:
-            # PP is gated off for GLM-5.3-Flash (no make_empty_intermediate_tensors),
-            # so this branch is not exercised. post/comb are the deferred
-            # hc_post state of this rank's last mHC layer; a future PP path
-            # would need to propagate them, but for now they are dropped (the
-            # receiving rank's first layer would fall back to standalone pre).
+            # DFlash's captured states are not part of the PP wire contract.
+            # Keep that unsupported combination explicit while enabling the
+            # ordinary GLM PP boundary below.
             assert not aux_hidden_states, (
                 "aux-hidden capture is not propagated across PP ranks"
             )
+            if self.mhc:
+                # post/comb are the deferred hc_post inputs of this rank's
+                # last mHC layer (normally consumed by the next layer's
+                # hc_fused_post_pre). Materialize them here so the boundary
+                # carries only the residual streams; the next rank's first
+                # layer then runs standalone hc_pre on them, which is what
+                # the fused op computes after its internal hc_post.
+                if post is not None:
+                    assert residual is not None and comb is not None
+                    hidden_states = self._active_layers[-1].hc_post(
+                        hidden_states, residual, post, comb
+                    )
+                assert hidden_states.dim() == 3, hidden_states.shape
+                if self.is_sequence_parallel:
+                    # Send the full token count (the receiver re-shards), as
+                    # the last rank does before its final norm. Collectives
+                    # expect 2-D, so gather the flattened streams.
+                    n, h = hidden_states.shape[1:]
+                    hidden_states = sp_all_gather(hidden_states.flatten(1))[
+                        :full_num_tokens
+                    ].view(-1, n, h)
+                return IntermediateTensors({"hidden_states": hidden_states})
+            if self.is_sequence_parallel:
+                hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+                residual = sp_all_gather(residual)[:full_num_tokens]
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
@@ -835,7 +918,17 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         if self.config.mla_nope and self.config.qk_rope_head_dim > 0:
             kv_a_pad_size = self.config.qk_rope_head_dim
 
-        _pending_wk_fp8: dict = {}
+        # FP8 (weight, weight_scale_inv) pairs are dequantized once both halves
+        # have been seen. A streaming loader may send the 2 halves in different
+        # load_weights() calls. AutoWeightsLoader invokes this method once per
+        # contiguous run of a top-level prefix, so any ``visual.*`` tensor between
+        # a weight and its scale ends the call, thereby discarding the pending half
+        # that actually should have been successfully loaded. To avoid this, keep
+        # the pending halves alive such that completed pairs are popped by the
+        # helpers, so the dict is empty again after a full load.
+        _pending_wk_fp8 = getattr(self, "_pending_fp8_pairs", None)
+        if _pending_wk_fp8 is None:
+            self._pending_fp8_pairs = _pending_wk_fp8 = {}
 
         for args in weights:
             name, loaded_weight = args[:2]
@@ -991,6 +1084,9 @@ class Glm5NextForCausalLM(
         self.logits_processor = LogitsProcessor(
             self.config.vocab_size, scale=self.config.logit_scale
         )
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -1023,7 +1119,9 @@ class Glm5NextForCausalLM(
         vllm_config: "VllmConfig",
     ) -> tuple[torch.dtype, torch.dtype]:
         return MambaStateDtypeCalculator.kda_state_dtype(
-            vllm_config.model_config.dtype, vllm_config.cache_config.mamba_cache_dtype
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_cache_dtype,
         )
 
     @classmethod
@@ -1167,9 +1265,14 @@ class Glm5NextForConditionalGeneration(
 
         self.set_moe_parameters()
 
-        # Glm5NextForCausalLM does not implement make_empty_intermediate_tensors,
-        # so pipeline parallelism is gated off (consistent with the text-only
-        # model) and we intentionally do not alias it here.
+        # PP: the boundary tensors are defined by the text model (mHC residual
+        # streams, or the plain hidden/residual pair for non-mHC configs).
+        # The inherited Glm4vForConditionalGeneration.forward passes
+        # intermediate_tensors straight through to language_model.model and
+        # returns its IntermediateTensors unchanged on non-last ranks.
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
 
     def set_moe_parameters(self) -> None:
         self.moe_mlp_layers = [
@@ -1237,6 +1340,10 @@ def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
     if not is_weight and not is_scale:
         return False
     layer_prefix = name.rsplit(".wk.", 1)[0]
+    # PP rank that doesn't hold this layer — let the normal path skip it
+    # (is_pp_missing_parameter); also avoids buffering tensors nobody loads.
+    if f"{layer_prefix}.wk_weights_proj.weight" not in params_dict:
+        return False
     entry = buf.setdefault(layer_prefix, {})
     entry["weight" if is_weight else "scale"] = tensor
     if "weight" not in entry or "scale" not in entry:
@@ -1332,6 +1439,10 @@ def _try_load_fp8_attn_proj(
     # If the model actually kept this projection in FP8, let the normal path
     # handle it (it has a weight_scale_inv param).
     if target_s in params_dict:
+        return False
+    # On PP ranks that don't hold this layer, let the normal path skip it
+    # (is_pp_missing_parameter); there is no param to load into here.
+    if target_w not in params_dict:
         return False
 
     entry = buf.setdefault(layer_prefix, {}).setdefault(key, {})

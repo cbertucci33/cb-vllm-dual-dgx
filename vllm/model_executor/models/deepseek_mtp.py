@@ -327,7 +327,11 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
         pp_missing_layer_names = get_pp_missing_layer_names(self)
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
-        _pending_wk_fp8: dict = {}  # FP8 indexer wk dequant buffer
+        # Reordering loaders can split an FP8 indexer wk weight/scale pair
+        # across load_weights() calls; retain the pair buffer on this module.
+        _pending_wk_fp8 = getattr(self, "_pending_indexer_wk_fp8", None)
+        if _pending_wk_fp8 is None:
+            self._pending_indexer_wk_fp8 = _pending_wk_fp8 = {}
         rank_sliced_name = getattr(
             self.quant_config,
             "normalize_rank_sliced_weight_name",

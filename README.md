@@ -1,19 +1,121 @@
 # cb-vllm-dual-dgx
 
-This repository contains the two-node NVIDIA DGX Spark vLLM runner for
-rank-sliced EXL3 checkpoints and related hybrid-model serving work. Model
-weights are published separately. The active line is Release 6 on vLLM 0.30.
-The vLLM 0.29 source remains available on the `release/v0.29` maintenance line.
-
-The runner supports GLM chat, reasoning, tools, multimodal input, hybrid KDA,
-native sparse MLA on GB10, EXL3 tensor parallelism, and DFlash2. It does not
-hard-code a context length, concurrency limit, KV-cache allocation, network
-address, or model path.
-
-The qualified GLM target is
+This repository is a performance-focused vLLM runner geared toward two-node
+NVIDIA DGX Spark deployments. Release 7 is qualified with
+**[cbert33/MiMo-V2.6-Flash-MOPD-Heretic-Uncensored-EXL3-DGX-Sliced](https://huggingface.co/cbert33/MiMo-V2.6-Flash-MOPD-Heretic-Uncensored-EXL3-DGX-Sliced)**
+and
 **[cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced](https://huggingface.co/cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced)**.
+Development is focused on throughput, prefix-cache behavior, speculative
+acceptance, and long-context agentic workloads for these models. Performance
+tuning is ongoing, and verified results are published below as they complete.
+
+Model weights are published separately. The active line is Release 7 on vLLM
+0.30. The vLLM 0.29 source remains available on the `release/v0.29`
+maintenance line.
+
+The runner supports MiMo and GLM chat, reasoning, tools, multimodal model
+paths, hybrid KDA, native sparse MLA on GB10, EXL3 tensor parallelism, and
+DFlash2. It does not hard-code a context length, concurrency limit, KV-cache
+allocation, network address, or model path.
+
 Other compatible EXL3 checkpoints must satisfy the rank-slicing contract
 documented below.
+
+## Release 7 highlights
+
+- Added the MiMo V2.6 model, reasoning, strict tool-calling, and Omni wrapper
+  paths required by the qualified MiMo checkpoint.
+- Added a DGX Spark DFlash path for MiMo with Triton DiffKV, FP8 KV cache,
+  split-QK verification, CUDA graph capture, and probabilistic K=4 drafting.
+- Corrected EXL3 asymmetric QKV padding, rank-local expert loading, calibrated
+  KV scales, and unproposed draft-slot handling at prefill boundaries.
+- Expanded consumer Blackwell support with SM120/SM121 CUTLASS grouped GEMM,
+  recurrent-state, TopK, KDA/GDN, sparse-indexer, and hybrid-cache repairs.
+- Carried forward the qualified GLM-5.3 Flash path while adding GLM vision,
+  pipeline-parallel, MTP, tool-rendering, and fused multi-step decode updates.
+- Qualified MiMo text, reasoning, and tool use on two DGX Spark systems with
+  probabilistic DFlash K=4 and asynchronous scheduling explicitly disabled.
+
+## Release 7
+
+Release 7 extends the vLLM 0.30 runner from the GLM-focused Release 6 line to
+the current MiMo V2.6 and GLM-5.3 Flash integration. It contains the complete
+integration history since Release 6, including the following changes.
+
+### MiMo V2.6 serving
+
+- Added native MiMo V2.6 target, MTP, and Omni model integration, including
+  attention-sink loading, shared-cache policy, Eagle3 exposure, multimodal
+  input handling, and reduced vision-index sorting overhead.
+- Added MiMo reasoning and strict tool parsers, structural-tag registration,
+  streaming parser reconciliation, closed-call parameter handling, and
+  safeguards for structural tool closers inside parameter values.
+- Added modality-scoped processor arguments and encoder-cache allocation
+  repairs. These code paths are included, but Release 7 qualification covers
+  MiMo text, reasoning, and tools; audio and multimodal serving were not
+  requalified in this release.
+
+### DFlash, DiffKV, and long-context performance
+
+- Added MiMo FP8 KV support to the Triton DiffKV backend, including quantized
+  query support, split QK processing, fused RoPE and value scaling, fused input
+  preparation, KV reuse, and bounded multi-token split-KV verification.
+- Added DFlash context K/V precomputation under CUDA graph capture and support
+  for whole speculative verification inside each split-KV program.
+- Added a verifier gather that marks draft slots created inside prefill as
+  unproposed. This prevents stale input IDs from entering probabilistic
+  acceptance when prefill and decode rows share a verification batch.
+- Repaired prefix-cache and Mamba resume boundaries, hybrid KV group planning,
+  weighted padding, tensor-parallel invariance, connector constraints, and
+  BLHNC grouping.
+
+### EXL3, MoE, and consumer Blackwell
+
+- Corrected asymmetric EXL3 QKV padding and trimming, rank-local expert slices,
+  calibrated KV scale loading, and FP8 weight and scale retention across model
+  loader calls.
+- Added rank-agnostic MoE input handling, pipeline-parallel intermediate-state
+  support, pipeline-parallel MTP embeddings, routed-expert capture repairs, and
+  recurrent-state dtype preservation.
+- Added SM120/SM121 CUTLASS grouped GEMM support and runtime advertisement for
+  consumer Blackwell GPUs. Also corrected deterministic TopK, KDA/GDN launch
+  grids, sparse-indexer sharding, K-pool tail handling, and custom-allreduce
+  selection on this platform.
+- Added FlashInfer `gvr_2` decode TopK and tensor-parallel sharded long-context
+  indexer prefill, with indexer and K-pool correctness repairs.
+
+### GLM and shared runtime work
+
+- Added GLM vision rotary and encoder-cache sizing repairs, pipeline-parallel
+  model and MTP support, fused multi-step decode, shallow tool grammar,
+  built-in tool fallback, and tool-result rendering.
+- Repaired draft-embedding rebuilds, encoder allocation stalls, and resumable
+  handoff behavior in the shared scheduler and speculative runtime.
+
+### Qualified MiMo configuration and results
+
+The Release 7 MiMo qualification used tensor parallelism across two DGX Spark
+systems, the linked rank-sliced EXL3 target and its matching DFlash checkpoint,
+FP8 target KV cache, prefix caching, an 800K-token context limit,
+probabilistic DFlash with K=4, and explicit `--no-async-scheduling`.
+Asynchronous MiMo DFlash is not qualified in this release.
+
+The acceptance workload used a 62,287-token agentic conversation and covered
+cold, cached-prefix, and concurrent text/reasoning/tool requests.
+
+| Measurement | Result |
+| --- | ---: |
+| Accepted draft tokens | 2,178 of 7,981 |
+| Overall draft-token acceptance | 27.3% |
+| Draft-position acceptance, 1 through 4 | 61.1%, 27.7%, 13.2%, 7.2% |
+| Cached-prefix generation throughput | 30.3 tokens/s |
+| Concurrent long-request throughput | 28.4 tokens/s |
+| Aggregate throughput during overlap | 29.4 tokens/s |
+
+These are qualification observations from one two-node deployment, not
+hardware limits. Performance work remains active. The Release 5 GLM production
+measurements retained below continue to describe the qualified GLM workload;
+they are not presented as Release 7 MiMo results.
 
 ## Release 6
 
@@ -63,7 +165,7 @@ source revision, rank-sliced checkpoint, DFlash checkpoint, and runtime flags.
 1. Clone the source release and download the qualified models:
 
    ```bash
-   git clone --branch release-6 --single-branch \
+   git clone --branch release-7 --single-branch \
      https://github.com/cbertucci33/cb-vllm-dual-dgx.git
    cd cb-vllm-dual-dgx
    build/download_models.sh /srv/glm53/models

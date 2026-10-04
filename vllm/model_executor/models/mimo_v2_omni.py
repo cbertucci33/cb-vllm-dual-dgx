@@ -55,6 +55,7 @@ from vllm.transformers_utils.processors.mimo_v2_omni import (
 
 from .interfaces import (
     MultiModalEmbeddings,
+    SupportsEagle3,
     SupportsMultiModal,
     SupportsPP,
     SupportsQuant,
@@ -231,12 +232,7 @@ class MiMoVisionAttention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: torch.Tensor,
     ) -> torch.Tensor:
-        """Window attention with the per-head sink applied to key 0.
-
-        The reference adds ``sinks[h]`` to the logit of each sequence's first
-        key, which the Triton prefill kernel supports directly, so the softmax
-        normalizes over the biased scores in one pass.
-        """
+        """Window attention with the per-head sink as a null softmax logit."""
         from vllm.v1.attention.ops.triton_prefill_attention import (
             context_attention_fwd,
         )
@@ -262,7 +258,7 @@ class MiMoVisionAttention(nn.Module):
             sliding_window_q=w,
             sliding_window_k=w,
             sinks=sinks,
-            sinks_bias_key0=True,
+            sinks_bias_key0=False,
         )
         return output
 
@@ -615,7 +611,12 @@ class MiMoVisionTransformer(nn.Module):
         window_index_1d_col = self.get_window_index_1d(grid_thw, col=True).to(
             device=x.device
         )
-        reverse_window_index_1d_col = torch.argsort(window_index_1d_col)
+        reverse_window_index_1d_col = torch.empty_like(window_index_1d_col)
+        reverse_window_index_1d_col[window_index_1d_col] = torch.arange(
+            window_index_1d_col.numel(),
+            device=window_index_1d_col.device,
+            dtype=window_index_1d_col.dtype,
+        )
 
         # Col-based rotary embeddings (reordered at spatial_merge_unit granularity).
         # apply_index reorders groups of spatial_merge_unit tokens, just like x.
@@ -713,6 +714,7 @@ class MiMoV2OmniProcessingInfo(BaseProcessingInfo):
         do_resize: bool = True,
         image_processor,
         mm_kwargs: Mapping[str, object],
+        modality: str | None = None,
     ) -> tuple[ImageSize, int]:
         hf_config = self.get_hf_config()
         vision_config = hf_config.vision_config
@@ -721,7 +723,7 @@ class MiMoV2OmniProcessingInfo(BaseProcessingInfo):
         temporal_patch_size = vision_config.temporal_patch_size
         tokens_per_second = vision_config.tokens_per_second
 
-        mm_kwargs = self.ctx.get_merged_mm_kwargs(mm_kwargs)
+        mm_kwargs = self.ctx.get_merged_mm_kwargs(mm_kwargs, modality=modality)
         size = image_processor.size
         if override_size := mm_kwargs.get("size"):
             size = size | override_size
@@ -771,6 +773,7 @@ class MiMoV2OmniProcessingInfo(BaseProcessingInfo):
             num_frames=1,
             image_processor=image_processor,
             mm_kwargs=mm_kwargs,
+            modality="image",
         )
         return num_image_tokens
 
@@ -789,6 +792,7 @@ class MiMoV2OmniProcessingInfo(BaseProcessingInfo):
             num_frames=num_frames,
             image_processor=image_processor,
             mm_kwargs=mm_kwargs,
+            modality="video",
         )
         return num_video_tokens
 
@@ -802,6 +806,10 @@ class MiMoV2OmniProcessingInfo(BaseProcessingInfo):
 
         if max_pixels is None:
             image_processor = self.get_image_processor()
+            # Unscoped on purpose: this bound is shared by the image budget,
+            # the video budget and the dummy data, so a modality-scoped
+            # override must not move it. get_num_{image,video}_tokens
+            # re-resize it with the cap for their own modality.
             mm_kwargs = self.ctx.get_merged_mm_kwargs({})
             size = image_processor.size
             if override_size := mm_kwargs.get("size"):
@@ -1238,7 +1246,10 @@ class MiMoV2OmniDummyInputsBuilder(BaseDummyInputsBuilder[MiMoV2OmniProcessingIn
     info=MiMoV2OmniProcessingInfo,
     dummy_inputs=MiMoV2OmniDummyInputsBuilder,
 )
-class MiMoV2OmniForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsQuant):
+class MiMoV2OmniForCausalLM(
+    nn.Module, SupportsMultiModal, SupportsPP, SupportsQuant, SupportsEagle3
+):
+    packed_modules_mapping = MiMoV2FlashForCausalLM.packed_modules_mapping.copy()
     # To ensure correct weight loading and mapping.
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={

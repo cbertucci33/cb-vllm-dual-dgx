@@ -19,7 +19,8 @@ Both 2D and 3D launches are supported:
   - 3D: one program per (q-block, kv-head, segm); each program covers a
     KV slice and writes per-segment partials (max/expsum/output).  A
     follow-up ``kernel_reduce_segments_diffkv`` combines them.  Selected
-    for decode-only batches whose 2D grid would under-fill the GPU.
+    for small decode and multi-token batches whose 2D grid would under-fill
+    the GPU.
 """
 
 from typing import Any
@@ -28,6 +29,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.triton_attention_helpers import (
     apply_alibi_to_score,
@@ -46,6 +48,35 @@ logger = init_logger(__name__)
 
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 
+# Whole-verify split-KV grouping: one program covers all q tokens of a
+# spec-decode verify request (BLOCK_M = q_len * GQA group, capped at 128).
+_SPEC_3D_MAX_Q = 16
+_SPEC_3D_BLOCK_M = 128
+_SPEC_3D_NUM_WARPS = 8
+_SPEC_3D_TILE = 16
+
+
+def can_use_split_kv(
+    max_seqlen_q: int,
+    num_seqs: int,
+    seq_threshold_3D: int | None,
+    num_par_softmax_segments: int | None,
+    softmax_segm_output: torch.Tensor | None,
+    softmax_segm_max: torch.Tensor | None,
+    softmax_segm_expsum: torch.Tensor | None,
+) -> bool:
+    """One definition of 3D split-KV eligibility for launcher and builders."""
+    return not (
+        seq_threshold_3D is None
+        or num_par_softmax_segments is None
+        or softmax_segm_output is None
+        or softmax_segm_max is None
+        or softmax_segm_expsum is None
+        or max_seqlen_q > 1
+        or num_seqs > seq_threshold_3D
+        or is_batch_invariant
+    )
+
 
 @triton.jit
 def kernel_unified_attention_diffkv(
@@ -60,6 +91,9 @@ def kernel_unified_attention_diffkv(
     query_ptr,
     key_cache_ptr,  # view of packed cache: [..., :head_size_qk]
     value_cache_ptr,  # view of packed cache: [..., head_size_qk:hqk+hv]
+    q_descale_ptr,
+    k_descale_ptr,
+    v_descale_ptr,
     sink_ptr,
     block_tables_ptr,
     seq_lens_ptr,
@@ -79,10 +113,14 @@ def kernel_unified_attention_diffkv(
     HEAD_SIZE_QK_PADDED: tl.constexpr,
     HEAD_SIZE_V: tl.constexpr,
     HEAD_SIZE_V_PADDED: tl.constexpr,
+    QK_SPLIT_A: tl.constexpr,  # > 0: Q.K^T as an A-wide plus a B-wide dot, no padding
+    QK_SPLIT_B: tl.constexpr,
     USE_ALIBI_SLOPES: tl.constexpr,
     USE_ALIBI_SQRT: tl.constexpr,
     USE_SOFTCAP: tl.constexpr,
     USE_SINKS: tl.constexpr,
+    USE_Q_SCALE: tl.constexpr,
+    USE_KV_SCALES: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     # Strides for both cache views (they share the same packed buffer, so
     # dims 0/1/2 strides match; only the per-head extent differs).
@@ -147,12 +185,40 @@ def kernel_unified_attention_diffkv(
     query_mask_0 = tl.where(query_pos < cur_batch_query_len, 1, 0).to(tl.int1)
     query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
 
-    # Q : (BLOCK_M, HEAD_SIZE_QK_PADDED)
-    Q = tl.load(
-        query_ptr + query_offset,
-        mask=dim_mask_qk[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
-        other=0.0,
-    )
+    if QK_SPLIT_A > 0:
+        # Qa : (BLOCK_M, QK_SPLIT_A), Qb : (BLOCK_M, QK_SPLIT_B)
+        offs_qa = tl.arange(0, QK_SPLIT_A)
+        offs_qb = QK_SPLIT_A + tl.arange(0, QK_SPLIT_B)
+        q_base = (
+            query_offset_0[:, None] * query_stride_0
+            + query_offset_1[:, None] * query_stride_1
+        )
+        Qa = tl.load(
+            query_ptr + q_base + offs_qa[None, :],
+            mask=query_mask_0[:, None] & query_mask_1[:, None],
+            other=0.0,
+        )
+        Qb = tl.load(
+            query_ptr + q_base + offs_qb[None, :],
+            mask=(offs_qb < HEAD_SIZE_QK)[None, :]
+            & query_mask_0[:, None]
+            & query_mask_1[:, None],
+            other=0.0,
+        )
+        Q = Qa
+    else:
+        # Q : (BLOCK_M, HEAD_SIZE_QK_PADDED)
+        Q = tl.load(
+            query_ptr + query_offset,
+            mask=dim_mask_qk[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+            other=0.0,
+        )
+
+    if USE_Q_SCALE:
+        scale *= tl.load(q_descale_ptr)
+    if USE_KV_SCALES:
+        scale *= tl.load(k_descale_ptr)
+        v_descale = tl.load(v_descale_ptr)
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -200,19 +266,37 @@ def kernel_unified_attention_diffkv(
             + offs_d_v[None, :] * stride_v_cache_3
             + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
         )
-        k_offset = (
-            physical_block_idx[None, :] * stride_k_cache_0
-            + kv_head_idx * stride_k_cache_2
-            + offs_d_qk[:, None] * stride_k_cache_3
-            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-        )
-        # K : (HEAD_SIZE_QK_PADDED, TILE_SIZE)
-        K_load = tl.load(
-            key_cache_ptr + k_offset,
-            mask=dim_mask_qk[:, None] & tile_mask[None, :],
-            other=0.0,
-        )
-        K = K_load.to(Q.dtype)
+        if QK_SPLIT_A > 0:
+            k_base = (
+                physical_block_idx[None, :] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            )
+            # Ka : (QK_SPLIT_A, TILE_SIZE), Kb : (QK_SPLIT_B, TILE_SIZE)
+            Ka = tl.load(
+                key_cache_ptr + k_base + offs_qa[:, None] * stride_k_cache_3,
+                mask=tile_mask[None, :],
+                other=0.0,
+            ).to(Q.dtype)
+            Kb = tl.load(
+                key_cache_ptr + k_base + offs_qb[:, None] * stride_k_cache_3,
+                mask=(offs_qb < HEAD_SIZE_QK)[:, None] & tile_mask[None, :],
+                other=0.0,
+            ).to(Q.dtype)
+        else:
+            k_offset = (
+                physical_block_idx[None, :] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + offs_d_qk[:, None] * stride_k_cache_3
+                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            )
+            # K : (HEAD_SIZE_QK_PADDED, TILE_SIZE)
+            K_load = tl.load(
+                key_cache_ptr + k_offset,
+                mask=dim_mask_qk[:, None] & tile_mask[None, :],
+                other=0.0,
+            )
+            K = K_load.to(Q.dtype)
         # V : (TILE_SIZE, HEAD_SIZE_V_PADDED)
         V_load = tl.load(
             value_cache_ptr + v_offset,
@@ -235,7 +319,12 @@ def kernel_unified_attention_diffkv(
 
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
-        S += scale * tl.dot(Q, K)
+        if QK_SPLIT_A > 0:
+            qk = tl.dot(Qa, Ka)
+            qk = tl.dot(Qb, Kb, qk)
+            S += scale * qk
+        else:
+            S += scale * tl.dot(Q, K)
 
         if USE_SOFTCAP:
             S = apply_softcap(S, softcap)
@@ -262,6 +351,9 @@ def kernel_unified_attention_diffkv(
         acc += tl.dot(P.to(V.dtype), V)
 
     # ---- Epilogue --------------------------------------------------------
+    if USE_KV_SCALES:
+        acc *= v_descale
+
     if IS_3D:
         # Store per-segment partials; finalized by reduce_segments_diffkv.
         segm_output_offset = (
@@ -276,6 +368,9 @@ def kernel_unified_attention_diffkv(
             acc,
             mask=dim_mask_v[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         )
+        # A row whose keys are all masked in this segment ends at M=0, L=0;
+        # -inf makes reduce_segments treat that segment as absent.
+        M = tl.where(L > 0.0, M, float("-inf"))
         store_segm_reduce_scalars(
             segm_max_ptr,
             segm_expsum_ptr,
@@ -330,6 +425,9 @@ def kernel_reduce_segments_diffkv(
     query_token_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
 
+    if query_token_idx >= tl.load(query_start_len_ptr + num_seqs):
+        return
+
     seq_idx = find_seq_idx(
         query_start_len_ptr, query_token_idx, num_seqs, BLOCK_Q, False
     )
@@ -351,6 +449,8 @@ def kernel_reduce_segments_diffkv(
     )
     segm_max = tl.load(segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf"))
     overall_max = tl.max(segm_max)
+    # Graph-capture dummy lengths can leave a query with no causal keys.
+    overall_max = tl.where(overall_max > float("-inf"), overall_max, 0.0)
 
     segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
     segm_expsum = segm_expsum * tl.exp(segm_max - overall_max)
@@ -396,13 +496,15 @@ def unified_attention_diffkv(
     alibi_slopes=None,
     sinks=None,
     use_alibi_sqrt=False,
-    # 3D / split-KV softmax buffers.  When all four are provided and the
-    # batch is decode-only with few sequences, the 3D path is taken.
+    # 3D / split-KV softmax buffers, indexed by query token.
     seq_threshold_3D: int | None = None,
     num_par_softmax_segments: int | None = None,
     softmax_segm_output: torch.Tensor | None = None,
     softmax_segm_max: torch.Tensor | None = None,
     softmax_segm_expsum: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
+    q_descale: torch.Tensor | None = None,
 ):
     assert causal, "Only causal attention is supported"
 
@@ -422,29 +524,87 @@ def unified_attention_diffkv(
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
-    BLOCK_Q = BLOCK_M // num_queries_per_kv
-
-    total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
+    # With 16 query heads per KV head a 16-row block covers one query position,
+    # so every position reloads its KV prefix. Prefills share those loads
+    # between two positions; measured on SM12x only. Batch invariance forbids
+    # a tile shape that depends on the batch's longest query.
+    if (
+        max_seqlen_q >= 64
+        and num_queries_per_kv == 16
+        and head_size_qk == 192
+        and head_size_v == 128
+        and q.dtype == torch.bfloat16
+        and not is_batch_invariant
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+    ):
+        BLOCK_M = 32
+    launch_kw: dict[str, int] = {}
 
     sliding_window_val = 1 + window_size[0] if window_size[0] >= 0 else 0
 
     # Decide between 2D and 3D launch.  Mirrors the standard launcher:
     # 3D requires preallocated softmax buffers, decode-only batches, and
     # a small number of sequences (otherwise 2D already saturates the SM).
+    # Spec-decode verify batches (q_len <= _SPEC_3D_MAX_Q, full attention)
+    # also take 3D: their 2D grid is only q_blocks x kv_heads programs, each
+    # walking the whole context.  Sliding-window layers stay 2D: their loop
+    # is already window-bounded.
+    spec_3d = (
+        1 < max_seqlen_q <= _SPEC_3D_MAX_Q
+        and sliding_window_val == 0
+        and softmax_segm_output is not None
+        and q.shape[0] <= softmax_segm_output.shape[0]
+    )
     use_3d = not (
         seq_threshold_3D is None
         or num_par_softmax_segments is None
         or softmax_segm_output is None
         or softmax_segm_max is None
         or softmax_segm_expsum is None
-        or max_seqlen_q > 1
+        or (max_seqlen_q > 1 and not spec_3d)
         or num_seqs > seq_threshold_3D
         or is_batch_invariant
     )
 
+    spec_tile: int | None = None
+    if use_3d and spec_3d and _SPEC_3D_BLOCK_M > BLOCK_M:
+        spec_bm = min(
+            _SPEC_3D_BLOCK_M,
+            triton.next_power_of_2(max_seqlen_q * num_queries_per_kv),
+        )
+        if spec_bm > BLOCK_M and spec_bm % num_queries_per_kv == 0:
+            BLOCK_M = spec_bm
+            launch_kw["num_warps"] = _SPEC_3D_NUM_WARPS if BLOCK_M >= 128 else 4
+            spec_tile = _SPEC_3D_TILE
+    BLOCK_Q = BLOCK_M // num_queries_per_kv
+
+    total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
+
     # Tile size: 32 for prefill-class kernels.  Decode (small Q) prefers
     # smaller tiles to expose more parallelism along the KV dim.
     tile_size = 32 if not use_3d else (16 if q.element_size() >= 2 else 32)
+    if spec_tile is not None:
+        tile_size = spec_tile
+    # Triton's SM12x dot instruction requires K >= 32. Both the ordinary
+    # split-KV decode path and the speculative 3D override use TILE_SIZE as K
+    # for P @ V, so clamp after every tile-size override.
+    if (
+        tile_size < 32
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+    ):
+        tile_size = 32
+
+    # A Q/K head size that is not a power of two (192 on MiMo-V2) would be padded to the
+    # next one (256) for the Q.K^T dot. In the 2D kernel, split it into its largest
+    # power-of-two part and the rest (192 = 128 + 64) so no padded lanes are loaded or
+    # multiplied. The split-KV decode kernel keeps one dot: there it measured neutral to
+    # slightly slower.
+    qk_split_a = qk_split_b = 0
+    if not use_3d and head_size_qk & (head_size_qk - 1):
+        qk_split_a = 1 << (head_size_qk.bit_length() - 1)
+        qk_split_b = triton.next_power_of_2(head_size_qk - qk_split_a)
 
     grid: tuple[Any, ...]
     if use_3d:
@@ -470,6 +630,9 @@ def unified_attention_diffkv(
         query_ptr=q,
         key_cache_ptr=k,
         value_cache_ptr=v,
+        q_descale_ptr=q_descale,
+        k_descale_ptr=k_descale,
+        v_descale_ptr=v_descale,
         sink_ptr=sinks,
         block_tables_ptr=block_table,
         seq_lens_ptr=seqused_k,
@@ -489,10 +652,14 @@ def unified_attention_diffkv(
         HEAD_SIZE_QK_PADDED=triton.next_power_of_2(head_size_qk),
         HEAD_SIZE_V=head_size_v,
         HEAD_SIZE_V_PADDED=triton.next_power_of_2(head_size_v),
+        QK_SPLIT_A=qk_split_a,
+        QK_SPLIT_B=qk_split_b,
         USE_ALIBI_SLOPES=use_alibi_slopes,
         USE_ALIBI_SQRT=use_alibi_sqrt,
         USE_SOFTCAP=(softcap > 0),
         USE_SINKS=(sinks is not None),
+        USE_Q_SCALE=q_descale is not None,
+        USE_KV_SCALES=k_descale is not None,
         SLIDING_WINDOW=sliding_window_val,
         stride_k_cache_0=k.stride(0),
         stride_k_cache_1=k.stride(1),
@@ -508,6 +675,7 @@ def unified_attention_diffkv(
         BLOCK_M=BLOCK_M,
         NUM_SEGMENTS_PER_SEQ=num_segments,
         IS_3D=use_3d,
+        **launch_kw,
     )
 
     if use_3d:

@@ -308,6 +308,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     get_kv_quant_mode,
+    get_mla_state_content_bytes,
 )
 
 if TYPE_CHECKING:
@@ -1360,7 +1361,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             state_content_bytes=(
                 cast(MLAAttentionImpl, self.impl).get_fp8_ds_mla_row_bytes()
                 if self.kv_cache_dtype == "fp8_ds_mla"
-                else {"nvfp4_ds_mla": 352}.get(self.kv_cache_dtype)
+                else get_mla_state_content_bytes(self.kv_cache_dtype)
             ),
         )
         if self.sliding_window is not None:

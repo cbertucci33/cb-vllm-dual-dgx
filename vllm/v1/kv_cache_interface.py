@@ -633,6 +633,12 @@ class FullAttentionSpec(AttentionSpec):
         return merged_spec
 
 
+def get_mla_state_content_bytes(cache_dtype: str) -> int | None:
+    """Packed NoPE + RoPE + scales bytes per token, or None for standard MLA."""
+    # See the ds_mla layouts in flashmla_sparse.py.
+    return {"fp8_ds_mla": 656, "nvfp4_ds_mla": 352}.get(cache_dtype)
+
+
 def _apply_alignment_padding(spec: MLAAttentionSpec | SlidingWindowMLASpec):
     if spec.alignment is None:
         return
@@ -1312,6 +1318,22 @@ def is_full_attention_spec(kv_cache_spec: KVCacheSpec) -> bool:
     layer_specs = iter_layer_specs(kv_cache_spec)
     return len(layer_specs) > 0 and all(
         isinstance(spec, FullAttentionSpec) for spec in layer_specs
+    )
+
+
+def uses_generic_slot_mapping(kv_cache_spec: KVCacheSpec) -> bool:
+    """Whether the generic position-indexed slot-mapping kernel may serve a
+    KV cache group.
+
+    Builder-managed groups are excluded: ``CircularBufferSpec`` and
+    ``KpoolTailSpec`` rows hold a single block per request whose slot mapping
+    is computed by their own attention metadata builders, so the generic
+    ``pos // kernel_block_size`` column lookup would index past the row and
+    read unmaterialized block ids (#56380).
+    """
+    layer_specs = iter_layer_specs(kv_cache_spec)
+    return not any(
+        isinstance(spec, (CircularBufferSpec, KpoolTailSpec)) for spec in layer_specs
     )
 
 

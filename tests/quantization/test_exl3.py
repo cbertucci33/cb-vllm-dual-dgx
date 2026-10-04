@@ -144,7 +144,11 @@ def test_rank_sliced_weight_name_keeps_only_local_tp_rank(monkeypatch):
     )
 
 
-def test_rank_sliced_dense_parameter_copies_mapped_weight():
+def test_rank_sliced_dense_parameter_copies_mapped_weight(monkeypatch):
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
     source = torch.arange(8, dtype=torch.float16)
     param = Exl3Parameter(weight_loader=lambda *_: None)
     param.exl3_copy_on_load = True
@@ -220,7 +224,11 @@ def test_rank_sliced_parameter_preallocates_projection_major_slab(monkeypatch):
     torch.testing.assert_close(param.exl3_tensors[(2, "w3")], w3)
 
 
-def test_moe_scalar_marker_does_not_retain_source_storage():
+def test_moe_scalar_marker_does_not_retain_source_storage(monkeypatch):
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
     source = torch.tensor([0xCBAC1FED], dtype=torch.int64)
     param = Exl3MoEParameter(weight_loader=lambda *_: None)
 

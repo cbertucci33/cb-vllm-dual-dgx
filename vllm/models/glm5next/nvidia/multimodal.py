@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GLM-5.3-Flash vision tower and multimodal processor."""
 
+import math
 from collections.abc import Mapping
 from functools import cached_property, partial
 
@@ -42,6 +43,7 @@ from vllm.model_executor.models.vision import (
 )
 from vllm.models.common.ops import fused_q_kv_rmsnorm
 from vllm.multimodal.parse import ImageSize, MultiModalDataItems
+from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 
@@ -389,7 +391,7 @@ class Glm5NextVisionTransformer(nn.Module):
         head_dim = self.hidden_size // self.num_heads
         self.rotary_pos_emb = get_rope(
             head_size=head_dim,
-            max_position=8192,
+            max_position=text_config.max_position_embeddings,
             is_neox_style=True,
             rope_parameters={"partial_rotary_factor": 0.5},
         )
@@ -473,7 +475,7 @@ class Glm5NextVisionTransformer(nn.Module):
 
         cos, sin = self.rotary_pos_emb.get_cos_sin(max_grid_size)
 
-        pos_ids = pos_ids.to(cos.device, non_blocking=True)
+        pos_ids = async_tensor_h2d(pos_ids, device=cos.device)
         cos_combined = cos[pos_ids].flatten(1)
         sin_combined = sin[pos_ids].flatten(1)
         return cos_combined, sin_combined, pos_ids
@@ -584,7 +586,7 @@ class Glm5NextVisionTransformer(nn.Module):
                 grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
             ).cumsum(dim=0, dtype=torch.int32)
             cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
-            cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
+            cu_seqlens = async_tensor_h2d(cu_seqlens, device=self.device)
             max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
 
         # transformers
@@ -644,17 +646,35 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
             proc.temporal_patch_size,
         )
 
-    def _get_image_max_pixels(self) -> int:
-        mm_kwargs = self.ctx.get_merged_mm_kwargs({})
+    def _get_image_max_pixels(self, modality: str | None = "image") -> int:
+        mm_kwargs = self.ctx.get_merged_mm_kwargs({}, modality=modality)
         if (override := mm_kwargs.get("max_pixels")) is not None:
             return int(override)
         return self._processor_pixel_budget(self.get_hf_processor().image_processor)[1]
 
     def _get_video_max_pixels(self) -> int:
-        mm_kwargs = self.ctx.get_merged_mm_kwargs({})
+        mm_kwargs = self.ctx.get_merged_mm_kwargs({}, modality="video")
         if (override := mm_kwargs.get("max_pixels")) is not None:
             return int(override)
         return self._processor_pixel_budget(self.get_hf_processor().video_processor)[1]
+
+    def get_image_size_with_most_features(self) -> ImageSize:
+        """Return a canvas that reaches the processor's exact token ceiling."""
+        vision_config = self.get_hf_config().vision_config
+        factor = (
+            vision_config.patch_size
+            * vision_config.spatial_merge_size
+            * self.get_hf_processor().image_processor.patch_expand_factor
+        )
+        pixels_per_token = vision_config.temporal_patch_size * factor * factor
+        max_tokens = max(1, self._get_image_max_pixels() // pixels_per_token)
+        short_side = math.isqrt(max_tokens)
+        while max_tokens % short_side:
+            short_side -= 1
+        return ImageSize(
+            width=(max_tokens // short_side) * factor,
+            height=short_side * factor,
+        )
 
     def _get_vision_info(
         self,

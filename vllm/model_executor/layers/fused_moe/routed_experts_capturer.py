@@ -16,6 +16,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import KVCacheConfig, is_full_attention_spec
 from vllm.v1.outputs import RoutedExpertsTensors
@@ -248,6 +249,23 @@ class RoutedExpertsCapturer:
         )
 
 
+class RoutedExpertsSink:
+    """Layer-owned buffer and callback for the expert ids a monolithic kernel
+    routes to; it outlives kernel rebuilds on weight reload."""
+
+    def __init__(
+        self, moe_config: FusedMoEConfig, capture_fn: Callable[[torch.Tensor], None]
+    ) -> None:
+        # Sized for per-rank batches gathered across the DP or EP group.
+        group_size = moe_config.ep_size if moe_config.use_ep else moe_config.dp_size
+        self.buffer = torch.empty(
+            (moe_config.max_num_tokens * group_size, moe_config.experts_per_token),
+            dtype=torch.int16,
+            device=moe_config.device,
+        )
+        self.capture_fn = capture_fn
+
+
 def bind_routed_experts_capturer(
     model: torch.nn.Module,
     capturer: RoutedExpertsCapturer,
@@ -289,7 +307,9 @@ def bind_routed_experts_capturer(
                     "Routed-experts capture is not supported with monolithic "
                     f"MoE kernel {type(fused_experts).__name__}."
                 )
-            fused_experts.set_capture_fn(capture_fn)
+            module.routed_experts.routing_sink = RoutedExpertsSink(
+                fused_experts.moe_config, capture_fn
+            )
             num_bound += 1
         elif isinstance(module.router, BaseRouter):
             module.router.set_capture_fn(capture_fn)

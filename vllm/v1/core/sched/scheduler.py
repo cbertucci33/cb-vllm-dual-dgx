@@ -510,6 +510,15 @@ class Scheduler(SchedulerInterface):
             if self.draft_replay_reserve
             else 0
         )
+        # Incremental multimodal prompts often append a new item before the
+        # producer's end-of-prompt state. Materialize one reusable state at the
+        # final MM boundary, aligned to the cache-hit granularity. Limiting this
+        # to the final feature adds at most one prefill split per request.
+        mm_boundary = request.last_mm_feature_end
+        mm_alignment = (
+            self.hash_block_size if self.mamba_fine_grained_prefix_cache else block_size
+        )
+        mm_boundary_stop = mm_boundary // mm_alignment * mm_alignment
         stops = (
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
@@ -530,6 +539,10 @@ class Scheduler(SchedulerInterface):
             # cache restore. Materialize the exact restorable target-state
             # boundary before the final prefill chunk advances that page.
             replay_boundary if start < replay_boundary < end else 0,
+            # Last multimodal boundary: cache a state that an incremental
+            # sibling can discover on its first request, before Marconi has a
+            # chance to observe and repair the missing Mamba state.
+            mm_boundary_stop if start < mm_boundary_stop < end else 0,
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
@@ -1137,8 +1150,15 @@ class Scheduler(SchedulerInterface):
                     )
 
                     if num_new_tokens == 0:
-                        # The request cannot be scheduled.
-                        break
+                        if encoder_inputs_to_schedule is None:
+                            # The request cannot be scheduled.
+                            break
+                        # Encoder work stalled it: requeue it for the next
+                        # pass instead of stopping here, where one stuck
+                        # request would starve every request behind it.
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
 
                 # During async KV load, no forward pass is run yet.
                 # Allocate speculative lookahead slots later to avoid
@@ -1758,19 +1778,6 @@ class Scheduler(SchedulerInterface):
                 # already calculated encoder inputs and can skip here.
                 continue
 
-            if not self.is_encoder_decoder:
-                # We are not using the encoder cache for encoder-decoder models,
-                # yet.
-                if item_identifier in mm_hashes_to_schedule:
-                    # The same encoder input has already been scheduled in the
-                    # current step.
-                    continue
-
-                if self.encoder_cache_manager.check_and_update_cache(request, i):
-                    # The encoder input is already computed and cached from a
-                    # previous step.
-                    continue
-
             # If no encoder input chunking is allowed, we do not want to
             # partially schedule a multimodal item. If the scheduled range would
             # only cover part of the mm input, roll back to before the mm item.
@@ -1787,9 +1794,35 @@ class Scheduler(SchedulerInterface):
                     0, start_pos - (num_computed_tokens + shift_computed_tokens)
                 )
                 break
-            if not self.encoder_cache_manager.can_allocate(
+            if not self.is_encoder_decoder:
+                # We are not using the encoder cache for encoder-decoder models,
+                # yet.
+                if item_identifier in mm_hashes_to_schedule:
+                    # The same encoder input has already been scheduled in the
+                    # current step.
+                    continue
+
+                if self.encoder_cache_manager.check_and_update_cache(request, i):
+                    # The encoder input is already computed and cached from a
+                    # previous step.
+                    continue
+
+            can_allocate = self.encoder_cache_manager.can_allocate(
                 request, i, encoder_compute_budget, num_embeds_to_schedule
+            )
+            # When every earlier input of this request is already consumed by
+            # the forward pass, its own references hold the cache slots this
+            # item needs, and nothing else will drop them: release them and
+            # look again.
+            if (
+                not can_allocate
+                and num_computed_tokens + shift_computed_tokens >= start_pos
+                and self._release_consumed_encoder_inputs(request, num_computed_tokens)
             ):
+                can_allocate = self.encoder_cache_manager.can_allocate(
+                    request, i, encoder_compute_budget, num_embeds_to_schedule
+                )
+            if not can_allocate:
                 # The encoder cache is full or the encoder budget is exhausted.
                 # NOTE(woosuk): We assume that the encoder input tokens should
                 # be processed altogether, as the encoder usually uses
@@ -2345,6 +2378,16 @@ class Scheduler(SchedulerInterface):
         if not request.resumable:
             return True
 
+        # Drop the finished turn's in-flight work and resume from the
+        # materialized frontier.
+        safe_frontier = request.num_computed_tokens - request.num_output_placeholders
+        assert safe_frontier >= 0
+        request.num_computed_tokens = safe_frontier
+        request.spec_token_ids = []
+        request.drop_stale_output = True
+        request.num_stale_output_tokens = request.num_in_flight_tokens
+        request.num_output_placeholders = 0
+
         if request.streaming_queue:
             update = request.streaming_queue.popleft()
             if update is None:
@@ -2414,6 +2457,24 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free_encoder_input(request, input_id)
         if self.ec_connector is not None:
             self.ec_connector.update_state_after_free(request, input_id)
+
+    def _release_consumed_encoder_inputs(
+        self, request: Request, num_computed_tokens: int
+    ) -> bool:
+        """Drop this request's references to inputs the forward pass consumed.
+
+        Unlike `_free_encoder_inputs` this defers nothing: it runs only where
+        an allocation has already stalled, so the lookahead deferral would be
+        the stall. Returns whether anything was released.
+        """
+        released = False
+        cached_input_ids = self.encoder_cache_manager.get_cached_input_ids(request)
+        for input_id in list(cached_input_ids):
+            position = request.mm_features[input_id].mm_position
+            if position.offset + position.length <= num_computed_tokens:
+                self._free_encoder_input(request, input_id)
+                released = True
+        return released
 
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
         for req_id, spec_token_ids in zip(
