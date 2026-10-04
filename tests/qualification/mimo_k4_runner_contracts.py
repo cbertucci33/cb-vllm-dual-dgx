@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
+from _pytest.monkeypatch import MonkeyPatch
 
 from vllm.config import (
     CacheConfig,
@@ -34,7 +35,9 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.worker.gpu.spec_decode.dflash import utils as dflash_utils
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+    DFlashSpeculator,
     prepare_dflash_inputs,
     synthesize_draft_ring_block_tables,
 )
@@ -232,20 +235,166 @@ def contract_draft_probability_order() -> None:
     torch.testing.assert_close(actual.sum(-1), torch.ones(actual.shape[0]))
 
 
+def contract_proposer_probability_capture() -> None:
+    device = torch.device("cuda")
+    num_reqs = 2
+    vocab_size = 8
+    num_samples = num_reqs * K
+    logits = torch.arange(
+        num_samples * vocab_size, dtype=torch.float32, device=device
+    ).view(num_samples, vocab_size)
+
+    speculator = object.__new__(DFlashSpeculator)
+    speculator.num_speculative_steps = K
+    speculator.sample_indices = torch.arange(
+        num_samples, dtype=torch.int64, device=device
+    )
+    speculator.sample_pos = torch.arange(
+        1, num_samples + 1, dtype=torch.int64, device=device
+    )
+    speculator.sample_idx_mapping = torch.arange(
+        num_reqs, dtype=torch.int32, device=device
+    ).repeat_interleave(K)
+    speculator.sample_col = torch.arange(K, dtype=torch.int32, device=device).repeat(
+        num_reqs
+    )
+    speculator.temperature = torch.ones(num_reqs, dtype=torch.float32, device=device)
+    speculator.seeds = torch.tensor([17, 29], dtype=torch.int64, device=device)
+    speculator.draft_logits = torch.full(
+        (num_reqs, K, vocab_size),
+        torch.nan,
+        dtype=torch.float32,
+        device=device,
+    )
+    speculator.draft_tokens = torch.full(
+        (num_reqs, K), -1, dtype=torch.int64, device=device
+    )
+    speculator.model = SimpleNamespace(compute_logits=lambda hidden_states: logits)
+    speculator.use_fp64_gumbel = False
+    speculator.use_local_argmax_reduction = False
+    speculator.draft_watermarker = None
+    speculator.acceptance_estimator = None
+    speculator._run_model = lambda *args, **kwargs: torch.zeros(
+        num_samples, 2, dtype=torch.bfloat16, device=device
+    )
+
+    speculator._generate_draft(num_reqs, num_samples, None, None, None)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(speculator.draft_logits, logits.view(num_reqs, K, -1))
+    assert torch.all(
+        (speculator.draft_tokens >= 0) & (speculator.draft_tokens < vocab_size)
+    )
+
+
+def contract_draft_cache_ownership(target: str, draft: str) -> None:
+    target_config = ModelConfig(
+        model=target,
+        runner="generate",
+        max_model_len=100,
+        trust_remote_code=True,
+    )
+    speculative_config = SpeculativeConfig(
+        target_model_config=target_config,
+        target_parallel_config=ParallelConfig(),
+        model=draft,
+        method="dflash",
+        num_speculative_tokens=K,
+        kv_cache_dtype="bfloat16",
+    )
+    target_cache_config = CacheConfig(
+        block_size=BLOCK_SIZE,
+        gpu_memory_utilization=0.9,
+        cache_dtype="fp8_e4m3",
+        enable_prefix_caching=False,
+    )
+    target_vllm_config = VllmConfig(
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=16,
+            max_num_batched_tokens=8192,
+            max_model_len=100,
+            is_encoder_decoder=target_config.is_encoder_decoder,
+        ),
+        model_config=target_config,
+        cache_config=target_cache_config,
+        parallel_config=ParallelConfig(),
+        speculative_config=speculative_config,
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_get_model(*, vllm_config, model_config):
+        captured["vllm_config"] = vllm_config
+        captured["model_config"] = model_config
+        return SimpleNamespace(model=object())
+
+    monkeypatch = MonkeyPatch()
+    monkeypatch.setattr(dflash_utils, "get_model", fake_get_model)
+    monkeypatch.setattr(dflash_utils, "maybe_share_target_embed", lambda *args: None)
+    monkeypatch.setattr(dflash_utils, "get_target_lm_head", lambda *args: None)
+    monkeypatch.setattr(
+        dflash_utils,
+        "get_pp_safe_draft_load_config",
+        lambda load_config: load_config,
+    )
+    try:
+        _, draft_vllm_config = dflash_utils.load_dflash_model(
+            object(), target_vllm_config
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert captured["vllm_config"] is draft_vllm_config
+    assert captured["model_config"] is speculative_config.draft_model_config
+    assert target_vllm_config.cache_config is target_cache_config
+    assert draft_vllm_config.cache_config is not target_cache_config
+    _assert_equal(target_cache_config.cache_dtype, "fp8_e4m3", "target-cache-dtype")
+    _assert_equal(
+        draft_vllm_config.cache_config.cache_dtype,
+        "bfloat16",
+        "draft-cache-dtype",
+    )
+
+    target_cache_config.kv_cache_layout = "LBHNC"
+    draft_vllm_config.cache_config.kv_cache_layout = None
+    speculator = object.__new__(DFlashSpeculator)
+    speculator.vllm_config = target_vllm_config
+    speculator._draft_vllm_config = draft_vllm_config
+    resolved = DFlashSpeculator.attn_vllm_config.fget(speculator)
+    assert resolved is draft_vllm_config
+    _assert_equal(
+        draft_vllm_config.cache_config.kv_cache_layout,
+        "LBHNC",
+        "draft-cache-layout",
+    )
+
+
 def _rejection_inputs(
     target_logits: torch.Tensor,
     draft_logits: torch.Tensor,
     draft_tokens: torch.Tensor,
 ) -> dict:
-    num_trials = target_logits.shape[0]
+    num_trials = draft_tokens.shape[0]
     device = target_logits.device
-    target_rows = (
-        target_logits[:, None, :]
-        .expand(-1, K + 1, -1)
-        .reshape(num_trials * (K + 1), -1)
-        .contiguous()
-    )
-    draft_rows = draft_logits[:, None, :].expand(-1, K, -1).contiguous()
+    if target_logits.ndim == 2:
+        target_rows = target_logits[:, None, :].expand(-1, K + 1, -1)
+    else:
+        _assert_equal(
+            target_logits.shape[:2],
+            (num_trials, K + 1),
+            "target-logit-shape",
+        )
+        target_rows = target_logits
+    if draft_logits.ndim == 2:
+        draft_rows = draft_logits[:, None, :].expand(-1, K, -1)
+    else:
+        _assert_equal(
+            draft_logits.shape[:2],
+            (num_trials, K),
+            "draft-logit-shape",
+        )
+        draft_rows = draft_logits
+    target_rows = target_rows.reshape(num_trials * (K + 1), -1).contiguous()
+    draft_rows = draft_rows.contiguous()
     sampled = torch.zeros(num_trials, K + 1, dtype=torch.int64, device=device)
     sampled[:, 1:] = draft_tokens
     return {
@@ -308,6 +457,23 @@ def contract_probabilistic_rejection() -> None:
     _assert_equal(replacement_count.item(), 1, "forced-rejection-count")
     _assert_equal(replacement[0, 0].item(), 6, "forced-replacement-token")
 
+    target = torch.full((1, K + 1, 8), float("-inf"), device=device)
+    draft = torch.full((1, K, 8), float("-inf"), device=device)
+    proposals = torch.tensor([[1, 2, 3, 4]], dtype=torch.int64, device=device)
+    for pos, token in enumerate(proposals[0].tolist()):
+        draft[0, pos, token] = 0
+    target[0, 0, 1] = 0
+    target[0, 1, 2] = 0
+    target[0, 2:, 6] = 0
+    accepted_prefix = _rejection_inputs(target, draft, proposals)
+    output, output_count = rejection_sample(**accepted_prefix, num_speculative_steps=K)
+    _assert_equal(output_count.item(), 3, "accepted-prefix-replacement-count")
+    _assert_equal(
+        output[0, :3].tolist(),
+        [1, 2, 6],
+        "accepted-prefix-replacement-tokens",
+    )
+
 
 def contract_k4_scheduler(target: str, draft: str) -> None:
     target_config = ModelConfig(
@@ -322,7 +488,9 @@ def contract_k4_scheduler(target: str, draft: str) -> None:
         model=draft,
         method="dflash",
         num_speculative_tokens=K,
+        kv_cache_dtype="bfloat16",
     )
+    _assert_equal(speculative_config.kv_cache_dtype, "bfloat16", "draft-kv-dtype")
     scheduler_config = SchedulerConfig(
         max_num_seqs=16,
         max_num_batched_tokens=8192,
@@ -400,8 +568,12 @@ def main() -> None:
     print("PASS private-ring-cold-partial-continuation-wrap-isolation")
     contract_draft_probability_order()
     print("PASS draft-probability-order-normalization-k4")
+    contract_proposer_probability_capture()
+    print("PASS proposer-probability-capture-k4")
     contract_probabilistic_rejection()
-    print("PASS probabilistic-rejection-replacement-k4")
+    print("PASS probabilistic-rejection-accepted-prefix-replacement-k4")
+    contract_draft_cache_ownership(args.target, args.draft)
+    print("PASS target-fp8-draft-bf16-cache-ownership-layout")
     contract_k4_scheduler(args.target, args.draft)
     print("PASS scheduler-lookahead-k4")
 
