@@ -530,6 +530,101 @@ def test_mimo_diffkv_mixed_metadata_partition_contract(
     not current_platform.is_cuda() or not current_platform.has_device_capability(89),
     reason="FP8 DiffKV requires CUDA SM89+",
 )
+@torch.inference_mode()
+def test_mimo_fp8_diffkv_cuda_graph_replay() -> None:
+    """Captured 3D whole-verify replay must match eager FP32-oracle output."""
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(19)
+    fp8_dtype = current_platform.fp8_dtype()
+    query_len, kv_len = 4, 257
+    num_query_heads, num_kv_heads = 32, 2
+    head_size_qk, head_size_v, block_size = 192, 128, 16
+    q_scale = torch.tensor(0.037, dtype=torch.float32)
+    k_scale = torch.tensor(0.041, dtype=torch.float32)
+    v_scale = torch.tensor(0.007, dtype=torch.float32)
+    num_blocks = (kv_len + block_size - 1) // block_size
+    key = (
+        torch.randn(num_blocks, block_size, num_kv_heads, head_size_qk) / k_scale
+    ).to(fp8_dtype)
+    value = (
+        torch.randn(num_blocks, block_size, num_kv_heads, head_size_v) / v_scale
+    ).to(fp8_dtype)
+    block_table = torch.arange(num_blocks, dtype=torch.int32).view(1, -1)
+    cu_query_lens = torch.tensor([0, query_len], dtype=torch.int32)
+    kv_lens = torch.tensor([kv_len], dtype=torch.int32)
+    segm_output, segm_max, segm_expsum = _alloc_segm_buffers(
+        64, num_query_heads, head_size_v
+    )
+    static_query = torch.empty(
+        query_len, num_query_heads, head_size_qk, dtype=fp8_dtype
+    )
+    output = torch.empty(query_len, num_query_heads, head_size_v, dtype=torch.bfloat16)
+
+    def run() -> None:
+        unified_attention_diffkv(
+            q=static_query,
+            k=key,
+            v=value,
+            out=output,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            softmax_scale=head_size_qk**-0.5,
+            causal=True,
+            window_size=(-1, -1),
+            block_table=block_table,
+            softcap=0,
+            max_seqlen_q=query_len,
+            seq_threshold_3D=64,
+            num_par_softmax_segments=NUM_PAR_SOFTMAX_SEGMENTS,
+            softmax_segm_output=segm_output,
+            softmax_segm_max=segm_max,
+            softmax_segm_expsum=segm_expsum,
+            q_descale=q_scale,
+            k_descale=k_scale,
+            v_descale=v_scale,
+        )
+
+    warm_query = (torch.randn_like(static_query.float()) / q_scale).to(fp8_dtype)
+    static_query.copy_(warm_query)
+    run()
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    captured = output.clone()
+    captured_reference = ref_paged_attn(
+        warm_query.float() * q_scale,
+        key.float() * k_scale,
+        value.float() * v_scale,
+        [query_len],
+        [kv_len],
+        block_table,
+        head_size_qk**-0.5,
+    ).to(torch.bfloat16)
+    torch.testing.assert_close(captured, captured_reference, atol=3e-2, rtol=3e-2)
+
+    replay_query = (torch.randn_like(static_query.float()) / q_scale).to(fp8_dtype)
+    static_query.copy_(replay_query)
+    graph.replay()
+    torch.cuda.synchronize()
+    replay_reference = ref_paged_attn(
+        replay_query.float() * q_scale,
+        key.float() * k_scale,
+        value.float() * v_scale,
+        [query_len],
+        [kv_len],
+        block_table,
+        head_size_qk**-0.5,
+    ).to(torch.bfloat16)
+    torch.testing.assert_close(output, replay_reference, atol=3e-2, rtol=3e-2)
+    assert not torch.equal(captured, output)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.has_device_capability(89),
+    reason="FP8 DiffKV requires CUDA SM89+",
+)
 @pytest.mark.parametrize(
     (
         "query_lens",

@@ -191,6 +191,142 @@ def contract_prepare_inputs() -> None:
     _assert_equal(prefill.input_buffers.input_ids[0].item(), 77, "prefill-bonus")
 
 
+def contract_prepare_inputs_cuda_graph() -> None:
+    device = torch.device("cuda")
+    max_num_reqs = 4
+    max_num_tokens = 32
+    num_context_tokens = 3
+    input_buffers = SimpleNamespace(
+        input_ids=torch.full((max_num_tokens,), -1, dtype=torch.int32, device=device),
+        positions=torch.full((max_num_tokens,), -1, dtype=torch.int64, device=device),
+        query_start_loc=torch.full(
+            (max_num_reqs + 1,), -7, dtype=torch.int32, device=device
+        ),
+        seq_lens=torch.full((max_num_reqs,), -7, dtype=torch.int32, device=device),
+    )
+    target_positions = torch.tensor([0, 1, 2], dtype=torch.int64, device=device)
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        num_scheduled_tokens=np.array([num_context_tokens], dtype=np.int32),
+        positions=target_positions,
+        query_start_loc=torch.tensor(
+            [0, num_context_tokens], dtype=torch.int32, device=device
+        ),
+        idx_mapping=torch.tensor([0], dtype=torch.int32, device=device),
+    )
+    query_slots = torch.full((max_num_tokens,), -3, dtype=torch.int64, device=device)
+    context_positions = torch.full(
+        (max_num_tokens,), -3, dtype=torch.int64, device=device
+    )
+    context_slots = torch.full((max_num_tokens,), -3, dtype=torch.int64, device=device)
+    sample_indices = torch.full(
+        (max_num_reqs * K,), -3, dtype=torch.int64, device=device
+    )
+    sample_pos = torch.full_like(sample_indices, -3)
+    sample_idx_mapping = torch.full(
+        (max_num_reqs * K,), -3, dtype=torch.int32, device=device
+    )
+    output_temperature = torch.zeros(max_num_reqs, dtype=torch.float32, device=device)
+    output_seeds = torch.zeros(max_num_reqs, dtype=torch.int64, device=device)
+    block_table = torch.tensor(
+        [[1, 2, 3, 4, 5, 6, 7, 8]], dtype=torch.int32, device=device
+    )
+    num_sampled = torch.tensor([1], dtype=torch.int32, device=device)
+    num_rejected = torch.tensor([0], dtype=torch.int32, device=device)
+    last_sampled = torch.tensor([99, 0, 0, 0], dtype=torch.int64, device=device)
+    next_prefill = torch.tensor([77, 0, 0, 0], dtype=torch.int32, device=device)
+    input_temperature = torch.tensor(
+        [1.0, 0.0, 0.0, 0.0], dtype=torch.float32, device=device
+    )
+    input_seeds = torch.tensor([17, 0, 0, 0], dtype=torch.int64, device=device)
+
+    def run() -> None:
+        prepare_dflash_inputs(
+            input_buffers,
+            query_slots,
+            context_positions,
+            context_slots,
+            sample_indices,
+            sample_pos,
+            sample_idx_mapping,
+            output_temperature,
+            output_seeds,
+            input_batch,
+            num_sampled,
+            num_rejected,
+            last_sampled,
+            next_prefill,
+            input_temperature,
+            input_seeds,
+            block_table,
+            BLOCK_SIZE,
+            0,
+            1,
+            1,
+            151675,
+            NUM_QUERY_PER_REQ,
+            K,
+            max_num_reqs,
+            max_num_tokens,
+            2048,
+            False,
+        )
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+
+    target_positions.copy_(torch.tensor([16, 17, 18], dtype=torch.int64, device=device))
+    query_slots.fill_(-3)
+    sample_indices.fill_(-3)
+    sample_pos.fill_(-3)
+    sample_idx_mapping.fill_(-3)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    _assert_equal(
+        context_positions[:num_context_tokens].cpu().tolist(),
+        [16, 17, 18],
+        "graph-context-positions",
+    )
+    _assert_equal(
+        context_slots[:num_context_tokens].cpu().tolist(),
+        [32, 33, 34],
+        "graph-context-slots",
+    )
+    _assert_equal(
+        input_buffers.positions[:NUM_QUERY_PER_REQ].cpu().tolist(),
+        [19, 20, 21, 22, 23],
+        "graph-query-positions",
+    )
+    _assert_equal(
+        input_buffers.input_ids[:NUM_QUERY_PER_REQ].cpu().tolist(),
+        [99, 151675, 151675, 151675, 151675],
+        "graph-query-input-ids",
+    )
+    _assert_equal(
+        query_slots[:NUM_QUERY_PER_REQ].cpu().tolist(),
+        [35, 36, 37, 38, 39],
+        "graph-query-slots",
+    )
+    assert torch.all(query_slots[NUM_QUERY_PER_REQ:] == PAD_SLOT_ID)
+    _assert_equal(
+        input_buffers.query_start_loc.cpu().tolist(),
+        [0, 5, 5, 5, 5],
+        "graph-query-start",
+    )
+    _assert_equal(
+        input_buffers.seq_lens.cpu().tolist(),
+        [24, 0, 0, 0],
+        "graph-seq-lens",
+    )
+    assert torch.all(sample_indices[K:] == 0)
+    assert torch.all(sample_pos[K:] == 0)
+    assert torch.all(sample_idx_mapping[K:] == -1)
+
+
 def contract_private_ring() -> None:
     ring_size = 4
     block_table = torch.full((4, 8), -1, dtype=torch.int32, device="cuda")
@@ -837,6 +973,8 @@ def main() -> None:
     assert torch.cuda.is_available()
     contract_prepare_inputs()
     print("PASS prepare-inputs-k4")
+    contract_prepare_inputs_cuda_graph()
+    print("PASS prepare-inputs-cuda-graph-replay-padding")
     contract_private_ring()
     print("PASS private-ring-cold-partial-continuation-wrap-isolation")
     contract_draft_probability_order()
