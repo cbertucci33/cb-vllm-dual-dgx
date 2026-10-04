@@ -5,6 +5,7 @@
   "exllamav3_revision": "c5d9c657966ffeeaa9353f0cc899f18629da4a13",
   "b12x_revision": "00b69ac22e21413622c4ecd98f607a2c3e015161",
   "flashinfer_revision": "dc04f50c9aa3eabcdaa5feb0934edb3d85e9529a",
+  "sparkinfer_revision": "d4438d490691f79022fdfc8149e1c5f161d15445",
   "wheel_sha256": "22127a5e9951cf7df2c1da6a95b3ab65700e96ae06dce151d495957bee917a0f",
   "production_source_mounts": []
 }

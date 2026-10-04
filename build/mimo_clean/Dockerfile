@@ -8,6 +8,7 @@ ARG RUNNER_VERSION
 ARG EXLLAMAV3_COMMIT
 ARG B12X_COMMIT
 ARG FLASHINFER_COMMIT
+ARG SPARKINFER_COMMIT
 
 ENV TORCH_CUDA_ARCH_LIST=12.1a \
     FLASHINFER_CUDA_ARCH_LIST=12.1a \
@@ -43,7 +44,8 @@ RUN --mount=type=bind,source=build/mimo_clean/artifacts,target=/mnt/artifacts,re
       /mnt/artifacts/nvidia_cutlass_dsl-4.7.1-py3-none-any.whl \
       /mnt/artifacts/flashinfer_python-0.7.0-py3-none-any.whl \
       /mnt/artifacts/b12x-1.3.0-py3-none-any.whl \
-      /mnt/artifacts/exllamav3_ext_vllm-0.0.43-cp312-cp312-linux_aarch64.whl; \
+      /mnt/artifacts/exllamav3_ext_vllm-0.0.43-cp312-cp312-linux_aarch64.whl \
+      /mnt/artifacts/sparkinfer-1.0.1-py3-none-any.whl; \
     install -D -m 0755 /mnt/artifacts/flashinfer-topk-sm121.so \
       /usr/local/lib/python3.12/dist-packages/flashinfer/data/aot/topk/topk.so; \
     find /usr/local/lib/python3.12/dist-packages/vllm -type d \
@@ -67,4 +69,5 @@ LABEL org.opencontainers.image.revision="${VLLM_COMMIT}" \
       io.mimo.runner.exllamav3.revision="${EXLLAMAV3_COMMIT}" \
       io.mimo.runner.b12x.revision="${B12X_COMMIT}" \
       io.mimo.runner.flashinfer.revision="${FLASHINFER_COMMIT}" \
+      io.mimo.runner.sparkinfer.revision="${SPARKINFER_COMMIT}" \
       io.mimo.runner.clean-build="true"
