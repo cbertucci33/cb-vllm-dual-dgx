@@ -203,8 +203,11 @@ def compute_tile_loop_bounds(
 
     # ---- Sliding-window tile pruning --------------------
     # Default: keep previous global behavior
-    tile_start = 0
-    tile_end = num_tiles
+    # Keep the loop bounds in int64. Runtime sequence lengths are int64, and
+    # Triton rejects reassignment when the default literal makes tile_start
+    # int32 before sliding-window pruning computes an int64 tile index.
+    tile_start = q_block_local_idx.to(tl.int64) * 0
+    tile_end = num_tiles.to(tl.int64)
     # Prefix ranges normally override the sliding window, so they require the
     # complete sequence. Gemma4 instead clamps prefix attention to the left
     # edge of the sliding window. In that case, the union of possible keys is
@@ -265,8 +268,8 @@ def compute_tile_loop_bounds(
                 )
         last_allowed_key = tl.minimum(last_allowed_key, seq_len - 1)
         # Convert to tile indices and clamp
-        tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
-        tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
+        tile_start = tl.maximum(tile_start, first_allowed_key // TILE_SIZE)
+        tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, tile_end)
 
     if IS_3D:
         loop_lo = max(segm_idx_or_0 * tiles_per_segment_or_0, tile_start)

@@ -10,6 +10,8 @@ import pytest
 import torch
 
 from tests.kernels.attention.test_triton_unified_attention import ref_paged_attn
+from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
+from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import next_power_of_2
 from vllm.utils.torch_utils import (
@@ -19,6 +21,9 @@ from vllm.utils.torch_utils import (
 from vllm.v1.attention.backends.fa_utils import (
     get_flash_attn_version,
     is_flash_attn_varlen_func_available,
+)
+from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+    triton_reshape_and_cache_flash_diffkv,
 )
 from vllm.v1.attention.ops.triton_unified_attention_diffkv import (
     kernel_unified_attention_diffkv,
@@ -158,6 +163,7 @@ def test_triton_unified_attn_diffkv_prefill_block_m(
     [
         ([2], [8193], 2),
         ([4], [8195], 4),
+        ([4], [62287], 4),
         ([2, 4], [8193, 777], 4),
     ],
 )
@@ -205,9 +211,7 @@ def test_triton_unified_attn_diffkv_mimo_fp8_whole_verify_3d(
     )
     kv_lens_t = torch.tensor(kv_lens, dtype=torch.int32)
     max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
-    block_tables = torch.empty(
-        num_seqs, max_num_blocks_per_seq, dtype=torch.int32
-    )
+    block_tables = torch.empty(num_seqs, max_num_blocks_per_seq, dtype=torch.int32)
     next_block = 0
     for seq_idx, kv_len in enumerate(kv_lens):
         blocks_for_seq = (kv_len + block_size - 1) // block_size
@@ -267,6 +271,180 @@ def test_triton_unified_attn_diffkv_mimo_fp8_whole_verify_3d(
     assert launch["USE_KV_SCALES"] is True
     assert not torch.isnan(triton_out).any()
     torch.testing.assert_close(triton_out, ref_out, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.has_device_capability(89),
+    reason="FP8 DiffKV requires CUDA SM89+",
+)
+@torch.inference_mode()
+def test_mimo_static_fp8_query_quantization(default_vllm_config) -> None:
+    """Match the scalar-scale query quantization used by target attention."""
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(0)
+    query = torch.randn(4, 32 * 192, dtype=torch.bfloat16)
+    scale = torch.tensor(0.037, dtype=torch.float32)
+    query[0, 0] = 0
+    query[0, 1] = 20
+    query[0, 2] = -20
+    quant = QuantFP8(static=True, group_shape=GroupShape.PER_TENSOR)
+
+    actual, returned_scale = quant(query, scale)
+
+    assert actual.dtype == current_platform.fp8_dtype()
+    assert actual.shape == query.shape
+    assert actual.stride() == query.stride()
+    assert torch.isfinite(actual.float()).all()
+    assert actual[0, 0].float().item() == 0
+    torch.testing.assert_close(returned_scale, scale)
+    expected = query.float().clamp(-448 * float(scale), 448 * float(scale))
+    torch.testing.assert_close(
+        actual.float() * scale,
+        expected,
+        atol=float(scale) * 0.55,
+        rtol=0.08,
+    )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.has_device_capability(89),
+    reason="FP8 DiffKV requires CUDA SM89+",
+)
+@torch.inference_mode()
+def test_mimo_fp8_diffkv_cache_write_contract() -> None:
+    """Write asymmetric K/V across block boundaries with production scales."""
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(0)
+    num_tokens, num_kv_heads, block_size = 5, 2, 16
+    key = torch.randn(num_tokens, num_kv_heads, 192, dtype=torch.bfloat16)
+    value = torch.empty(num_tokens, num_kv_heads, 128, dtype=torch.bfloat16).uniform_(
+        -2.5, 2.5
+    )
+    slots = torch.tensor([0, 15, 16, 31, -1], dtype=torch.int64)
+    k_scale = torch.tensor(0.041, dtype=torch.float32)
+    v_scale = torch.tensor(0.007, dtype=torch.float32)
+    cache_bytes = torch.zeros(2, block_size, num_kv_heads, 192 + 128, dtype=torch.uint8)
+
+    triton_reshape_and_cache_flash_diffkv(
+        key,
+        value,
+        cache_bytes,
+        slots,
+        "fp8_e4m3",
+        k_scale,
+        v_scale,
+    )
+
+    cache = cache_bytes.view(current_platform.fp8_dtype())
+    for token_idx, slot in enumerate(slots[:-1].tolist()):
+        block_idx, block_offset = divmod(slot, block_size)
+        torch.testing.assert_close(
+            cache[block_idx, block_offset, :, :192].float() * k_scale,
+            key[token_idx].float(),
+            atol=float(k_scale),
+            rtol=0.125,
+        )
+        torch.testing.assert_close(
+            cache[block_idx, block_offset, :, 192:].float() * v_scale,
+            value[token_idx].float(),
+            atol=float(v_scale),
+            rtol=0.125,
+        )
+    selected = torch.zeros(2, block_size, dtype=torch.bool)
+    for slot in slots[:-1].tolist():
+        selected[slot // block_size, slot % block_size] = True
+    assert torch.count_nonzero(cache_bytes[~selected]).item() == 0
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.has_device_capability(89),
+    reason="FP8 DiffKV requires CUDA SM89+",
+)
+@pytest.mark.parametrize(
+    ("query_lens", "kv_lens", "window_size", "seq_threshold_3d"),
+    [
+        ([63], [294], (-1, -1), 0),
+        ([1], [2011], (-1, -1), 0),
+        ([1], [8193], (-1, -1), 64),
+        ([4], [8195], (127, 0), 64),
+    ],
+)
+@torch.inference_mode()
+def test_mimo_fp8_diffkv_route_parity(
+    query_lens: list[int],
+    kv_lens: list[int],
+    window_size: tuple[int, int],
+    seq_threshold_3d: int,
+) -> None:
+    """Cover FP8 prefill, 2D/3D decode, and the sliding-window route."""
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(0)
+    num_query_heads, num_kv_heads = 32, 2
+    head_size_qk, head_size_v, block_size = 192, 128, 16
+    num_blocks = (sum(kv_lens) + block_size - 1) // block_size + len(kv_lens)
+    fp8_dtype = current_platform.fp8_dtype()
+    q_scale = torch.tensor(0.2, dtype=torch.float32)
+    k_scale = torch.tensor(0.3, dtype=torch.float32)
+    v_scale = torch.tensor(0.7, dtype=torch.float32)
+    query = (torch.randn(sum(query_lens), num_query_heads, head_size_qk) / q_scale).to(
+        fp8_dtype
+    )
+    kv = torch.randn(
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        head_size_qk + head_size_v,
+    )
+    key = (kv[..., :head_size_qk] / k_scale).to(fp8_dtype)
+    value = (kv[..., head_size_qk:] / v_scale).to(fp8_dtype)
+    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(0)
+    kv_lens_t = torch.tensor(kv_lens, dtype=torch.int32)
+    max_blocks = (max(kv_lens) + block_size - 1) // block_size
+    block_tables = torch.zeros(len(kv_lens), max_blocks, dtype=torch.int32)
+    next_block = 0
+    for seq_idx, kv_len in enumerate(kv_lens):
+        blocks = (kv_len + block_size - 1) // block_size
+        block_tables[seq_idx, :blocks] = torch.arange(next_block, next_block + blocks)
+        next_block += blocks
+    sliding_window = None if window_size == (-1, -1) else window_size[0] + 1
+    reference = ref_paged_attn(
+        query.float() * q_scale,
+        key.float() * k_scale,
+        value.float() * v_scale,
+        query_lens,
+        kv_lens,
+        block_tables,
+        head_size_qk**-0.5,
+        sliding_window=sliding_window,
+    ).to(torch.bfloat16)
+    segm_output, segm_max, segm_expsum = _alloc_segm_buffers(
+        seq_threshold_3d, num_query_heads, head_size_v
+    )
+    actual = torch.empty_like(reference)
+    unified_attention_diffkv(
+        q=query,
+        k=key,
+        v=value,
+        out=actual,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens_t,
+        softmax_scale=head_size_qk**-0.5,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        max_seqlen_q=max(query_lens),
+        seq_threshold_3D=seq_threshold_3d,
+        num_par_softmax_segments=NUM_PAR_SOFTMAX_SEGMENTS,
+        softmax_segm_output=segm_output,
+        softmax_segm_max=segm_max,
+        softmax_segm_expsum=segm_expsum,
+        q_descale=q_scale,
+        k_descale=k_scale,
+        v_descale=v_scale,
+    )
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, reference, atol=3e-2, rtol=3e-2)
 
 
 @pytest.mark.parametrize(
