@@ -26,13 +26,11 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 # Matches defaults from tests/v1/spec_decode/test_eagle.py
 DFLASH_TARGET_DIR = os.environ.get("VLLM_TEST_DFLASH_TARGET", "Qwen/Qwen3-8B")
-DFLASH_DRAFT_DIR = os.environ.get(
-    "VLLM_TEST_DFLASH_DRAFT", "z-lab/Qwen3-8B-DFlash-b16"
-)
+DFLASH_DRAFT_DIR = os.environ.get("VLLM_TEST_DFLASH_DRAFT", "z-lab/Qwen3-8B-DFlash-b16")
 
 BLOCK_SIZE = 16
 NUM_BLOCKS = 8
-NUM_SPECULATIVE_TOKENS = 3
+NUM_SPECULATIVE_TOKENS = 4
 
 
 def _dflash_speculative_config(num_speculative_tokens: int) -> SpeculativeConfig:

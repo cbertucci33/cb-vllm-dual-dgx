@@ -27,8 +27,9 @@ def _run_prepare(
 ):
     device = torch.device("cuda")
     max_num_reqs = 4
-    max_num_tokens = 16
-    num_speculative_steps = 3
+    max_num_tokens = 32
+    num_speculative_steps = 4
+    num_query_per_req = 1 + num_speculative_steps
 
     input_buffers = SimpleNamespace(
         input_ids=torch.full((max_num_tokens,), -1, dtype=torch.int32, device=device),
@@ -97,12 +98,12 @@ def _run_prepare(
         cp_size,
         cp_interleave,
         123,
-        num_speculative_steps,
+        num_query_per_req,
         num_speculative_steps,
         max_num_reqs,
         max_num_tokens,
         128,
-        sample_from_anchor=True,
+        sample_from_anchor=False,
     )
     torch.accelerator.synchronize()
     return SimpleNamespace(
@@ -131,12 +132,12 @@ def test_prepare_dflash_inputs_excludes_rejected_context_suffix():
 
     # The replacement query starts immediately after the two valid rows and
     # advances from the last accepted position (11).
-    assert out.input_buffers.input_ids[:3].cpu().tolist() == [99, 123, 123]
-    assert out.input_buffers.positions[:3].cpu().tolist() == [12, 13, 14]
-    assert out.query_slot_mapping[:3].tolist() == [32, 33, 34]
-    assert out.sample_indices[:3].tolist() == [0, 1, 2]
-    assert out.sample_pos[:3].tolist() == [13, 14, 15]
-    assert out.sample_idx_mapping[:3].tolist() == [2, 2, 2]
+    assert out.input_buffers.input_ids[:5].cpu().tolist() == [99, 123, 123, 123, 123]
+    assert out.input_buffers.positions[:5].cpu().tolist() == [12, 13, 14, 15, 16]
+    assert out.query_slot_mapping[:5].tolist() == [32, 33, 34, 35, 36]
+    assert out.sample_indices[:4].tolist() == [1, 2, 3, 4]
+    assert out.sample_pos[:4].tolist() == [13, 14, 15, 16]
+    assert out.sample_idx_mapping[:4].tolist() == [2, 2, 2, 2]
     assert out.temperature[2].item() == 1.0
     assert out.seeds[2].item() == 17
 
@@ -152,7 +153,13 @@ def test_prepare_dflash_inputs_excludes_rejected_context_suffix_with_dcp():
 
     assert out.context_positions[:4].tolist() == [10, 11, 0, 0]
     assert out.context_slot_mapping[:4].tolist() == [28, 29, PAD_SLOT_ID, PAD_SLOT_ID]
-    assert out.query_slot_mapping[:3].tolist() == [PAD_SLOT_ID, PAD_SLOT_ID, 30]
+    assert out.query_slot_mapping[:5].tolist() == [
+        PAD_SLOT_ID,
+        PAD_SLOT_ID,
+        30,
+        31,
+        PAD_SLOT_ID,
+    ]
 
 
 def test_prepare_dflash_inputs_never_writes_the_null_block():
@@ -169,7 +176,9 @@ def test_prepare_dflash_inputs_never_writes_the_null_block():
         PAD_SLOT_ID,
         PAD_SLOT_ID,
     ]
-    assert out.query_slot_mapping[:3].tolist() == [
+    assert out.query_slot_mapping[:5].tolist() == [
+        PAD_SLOT_ID,
+        PAD_SLOT_ID,
         PAD_SLOT_ID,
         PAD_SLOT_ID,
         PAD_SLOT_ID,

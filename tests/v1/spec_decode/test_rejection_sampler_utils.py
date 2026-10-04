@@ -234,8 +234,10 @@ def test_watermarked_recovery_supports_smaller_draft_vocabulary():
     [
         (1, 0.6),
         (3, 0.6),
+        (4, 0.6),
         (1, 1.0),
         (3, 1.0),
+        (4, 1.0),
     ],
 )
 @pytest.mark.parametrize("draft_logits_dtype", [torch.float32, torch.bfloat16])
@@ -327,7 +329,7 @@ def _gumbel_drafted_tokens(
     return draft_sampled
 
 
-@pytest.mark.parametrize("num_speculative_steps", [1, 3])
+@pytest.mark.parametrize("num_speculative_steps", [1, 3, 4])
 def test_gumbel_drafted_rejection_sample_is_unbiased(num_speculative_steps: int):
     """The proposal and the residual resample must not share a noise vector.
 

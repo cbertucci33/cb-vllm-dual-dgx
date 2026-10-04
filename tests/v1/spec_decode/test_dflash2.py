@@ -169,6 +169,33 @@ def test_ring_synthesis_covers_context_and_draft_queries():
     assert torch.equal(block_table, expected)
 
 
+def test_probabilistic_draft_probs_follow_request_order_and_k4():
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    vocab_size = 7
+    probs = torch.arange(3 * 4 * vocab_size, dtype=torch.float32).view(3, 4, vocab_size)
+    probs = torch.softmax(probs, dim=-1)
+
+    runner = object.__new__(GPUModelRunner)
+    runner._draft_probs = probs
+    runner._draft_prob_req_ids = ["request-b", "request-a", "request-c"]
+    runner.input_batch = SimpleNamespace(
+        req_ids=["request-a", "request-b", "request-c"]
+    )
+    metadata = SimpleNamespace(num_draft_tokens=[4, 2, 0])
+
+    actual = runner._get_spec_decode_draft_probs(metadata)
+    expected = torch.cat((probs[1, :4], probs[0, :2]), dim=0).contiguous()
+
+    assert actual is not None
+    assert actual.is_contiguous()
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(
+        actual.sum(dim=-1), torch.ones(actual.shape[0], dtype=actual.dtype)
+    )
+
+
 @pytest.mark.parametrize("block_size", [5, 8])
 def test_grouped_conv_matches_reference(block_size: int):
     torch.manual_seed(0)

@@ -1011,7 +1011,7 @@ def test_propose_stores_probabilistic_draft_probs(attn_backend, monkeypatch):
     batch_size = 2
     seq_lens = [5, 3]
     total_tokens = sum(seq_lens)
-    num_speculative_tokens = 3
+    num_speculative_tokens = 4
     vocab_size = 8
 
     proposer = _create_proposer(
