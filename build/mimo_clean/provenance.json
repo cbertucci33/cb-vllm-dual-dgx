@@ -1,10 +1,12 @@
 {
   "base_image": "vllm/vllm-openai:v0.30.0@sha256:4864d46625cbc3307623e29ac742030655e27249feba7b97ec925ce4cc4dfb56",
-  "vllm_source_revision": "51b74d6d83a7468997ebec8eae0be7e0284499d9",
-  "vllm_native_source_revision": "fe7a24a943262cd842481ca2b6d24c5ee0ecd340",
+  "vllm_source_revision": "5ab5a277e913dfb2fc6c359fb9452b61139923ca",
+  "vllm_native_artifact_build_revision": "fe7a24a943262cd842481ca2b6d24c5ee0ecd340",
+  "vllm_native_source_equivalent_revision": "5ab5a277e913dfb2fc6c359fb9452b61139923ca",
+  "base_precompiled_wheel_sha256": "64308932417a986d8450c3aeca3149c33751080307596b6cf43ba37fe8ee8c96",
   "exllamav3_revision": "c5d9c657966ffeeaa9353f0cc899f18629da4a13",
   "flashinfer_revision": "dc04f50c9aa3eabcdaa5feb0934edb3d85e9529a",
   "sparkinfer_revision": "d4438d490691f79022fdfc8149e1c5f161d15445",
-  "wheel_sha256": "661f8e1792d5242dbbc5fcd767668ad32f0946bd6cc0b42147758f37ee4e0087",
+  "wheel_sha256": "925191a4883d870ed546ca362b081a58aecfd91425e88859d3663360617d919c",
   "production_source_mounts": []
 }

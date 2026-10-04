@@ -20,16 +20,9 @@ RUN --mount=type=bind,source=build/mimo_clean/artifacts,target=/mnt/artifacts,re
     set -eux; \
     cd /mnt/artifacts; \
     sha256sum -c artifact-sha256.txt; \
-    cd /usr/local/lib/python3.12/dist-packages; \
-    find vllm -type f \( -name '*.so' -o -name 'vllm-rs' \) -print0 \
-      | sort -z \
-      | tar --null -T - -cf /tmp/vllm-base-native.tar; \
     uv pip uninstall --system vllm; \
     uv pip install --system --no-deps \
-      /mnt/artifacts/vllm-0.30.0+51b74d6d8-cp312-cp312-linux_aarch64.whl; \
-    tar -xf /tmp/vllm-base-native.tar -C /usr/local/lib/python3.12/dist-packages; \
-    install -m 0755 /mnt/artifacts/_C_stable_libtorch.abi3.so \
-      /usr/local/lib/python3.12/dist-packages/vllm/_C_stable_libtorch.abi3.so; \
+      /mnt/artifacts/vllm-0.30.0+5ab5a277e-cp312-cp312-linux_aarch64.whl; \
     uv pip uninstall --system \
       flashinfer-python flashinfer-jit-cache flashinfer-cubin \
       nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base \
@@ -50,7 +43,6 @@ RUN --mount=type=bind,source=build/mimo_clean/artifacts,target=/mnt/artifacts,re
       \( -name tests -o -name __pycache__ \) -prune -exec rm -rf '{}' +; \
     find /usr/local/lib/python3.12/dist-packages \
       -type d -name __pycache__ -prune -exec rm -rf '{}' +; \
-    rm -f /tmp/vllm-base-native.tar; \
     mkdir -p /opt/mimo-runner; \
     find /usr/local/lib/python3.12/dist-packages/vllm -type f -print0 \
       | sort -z \
