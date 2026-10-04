@@ -29,10 +29,12 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
+    DFlashSWASpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
 )
+from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.worker.gpu.spec_decode.dflash import utils as dflash_utils
@@ -556,6 +558,248 @@ def contract_k4_scheduler(target: str, draft: str) -> None:
             raise AssertionError(f"unallocated-lookahead-position: {position}")
 
 
+def _update_scheduler(
+    scheduler: Scheduler, output, sampled_token_ids: list[list[int]]
+) -> None:
+    req_ids = list(output.num_scheduled_tokens)
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={req_id: idx for idx, req_id in enumerate(req_ids)},
+            sampled_token_ids=sampled_token_ids,
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+
+def _make_request(request_id: str, num_prompt_tokens: int, max_tokens: int) -> Request:
+    params = SamplingParams(max_tokens=max_tokens)
+    params.update_from_generation_config({}, 50256)
+    return Request(
+        request_id=request_id,
+        prompt_token_ids=list(range(num_prompt_tokens)),
+        sampling_params=params,
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(BLOCK_SIZE, sha256),
+    )
+
+
+def contract_prefix_replay_and_rollback(target: str, draft: str) -> None:
+    max_model_len = 2048
+    sliding_window = 1024
+    target_config = ModelConfig(
+        model=target,
+        runner="generate",
+        max_model_len=max_model_len,
+        trust_remote_code=True,
+    )
+    speculative_config = SpeculativeConfig(
+        target_model_config=target_config,
+        target_parallel_config=ParallelConfig(),
+        model=draft,
+        method="dflash",
+        num_speculative_tokens=K,
+        kv_cache_dtype="bfloat16",
+    )
+    scheduler_config = SchedulerConfig(
+        max_num_seqs=4,
+        max_num_batched_tokens=max_model_len,
+        max_model_len=max_model_len,
+        is_encoder_decoder=target_config.is_encoder_decoder,
+    )
+    cache_config = CacheConfig(
+        block_size=BLOCK_SIZE,
+        gpu_memory_utilization=0.9,
+        cache_dtype="fp8_e4m3",
+        enable_prefix_caching=True,
+    )
+    vllm_config = VllmConfig(
+        scheduler_config=scheduler_config,
+        model_config=target_config,
+        cache_config=cache_config,
+        parallel_config=ParallelConfig(),
+        speculative_config=speculative_config,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=256,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["target"],
+                FullAttentionSpec(
+                    block_size=BLOCK_SIZE,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.uint8,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["draft"],
+                DFlashSWASpec(
+                    block_size=BLOCK_SIZE,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.bfloat16,
+                    sliding_window=sliding_window,
+                    private_ring=True,
+                ),
+            ),
+        ],
+    )
+    cache_config.num_gpu_blocks = 256
+    scheduler = Scheduler(
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        block_size=BLOCK_SIZE,
+        log_stats=True,
+        structured_output_manager=StructuredOutputManager(vllm_config),
+    )
+    _assert_equal(scheduler.draft_replay_reserve, sliding_window, "replay-reserve")
+
+    num_prompt_tokens = sliding_window + 129
+    warm = _make_request("warm", num_prompt_tokens, 1)
+    scheduler.add_request(warm)
+    first = scheduler.schedule()
+    _assert_equal(
+        first.num_scheduled_tokens["warm"],
+        num_prompt_tokens,
+        "warm-prefill-token-count",
+    )
+    _update_scheduler(scheduler, first, [[100]])
+    assert "warm" in scheduler.finished_req_ids
+
+    resumed = _make_request("resumed", num_prompt_tokens, 8)
+    scheduler.add_request(resumed)
+    replay = scheduler.schedule()
+    _assert_equal(
+        resumed.num_computed_tokens, num_prompt_tokens, "replay-scheduled-end"
+    )
+    _assert_equal(
+        replay.num_scheduled_tokens["resumed"],
+        num_prompt_tokens - 128,
+        "prefix-replay-token-count",
+    )
+    _assert_equal(
+        replay.scheduled_new_reqs[0].num_computed_tokens,
+        128,
+        "prefix-restore-boundary",
+    )
+
+    device = torch.device("cuda")
+    replay_positions = torch.arange(128, num_prompt_tokens, device=device)
+    num_replay_tokens = replay_positions.numel()
+    max_num_tokens = num_replay_tokens + NUM_QUERY_PER_REQ
+    input_buffers = SimpleNamespace(
+        input_ids=torch.full((max_num_tokens,), -1, dtype=torch.int32, device=device),
+        positions=torch.full((max_num_tokens,), -1, dtype=torch.int64, device=device),
+        query_start_loc=torch.full((2,), -1, dtype=torch.int32, device=device),
+        seq_lens=torch.full((1,), -1, dtype=torch.int32, device=device),
+    )
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        num_scheduled_tokens=np.array([num_replay_tokens], dtype=np.int32),
+        positions=replay_positions,
+        query_start_loc=torch.tensor(
+            [0, num_replay_tokens], dtype=torch.int32, device=device
+        ),
+        idx_mapping=torch.tensor([0], dtype=torch.int32, device=device),
+    )
+    block_table = torch.zeros((1, 80), dtype=torch.int32, device=device)
+    ring_size = 65
+    synthesize_draft_ring_block_tables(
+        block_table,
+        input_batch.idx_mapping,
+        torch.tensor([num_prompt_tokens], dtype=torch.int32, device=device),
+        BLOCK_SIZE,
+        ring_base=1,
+        ring_size=ring_size,
+        num_query_per_req=NUM_QUERY_PER_REQ,
+    )
+    query_slots = torch.full(
+        (max_num_tokens,), PAD_SLOT_ID, dtype=torch.int64, device=device
+    )
+    context_positions = torch.full_like(query_slots, -1)
+    context_slots = torch.full_like(query_slots, PAD_SLOT_ID)
+    sample_indices = torch.full((K,), -1, dtype=torch.int64, device=device)
+    sample_pos = torch.full_like(sample_indices, -1)
+    sample_idx_mapping = torch.full((K,), -1, dtype=torch.int32, device=device)
+    output_temperature = torch.zeros(1, dtype=torch.float32, device=device)
+    output_seeds = torch.zeros(1, dtype=torch.int64, device=device)
+    prepare_dflash_inputs(
+        input_buffers,
+        query_slots,
+        context_positions,
+        context_slots,
+        sample_indices,
+        sample_pos,
+        sample_idx_mapping,
+        output_temperature,
+        output_seeds,
+        input_batch,
+        torch.tensor([0], dtype=torch.int32, device=device),
+        torch.tensor([0], dtype=torch.int32, device=device),
+        torch.tensor([0], dtype=torch.int64, device=device),
+        torch.tensor([77], dtype=torch.int32, device=device),
+        torch.tensor([1.0], dtype=torch.float32, device=device),
+        torch.tensor([17], dtype=torch.int64, device=device),
+        block_table,
+        BLOCK_SIZE,
+        0,
+        1,
+        1,
+        151675,
+        NUM_QUERY_PER_REQ,
+        K,
+        1,
+        max_num_tokens,
+        max_model_len,
+        False,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(context_positions[:num_replay_tokens], replay_positions)
+    table = block_table[0].cpu().tolist()
+    expected_slots = [
+        table[position // BLOCK_SIZE] * BLOCK_SIZE + position % BLOCK_SIZE
+        for position in range(128, num_prompt_tokens)
+    ]
+    _assert_equal(
+        context_slots[:num_replay_tokens].cpu().tolist(),
+        expected_slots,
+        "prefix-replay-ring-slots",
+    )
+    _assert_equal(
+        input_buffers.positions[:NUM_QUERY_PER_REQ].cpu().tolist(),
+        list(range(num_prompt_tokens, num_prompt_tokens + NUM_QUERY_PER_REQ)),
+        "prefix-replay-query-positions",
+    )
+
+    _update_scheduler(scheduler, replay, [[100]])
+    scheduler.update_draft_token_ids(DraftTokenIds(["resumed"], [[1, 2, 3, 4]]))
+    verify = scheduler.schedule()
+    _assert_equal(
+        verify.scheduled_spec_decode_tokens["resumed"],
+        [1, 2, 3, 4],
+        "scheduled-k4-drafts",
+    )
+    computed_after_schedule = resumed.num_computed_tokens
+    _update_scheduler(scheduler, verify, [[1, 2, 6]])
+    _assert_equal(
+        resumed.num_computed_tokens,
+        computed_after_schedule - 2,
+        "rejected-suffix-rollback",
+    )
+    _assert_equal(
+        resumed.num_computed_tokens,
+        resumed.num_tokens - 1,
+        "rollback-next-token-position",
+    )
+    next_step = scheduler.schedule()
+    _assert_equal(next_step.num_scheduled_tokens["resumed"], 1, "next-step-token-count")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--target", required=True)
@@ -576,6 +820,8 @@ def main() -> None:
     print("PASS target-fp8-draft-bf16-cache-ownership-layout")
     contract_k4_scheduler(args.target, args.draft)
     print("PASS scheduler-lookahead-k4")
+    contract_prefix_replay_and_rollback(args.target, args.draft)
+    print("PASS prefix-replay-ring-and-partial-accept-rollback-k4")
 
 
 if __name__ == "__main__":
