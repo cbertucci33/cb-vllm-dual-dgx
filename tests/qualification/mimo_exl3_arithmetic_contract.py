@@ -9,10 +9,24 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+from _pytest.monkeypatch import MonkeyPatch
 from safetensors import safe_open
 
+from vllm.config import (
+    CacheConfig,
+    ModelConfig,
+    ParallelConfig,
+    SchedulerConfig,
+    SpeculativeConfig,
+    VllmConfig,
+)
 from vllm.model_executor.layers.linear import QKVParallelLinear
-from vllm.model_executor.layers.quantization.exl3 import Exl3LinearMethod
+from vllm.model_executor.layers.quantization.exl3 import (
+    Exl3LinearMethod,
+    _load_exl3_ext,
+)
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.v1.worker.gpu.spec_decode.dflash import utils as dflash_utils
 
 # vLLM's canonical FP16 kernel comparison contract.  These values are kept in
 # tests/kernels/allclose_default.py and sourced there to PyTorch's transformer
@@ -20,6 +34,7 @@ from vllm.model_executor.layers.quantization.exl3 import Exl3LinearMethod
 # equality is not a valid arithmetic contract for this comparison.
 FP16_ATOL = 1e-3
 FP16_RTOL = 1e-3
+EXL3_RELATIVE_RMS_LIMIT = 0.02
 
 
 def _assert_fp16_tiling_close(
@@ -44,6 +59,86 @@ def _assert_fp16_tiling_close(
     torch.testing.assert_close(
         batched, rowwise, rtol=FP16_RTOL, atol=FP16_ATOL
     )
+
+
+def _assert_exl3_relative_rms(
+    name: str, rows: int, actual: torch.Tensor, reference: torch.Tensor
+) -> None:
+    difference = actual.float() - reference.float()
+    error_rms = difference.square().mean().sqrt()
+    reference_rms = reference.float().square().mean().sqrt()
+    relative_rms = (error_rms / reference_rms).item()
+    print(
+        json.dumps(
+            {
+                "contract": name,
+                "rows": rows,
+                "max_abs_error": difference.abs().max().item(),
+                "mean_abs_error": difference.abs().mean().item(),
+                "relative_rms_error": relative_rms,
+                "relative_rms_limit": EXL3_RELATIVE_RMS_LIMIT,
+            },
+            sort_keys=True,
+        )
+    )
+    assert relative_rms < EXL3_RELATIVE_RMS_LIMIT
+
+
+def _sylvester_128(device: torch.device) -> torch.Tensor:
+    matrix = torch.ones(1, 1, dtype=torch.float32, device=device)
+    while matrix.shape[0] < 128:
+        matrix = torch.cat(
+            (
+                torch.cat((matrix, matrix), dim=1),
+                torch.cat((matrix, -matrix), dim=1),
+            ),
+            dim=0,
+        )
+    return matrix / 128**0.5
+
+
+def _reconstruct_exl3_weight(
+    trellis: torch.Tensor,
+    suh: torch.Tensor,
+    svh: torch.Tensor,
+    *,
+    mcg: bool,
+    mul1: bool,
+) -> torch.Tensor:
+    ext = _load_exl3_ext()
+    k = trellis.shape[0] * 16
+    n = trellis.shape[1] * 16
+    inner = torch.empty(k, n, dtype=torch.float16, device=trellis.device)
+    ext.reconstruct(inner, trellis, trellis.shape[2] // 16, mcg, mul1)
+    hadamard = _sylvester_128(trellis.device)
+    weight = inner.float().view(k // 128, 128, n)
+    weight = torch.einsum("ij,bjn->bin", hadamard, weight).reshape(k, n)
+    weight = weight.view(k, n // 128, 128)
+    weight = torch.einsum(
+        "bki,ij->bkj", weight.transpose(0, 1), hadamard
+    ).transpose(0, 1).reshape(k, n)
+    return weight * suh.float()[:, None] * svh.float()[None, :]
+
+
+def _dense_dequantized_reference(
+    layer: QKVParallelLinear, x: torch.Tensor
+) -> torch.Tensor:
+    outputs = []
+    for shard_id in layer.exl3_shard_ids:
+        weight = _reconstruct_exl3_weight(
+            layer.trellis.exl3_tensors[shard_id],
+            layer.suh.exl3_tensors[shard_id],
+            layer.svh.exl3_tensors[shard_id],
+            mcg=shard_id in layer.mcg.exl3_tensors,
+            mul1=shard_id in layer.mul1.exl3_tensors,
+        )
+        output = (x.float() @ weight).to(torch.float16)
+        if Exl3LinearMethod._is_padded_qkv_value_shard(layer, shard_id):
+            output = Exl3LinearMethod._trim_and_shard_padded_qkv_value(
+                layer, output
+            )
+        outputs.append(output)
+    return torch.cat(outputs, dim=-1)
 
 
 def _load_tensor(model: Path, index: dict[str, str], name: str) -> torch.Tensor:
@@ -112,7 +207,151 @@ def contract_dense(model: Path, index: dict[str, str], rank: int) -> None:
         assert batched.shape == (rows, 6784)
         assert batched.dtype == torch.float16
         assert torch.isfinite(batched).all()
-        _assert_fp16_tiling_close("exl3-dense", rows, batched, rowwise)
+        reference = _dense_dequantized_reference(layer, x)
+        _assert_exl3_relative_rms(
+            "exl3-dense-batched-reference", rows, batched, reference
+        )
+        _assert_exl3_relative_rms(
+            "exl3-dense-rowwise-reference", rows, rowwise, reference
+        )
+        _assert_exl3_relative_rms(
+            "exl3-dense-cross-tiling", rows, batched, rowwise
+        )
+        repeats = [method.apply(layer, x).clone() for _ in range(8)]
+        torch.cuda.synchronize()
+        for repeat in repeats[1:]:
+            assert torch.equal(repeats[0], repeat)
+
+
+def _lm_head_layer(
+    model: Path, index: dict[str, str], *, rank: int, tp_size: int
+) -> ParallelLMHead:
+    layer = object.__new__(ParallelLMHead)
+    torch.nn.Module.__init__(layer)
+    layer.trellis = _holder(
+        {None: _load_tensor(model, index, "lm_head.trellis").cuda()}
+    )
+    layer.suh = _holder({None: _load_tensor(model, index, "lm_head.suh").cuda()})
+    layer.svh = _holder({None: _load_tensor(model, index, "lm_head.svh").cuda()})
+    layer.mcg = _holder({None: _load_tensor(model, index, "lm_head.mcg").cuda()})
+    layer.mul1 = _holder({})
+    layer.exl3_shard_ids = [None]
+    layer.exl3_output_partition_sizes = [152576 // tp_size]
+    layer.exl3_tp_size = tp_size
+    layer.exl3_tp_rank = rank
+    layer.exl3_parallel_mode = "column"
+    layer.exl3_input_size_per_partition = 4096
+    layer.tp_size = tp_size
+    Exl3LinearMethod._validate_loaded_tensors(layer)
+    Exl3LinearMethod._shard_tensors_for_tensor_parallel(layer)
+    Exl3LinearMethod._validate_loaded_tensors(layer)
+    return layer
+
+
+def contract_lm_head(
+    model: Path, index: dict[str, str], rank: int
+) -> ParallelLMHead:
+    local_head = _lm_head_layer(model, index, rank=rank, tp_size=2)
+    full_head = _lm_head_layer(model, index, rank=0, tp_size=1)
+    method = object.__new__(Exl3LinearMethod)
+    generator = torch.Generator(device="cpu").manual_seed(800 + rank)
+    shard_start = rank * 76288
+    weight = _reconstruct_exl3_weight(
+        local_head.trellis.exl3_tensors[None],
+        local_head.suh.exl3_tensors[None],
+        local_head.svh.exl3_tensors[None],
+        mcg=True,
+        mul1=False,
+    )
+    for rows in (1, 2, 4, 5):
+        hidden = torch.randn(
+            rows, 4096, generator=generator, dtype=torch.float16
+        ).cuda()
+        local_logits = method.apply(local_head, hidden)
+        rowwise_logits = torch.cat(
+            [method.apply(local_head, row[None]) for row in hidden], dim=0
+        )
+        full_logits = method.apply(full_head, hidden)
+        assert local_logits.shape == (rows, 76288)
+        assert full_logits.shape == (rows, 152576)
+        assert torch.isfinite(local_logits).all()
+        assert torch.isfinite(full_logits).all()
+        reference = (hidden.float() @ weight).to(torch.float16)
+        _assert_exl3_relative_rms(
+            "exl3-lm-head-batched-reference", rows, local_logits, reference
+        )
+        _assert_exl3_relative_rms(
+            "exl3-lm-head-rowwise-reference", rows, rowwise_logits, reference
+        )
+        _assert_exl3_relative_rms(
+            "exl3-lm-head-row-tiling", rows, local_logits, rowwise_logits
+        )
+        _assert_exl3_relative_rms(
+            "exl3-lm-head-tp-slice",
+            rows,
+            local_logits,
+            full_logits[:, shard_start : shard_start + 76288],
+        )
+        repeats = [method.apply(local_head, hidden).clone() for _ in range(8)]
+        torch.cuda.synchronize()
+        for repeat in repeats[1:]:
+            assert torch.equal(repeats[0], repeat)
+    return local_head
+
+
+def contract_dflash_lm_head_share(
+    target: Path, draft: Path, target_lm_head: ParallelLMHead
+) -> None:
+    draft_index = json.loads((draft / "model.safetensors.index.json").read_text())[
+        "weight_map"
+    ]
+    assert not any("lm_head" in name for name in draft_index)
+    target_config = ModelConfig(
+        model=str(target), runner="generate", max_model_len=100, trust_remote_code=True
+    )
+    speculative_config = SpeculativeConfig(
+        target_model_config=target_config,
+        target_parallel_config=ParallelConfig(),
+        model=str(draft),
+        method="dflash",
+        num_speculative_tokens=4,
+        kv_cache_dtype="bfloat16",
+    )
+    target_vllm_config = VllmConfig(
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=2,
+            max_num_batched_tokens=4096,
+            max_model_len=100,
+            is_encoder_decoder=target_config.is_encoder_decoder,
+        ),
+        model_config=target_config,
+        cache_config=CacheConfig(
+            block_size=16,
+            gpu_memory_utilization=0.9,
+            cache_dtype="fp8_e4m3",
+            enable_prefix_caching=False,
+        ),
+        parallel_config=ParallelConfig(),
+        speculative_config=speculative_config,
+    )
+    draft_model = SimpleNamespace(model=object(), lm_head=object())
+    target_model = SimpleNamespace(model=object(), lm_head=target_lm_head)
+    monkeypatch = MonkeyPatch()
+    monkeypatch.setattr(dflash_utils, "get_model", lambda **_: draft_model)
+    monkeypatch.setattr(dflash_utils, "maybe_share_target_embed", lambda *args: None)
+    monkeypatch.setattr(
+        dflash_utils,
+        "get_pp_safe_draft_load_config",
+        lambda load_config: load_config,
+    )
+    try:
+        loaded_draft, _ = dflash_utils.load_dflash_model(
+            target_model, target_vllm_config
+        )
+    finally:
+        monkeypatch.undo()
+    assert loaded_draft is draft_model
+    assert loaded_draft.lm_head is target_lm_head
 
 
 def _load_expert(
@@ -227,14 +466,26 @@ def contract_trellis(model: Path, index: dict[str, str], rank: int) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True, type=Path)
+    parser.add_argument("--draft", type=Path)
     parser.add_argument("--rank", required=True, type=int, choices=(0, 1))
+    parser.add_argument("--only-dense", action="store_true")
+    parser.add_argument("--only-lm-head", action="store_true")
     args = parser.parse_args()
     assert torch.cuda.is_available()
     index = json.loads((args.model / "model.safetensors.index.json").read_text())[
         "weight_map"
     ]
-    contract_dense(args.model, index, args.rank)
-    print(f"PASS exl3-dense-rank={args.rank}-m1-m2-m4-m5-qkv-vtrim")
+    if not args.only_lm_head:
+        contract_dense(args.model, index, args.rank)
+        print(f"PASS exl3-dense-rank={args.rank}-m1-m2-m4-m5-qkv-vtrim")
+        if args.only_dense:
+            return
+    assert args.draft is not None
+    target_lm_head = contract_lm_head(args.model, index, args.rank)
+    contract_dflash_lm_head_share(args.model, args.draft, target_lm_head)
+    print(f"PASS shared-lm-head-rank={args.rank}-m1-m2-m4-m5-tp2-dflash")
+    if args.only_lm_head:
+        return
     contract_trellis(args.model, index, args.rank)
     print(f"PASS sparkinfer-trellis-rank={args.rank}-m1-m2-m4-m5-graph")
 
