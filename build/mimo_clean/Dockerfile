@@ -27,6 +27,12 @@ RUN --mount=type=bind,source=build/mimo_clean/artifacts,target=/mnt/artifacts,re
     uv pip install --system --no-deps \
       /mnt/artifacts/xgrammar-0.2.8-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl \
       /mnt/artifacts/nccl_extensions-0.1.0-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl; \
+    for dist in \
+      /usr/local/lib/python3.12/dist-packages/xgrammar-0.2.8.dist-info \
+      /usr/local/lib/python3.12/dist-packages/nccl_extensions-0.1.0.dist-info; do \
+      sed -i '\#/uv_cache.json,#d' "$dist/RECORD"; \
+      rm -f "$dist/uv_cache.json"; \
+    done; \
     uv pip uninstall --system \
       flashinfer-python flashinfer-jit-cache flashinfer-cubin \
       nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base \
