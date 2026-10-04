@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.7
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
+ARG SOURCE_DATE_EPOCH=1791150000
 
 ARG BASE_IMAGE
 ARG VLLM_COMMIT
@@ -54,7 +55,7 @@ RUN --mount=type=bind,source=build/mimo_clean/artifacts,target=/mnt/artifacts,re
       \( -name '*.so' -o -name 'vllm-rs' \) -print0 \
       | sort -z \
       | xargs -0 sha256sum > /opt/mimo-runner/native-files.sha256; \
-    python3 -c 'import importlib.metadata as m; assert m.version("xgrammar") == "0.2.8"; assert m.version("nccl-extensions") == "0.1.0"; from xgrammar import get_model_structural_tag; assert get_model_structural_tag(model="mimo", tools=[{"type":"function","function":{"name":"probe","parameters":{"type":"object","properties":{}}}}], tool_choice="auto", reasoning=True) is not None'; \
+    PYTHONDONTWRITEBYTECODE=1 python3 -c 'import importlib.metadata as m; assert m.version("xgrammar") == "0.2.8"; assert m.version("nccl-extensions") == "0.1.0"; from xgrammar import get_model_structural_tag; assert get_model_structural_tag(model="mimo", tools=[{"type":"function","function":{"name":"probe","parameters":{"type":"object","properties":{}}}}], tool_choice="auto", reasoning=True) is not None'; \
     uv pip freeze --system | sort > /opt/mimo-runner/python-packages.txt; \
     uv cache clean
 
