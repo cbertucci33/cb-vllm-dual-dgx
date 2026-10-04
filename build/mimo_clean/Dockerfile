@@ -23,6 +23,9 @@ RUN --mount=type=bind,source=build/mimo_clean/artifacts,target=/mnt/artifacts,re
     uv pip uninstall --system vllm; \
     uv pip install --system --no-deps \
       /mnt/artifacts/vllm-0.30.0+5ab5a277e-cp312-cp312-linux_aarch64.whl; \
+    uv pip install --system --no-deps \
+      /mnt/artifacts/xgrammar-0.2.8-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl \
+      /mnt/artifacts/nccl_extensions-0.1.0-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl; \
     uv pip uninstall --system \
       flashinfer-python flashinfer-jit-cache flashinfer-cubin \
       nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base \
@@ -51,6 +54,8 @@ RUN --mount=type=bind,source=build/mimo_clean/artifacts,target=/mnt/artifacts,re
       \( -name '*.so' -o -name 'vllm-rs' \) -print0 \
       | sort -z \
       | xargs -0 sha256sum > /opt/mimo-runner/native-files.sha256; \
+    python3 -c 'import importlib.metadata as m; assert m.version("xgrammar") == "0.2.8"; assert m.version("nccl-extensions") == "0.1.0"; from xgrammar import get_model_structural_tag; assert get_model_structural_tag(model="mimo", tools=[{"type":"function","function":{"name":"probe","parameters":{"type":"object","properties":{}}}}], tool_choice="auto", reasoning=True) is not None'; \
+    uv pip freeze --system | sort > /opt/mimo-runner/python-packages.txt; \
     uv cache clean
 
 LABEL org.opencontainers.image.revision="${VLLM_COMMIT}" \

@@ -7,6 +7,14 @@
   "exllamav3_revision": "c5d9c657966ffeeaa9353f0cc899f18629da4a13",
   "flashinfer_revision": "dc04f50c9aa3eabcdaa5feb0934edb3d85e9529a",
   "sparkinfer_revision": "d4438d490691f79022fdfc8149e1c5f161d15445",
+  "xgrammar_version": "0.2.8",
+  "xgrammar_wheel_sha256": "97732b6e5f11f21fd98a6cd9525241fc5f9d92f415329200a9adf8fc7453d8ec",
+  "nccl_extensions_version": "0.1.0",
+  "nccl_extensions_wheel_sha256": "d85e203e284b50dad3846d6fb0d35560378537689f23d92a16c67f7d854025d7",
+  "dependency_exceptions": {
+    "nvidia-nccl-cu13": "2.30.7 is the upstream vLLM v0.30.0 image override required for DeepEPv2; the live TP2 path uses this version.",
+    "nvidia-cusparselt-cu13": "0.8.1 uses the manylinux2014_sbsa wheel tag; its payload is AArch64 and matches the GB10 platform, although uv reports the sbsa tag as a platform mismatch."
+  },
   "wheel_sha256": "925191a4883d870ed546ca362b081a58aecfd91425e88859d3663360617d919c",
   "production_source_mounts": []
 }
