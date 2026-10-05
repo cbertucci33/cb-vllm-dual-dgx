@@ -9,6 +9,9 @@ import torch
 import torch.distributed as dist
 
 from vllm.platforms import current_platform
+from vllm.v1.attention.backends.triton_attn_diffkv import (
+    DIFFKV_NUM_PAR_SOFTMAX_SEGMENTS,
+)
 from vllm.v1.attention.ops.triton_unified_attention_diffkv import (
     unified_attention_diffkv,
 )
@@ -36,7 +39,7 @@ def main() -> None:
         query_len, kv_len = 4, 257
         num_query_heads, num_kv_heads = 32, 2
         head_size_qk, head_size_v, block_size = 192, 128, 16
-        num_segments = 16
+        num_segments = DIFFKV_NUM_PAR_SOFTMAX_SEGMENTS
         q_scale = torch.tensor(0.037, dtype=torch.float32, device=device)
         k_scale = torch.tensor(0.041, dtype=torch.float32, device=device)
         v_scale = torch.tensor(0.007, dtype=torch.float32, device=device)

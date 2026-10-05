@@ -91,7 +91,8 @@ NUM_BLOCKS = 2048
 # 0: 2D decode kernel; 8: 3D (split-KV) decode kernel.
 SEQ_THRESHOLD_3D_VALUES = [0, 8]
 
-NUM_PAR_SOFTMAX_SEGMENTS = 16
+# Exercise the exact DiffKV-specific geometry selected by the installed backend.
+NUM_PAR_SOFTMAX_SEGMENTS = DIFFKV_NUM_PAR_SOFTMAX_SEGMENTS
 
 
 def _alloc_segm_buffers(seq_threshold_3D: int, num_query_heads: int, head_size_v: int):
