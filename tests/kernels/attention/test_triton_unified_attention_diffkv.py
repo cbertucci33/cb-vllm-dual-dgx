@@ -29,6 +29,8 @@ from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadataBuilder,
 )
 from vllm.v1.attention.backends.triton_attn_diffkv import (
+    DIFFKV_NUM_PAR_SOFTMAX_SEGMENTS,
+    TritonAttentionDiffKVBackend,
     TritonAttentionDiffKVImpl,
     TritonAttentionDiffKVMetadataBuilder,
 )
@@ -55,6 +57,34 @@ NUM_HEADS = [(4, 4), (8, 2), (5, 1)]
 HEAD_SIZES = [(128, 128), (192, 128)]
 BLOCK_SIZES = [16]
 DTYPES = [torch.bfloat16]
+
+
+def test_diffkv_builder_uses_numerically_stable_segment_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DiffKV scratch tensors must all use the qualified eight-way split."""
+
+    def fake_parent_init(self, kv_cache_spec, layer_names, vllm_config, device):
+        self.seq_threshold_3D = 64
+        self.num_heads_q = 32
+
+    monkeypatch.setattr(TritonAttentionMetadataBuilder, "__init__", fake_parent_init)
+    monkeypatch.setattr(
+        TritonAttentionDiffKVMetadataBuilder,
+        "_init_reorder_batch_threshold",
+        lambda self, threshold, supports_spec_as_decode: None,
+    )
+    monkeypatch.setattr(TritonAttentionDiffKVBackend, "head_size_v", 128)
+
+    builder = TritonAttentionDiffKVMetadataBuilder(
+        Mock(), ["layer"], Mock(), torch.device("cpu")
+    )
+
+    assert builder.num_par_softmax_segments == DIFFKV_NUM_PAR_SOFTMAX_SEGMENTS == 8
+    expected_prefix = (64, 32, 8)
+    assert builder.softmax_segm_max.shape == expected_prefix
+    assert builder.softmax_segm_expsum.shape == expected_prefix
+    assert builder.softmax_segm_output.shape == (*expected_prefix, 128)
 
 NUM_BLOCKS = 2048
 

@@ -41,6 +41,12 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
+# MiMo's asymmetric DiffKV path is numerically sensitive to the 16-way
+# online-softmax split used by the generic Triton backend. Eight segments keep
+# split-KV parallelism while reducing the number of independently normalized
+# partials that are combined before the BF16 layer boundary.
+DIFFKV_NUM_PAR_SOFTMAX_SEGMENTS = 8
+
 
 @dataclass
 class TritonAttentionDiffKVMetadata(TritonAttentionMetadata):
@@ -67,6 +73,18 @@ class TritonAttentionDiffKVMetadataBuilder(TritonAttentionMetadataBuilder):
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+
+        self.num_par_softmax_segments = DIFFKV_NUM_PAR_SOFTMAX_SEGMENTS
+        self.softmax_segm_max = torch.empty(
+            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
+            dtype=torch.float32,
+            device=device,
+        )
+        self.softmax_segm_expsum = torch.empty(
+            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
+            dtype=torch.float32,
+            device=device,
+        )
 
         head_size_v = TritonAttentionDiffKVBackend.head_size_v
         head_size_v_padded = next_power_of_2(head_size_v)
