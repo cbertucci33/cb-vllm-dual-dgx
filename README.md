@@ -2,7 +2,7 @@
 
 This repository is a performance-focused vLLM runner geared toward two-node
 NVIDIA DGX Spark deployments. Release 8 is qualified with
-**[cbert33/MiMo-V2.6-Flash-MOPD-Heretic-Uncensored-EXL3-DGX-Sliced](https://huggingface.co/cbert33/MiMo-V2.6-Flash-MOPD-Heretic-Uncensored-EXL3-DGX-Sliced)**
+**[cbert33/MiMo-V2.6-Flash-MOPD-Heretic-Abliterated-EXL3-DGX-Sliced-Calibrated](https://huggingface.co/cbert33/MiMo-V2.6-Flash-MOPD-Heretic-Abliterated-EXL3-DGX-Sliced-Calibrated)**
 and
 **[cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced](https://huggingface.co/cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced)**.
 Development is focused on throughput, prefix-cache behavior, speculative

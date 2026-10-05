@@ -70,7 +70,7 @@ Release 7 broadens the two-node NVIDIA DGX Spark runner from the GLM-focused
 Release 6 line to a qualified MiMo V2.6 and GLM-5.3 Flash platform. The tested
 models are:
 
-- [cbert33/MiMo-V2.6-Flash-MOPD-Heretic-Uncensored-EXL3-DGX-Sliced](https://huggingface.co/cbert33/MiMo-V2.6-Flash-MOPD-Heretic-Uncensored-EXL3-DGX-Sliced)
+- [cbert33/MiMo-V2.6-Flash-MOPD-Heretic-Abliterated-EXL3-DGX-Sliced-Calibrated](https://huggingface.co/cbert33/MiMo-V2.6-Flash-MOPD-Heretic-Abliterated-EXL3-DGX-Sliced-Calibrated)
 - [cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced](https://huggingface.co/cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced)
 
 This release is focused on performance for those two models. Work continues on

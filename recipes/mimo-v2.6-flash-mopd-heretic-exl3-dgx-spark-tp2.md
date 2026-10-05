@@ -1,7 +1,7 @@
 # MiMo V2.6 Flash MOPD Heretic EXL3 on two DGX Spark systems
 
 This recipe serves
-[cbert33/MiMo-V2.6-Flash-MOPD-Heretic-Uncensored-EXL3-DGX-Sliced](https://huggingface.co/cbert33/MiMo-V2.6-Flash-MOPD-Heretic-Uncensored-EXL3-DGX-Sliced)
+[cbert33/MiMo-V2.6-Flash-MOPD-Heretic-Abliterated-EXL3-DGX-Sliced-Calibrated](https://huggingface.co/cbert33/MiMo-V2.6-Flash-MOPD-Heretic-Abliterated-EXL3-DGX-Sliced-Calibrated)
 with tensor parallelism across two NVIDIA DGX Spark systems.
 
 ## Qualified configuration
