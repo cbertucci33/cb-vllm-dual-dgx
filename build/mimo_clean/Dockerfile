@@ -23,7 +23,7 @@ RUN --mount=type=bind,source=build/mimo_clean/artifacts,target=/mnt/artifacts,re
     sha256sum -c artifact-sha256.txt; \
     uv pip uninstall --system vllm; \
     uv pip install --system --no-deps \
-      /mnt/artifacts/vllm-0.30.0+5ab5a277e-cp312-cp312-linux_aarch64.whl; \
+      /mnt/artifacts/vllm-0.30.0+239ad2b4c-cp312-cp312-linux_aarch64.whl; \
     uv pip install --system --no-deps \
       /mnt/artifacts/xgrammar-0.2.8-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl \
       /mnt/artifacts/nccl_extensions-0.1.0-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl; \

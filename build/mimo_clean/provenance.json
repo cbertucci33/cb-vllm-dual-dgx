@@ -1,8 +1,8 @@
 {
   "base_image": "vllm/vllm-openai:v0.30.0@sha256:4864d46625cbc3307623e29ac742030655e27249feba7b97ec925ce4cc4dfb56",
-  "vllm_source_revision": "5ab5a277e913dfb2fc6c359fb9452b61139923ca",
+  "vllm_source_revision": "239ad2b4c8bd53ddd6382a27fc36cfcb8b193a6d",
   "vllm_native_artifact_build_revision": "fe7a24a943262cd842481ca2b6d24c5ee0ecd340",
-  "vllm_native_source_equivalent_revision": "5ab5a277e913dfb2fc6c359fb9452b61139923ca",
+  "vllm_native_source_equivalent_revision": "239ad2b4c8bd53ddd6382a27fc36cfcb8b193a6d",
   "base_precompiled_wheel_sha256": "64308932417a986d8450c3aeca3149c33751080307596b6cf43ba37fe8ee8c96",
   "exllamav3_revision": "c5d9c657966ffeeaa9353f0cc899f18629da4a13",
   "flashinfer_revision": "dc04f50c9aa3eabcdaa5feb0934edb3d85e9529a",
@@ -15,6 +15,6 @@
     "nvidia-nccl-cu13": "2.30.7 is the upstream vLLM v0.30.0 image override required for DeepEPv2; the live TP2 path uses this version.",
     "nvidia-cusparselt-cu13": "0.8.1 uses the manylinux2014_sbsa wheel tag; its payload is AArch64 and matches the GB10 platform, although uv reports the sbsa tag as a platform mismatch."
   },
-  "wheel_sha256": "925191a4883d870ed546ca362b081a58aecfd91425e88859d3663360617d919c",
+  "wheel_sha256": "d956be30fbc08e62c264b0e785f738edd91858dd33efed85478b3dd2a29ea653",
   "production_source_mounts": []
 }
