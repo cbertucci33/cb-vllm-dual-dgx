@@ -1,7 +1,7 @@
 # cb-vllm-dual-dgx
 
 This repository is a performance-focused vLLM runner geared toward two-node
-NVIDIA DGX Spark deployments. Release 7 is qualified with
+NVIDIA DGX Spark deployments. Release 8 is qualified with
 **[cbert33/MiMo-V2.6-Flash-MOPD-Heretic-Uncensored-EXL3-DGX-Sliced](https://huggingface.co/cbert33/MiMo-V2.6-Flash-MOPD-Heretic-Uncensored-EXL3-DGX-Sliced)**
 and
 **[cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced](https://huggingface.co/cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced)**.
@@ -9,7 +9,7 @@ Development is focused on throughput, prefix-cache behavior, speculative
 acceptance, and long-context agentic workloads for these models. Performance
 tuning is ongoing, and verified results are published below as they complete.
 
-Model weights are published separately. The active line is Release 7 on vLLM
+Model weights are published separately. The active line is Release 8 on vLLM
 0.30. The vLLM 0.29 source remains available on the `release/v0.29`
 maintenance line.
 
@@ -21,20 +21,45 @@ allocation, network address, or model path.
 Other compatible EXL3 checkpoints must satisfy the rank-slicing contract
 documented below.
 
-## Release 7 highlights
+## Release 8 highlights
 
-- Added the MiMo V2.6 model, reasoning, strict tool-calling, and Omni wrapper
-  paths required by the qualified MiMo checkpoint.
-- Added a DGX Spark DFlash path for MiMo with Triton DiffKV, FP8 KV cache,
-  split-QK verification, CUDA graph capture, and probabilistic K=4 drafting.
-- Corrected EXL3 asymmetric QKV padding, rank-local expert loading, calibrated
-  KV scales, and unproposed draft-slot handling at prefill boundaries.
-- Expanded consumer Blackwell support with SM120/SM121 CUTLASS grouped GEMM,
-  recurrent-state, TopK, KDA/GDN, sparse-indexer, and hybrid-cache repairs.
-- Carried forward the qualified GLM-5.3 Flash path while adding GLM vision,
-  pipeline-parallel, MTP, tool-rendering, and fused multi-step decode updates.
-- Qualified MiMo text, reasoning, and tool use on two DGX Spark systems with
-  probabilistic DFlash K=4 and asynchronous scheduling explicitly disabled.
+- Corrected the MiMo FP8 DiffKV value dot by keeping probability and value
+  accumulation in BF16 when queries are FP8.
+- Replaced the unstable 16-way DiffKV reduction with an eight-way reduction
+  and matching scratch geometry. The serving path remains true 3D split-KV.
+- Added executable FP8 contracts for decode, prefill, whole verification,
+  ragged batches, CUDA graphs, long context, and tensor-parallel agreement.
+- Added a clean image recipe that starts from the pinned official vLLM 0.30
+  image and installs one complete, hashed runner wheel without source mounts.
+- Updated the MiMo serving recipe to match the qualified runtime. It removes
+  the unused B12X override, stale draft-head flag, and diagnostic JIT logging.
+
+## Release 8
+
+Release 8 supersedes Release 7 for MiMo serving. Release 7 used a 16-way 3D
+DiffKV reduction that passed narrow kernel checks but produced semantic
+corruption in a long agentic workload. Release 8 fixes that boundary and adds
+the missing executable coverage around the complete FP8 path.
+
+The qualified configuration retains FP8 target KV cache, probabilistic DFlash
+K=4, prefix caching, an 800K-token context limit, and explicit
+`--no-async-scheduling`. The runner matrix passed 27 of 27 contracts on both
+DGX Spark ranks. Coverage includes single-token and multi-token 3D attention,
+empty tails, ragged verification batches, mixed prefill and decode metadata,
+CUDA graph replay, tensor-parallel rank agreement, 62,287-token requests, and
+the 799,999-token context boundary.
+
+Production-facing checks also passed the original 62,287-token agentic
+request, a concurrent 62,287-token plus 26,470-token workload, and a two-turn
+tool-result continuation through the intended client route. A warm 26,470-token
+request produced 33.8 output tokens/s in the tested deployment. These results
+describe one two-node system, not a hardware limit. Broader production soak
+testing is still in progress.
+
+Release 8 qualifies text, reasoning, and structured tools. Asynchronous MiMo
+DFlash, multimodal-prefix attention, R-SWA, and audio serving are not qualified.
+Release 7 remains available for provenance but should not be used for the MiMo
+route.
 
 ## Release 7
 
@@ -173,7 +198,7 @@ source revision, rank-sliced checkpoint, DFlash checkpoint, and runtime flags.
 1. Clone the source release and download the qualified models:
 
    ```bash
-   git clone --branch release-7 --single-branch \
+   git clone --branch release-8 --single-branch \
      https://github.com/cbertucci33/cb-vllm-dual-dgx.git
    cd cb-vllm-dual-dgx
    build/download_models.sh /srv/glm53/models

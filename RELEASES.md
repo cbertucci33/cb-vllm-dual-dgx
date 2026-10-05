@@ -1,5 +1,69 @@
 # Release history
 
+## Release 8
+
+Release 8 supersedes Release 7 for MiMo serving. A long agentic workload
+exposed semantic corruption in Release 7's 16-way 3D DiffKV reduction even
+though its narrower checks passed. Release 8 repairs that execution path,
+packages it in a clean image, and adds executable coverage for the complete
+FP8 runner boundary.
+
+### DiffKV correctness repairs
+
+- Kept FP8 Q x K processing while moving the probability x value dot to BF16
+  when query scaling selects FP8 queries.
+- Replaced the DiffKV-specific 16-way softmax reduction with an eight-way
+  reduction and resized its output, maximum, and exponent-sum scratch tensors.
+  Generic Triton attention retains its existing geometry.
+- Corrected sliding-window tile-bound integer widths for the FP8 multi-row
+  prefill path.
+- Marked non-causal attention, multimodal-prefix attention, and R-SWA as
+  unsupported by the DiffKV backend instead of advertising capabilities that
+  its kernel does not implement.
+
+### Clean image and recipe
+
+- Added `build/mimo_clean`, which starts from the pinned official vLLM 0.30
+  image and installs one complete runner wheel plus hashed native dependencies.
+- Embedded source and dependency provenance, installed-file manifests, and
+  native-file manifests in the image.
+- Removed runtime source overlays, diagnostic code, test files, and source
+  mounts from the production image.
+- Updated the MiMo serving recipe to remove the unused B12X linear-backend
+  override, stale FP8 draft-head flag, B12X cache mount, and diagnostic JIT
+  logging. The recipe now matches the qualified launch contract.
+
+### Executable coverage
+
+The FP8 runner matrix passed 27 of 27 contracts on both DGX Spark ranks. The
+changed DiffKV boundary was rerun from the exact clean image with:
+
+- single-token and multi-token 3D attention;
+- empty tail segments and q2, q4, and ragged verification batches;
+- mixed prefill and decode metadata plus CUDA graph capture and replay;
+- tensor-parallel pre-collective agreement and NCCL completion;
+- 62,287-token and 799,999-token oracle comparisons.
+
+Production-facing acceptance passed the original 62,287-token agentic
+request, a concurrent 62,287-token plus 26,470-token workload, and a two-turn
+tool-result continuation through the intended client route. A warm 26,470-token
+request produced 33.8 output tokens/s in the tested deployment. Performance
+and broader production soak testing remain in progress.
+
+### Upgrade notes
+
+- Use the `release-8` tag for this source snapshot.
+- Rebuild the image with `build/mimo_clean/Dockerfile` and the exact artifact
+  hashes in `build/mimo_clean/artifact-sha256.txt`.
+- Run the same immutable image on both tensor-parallel ranks without source
+  mounts or package overlays.
+- Keep probabilistic DFlash K=4 and pass `--no-async-scheduling` explicitly.
+- Do not add `--linear-backend b12x`, `VLLM_DFLASH_FP8_DRAFT_HEAD`, or
+  `--jit-monitor-verbose` to the qualified MiMo launch.
+- Release 8 qualifies text, reasoning, and structured tools. Asynchronous MiMo
+  DFlash, multimodal-prefix attention, R-SWA, and audio serving are outside the
+  qualified scope.
+
 ## Release 7
 
 Release 7 broadens the two-node NVIDIA DGX Spark runner from the GLM-focused

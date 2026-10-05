@@ -19,15 +19,16 @@ with tensor parallelism across two NVIDIA DGX Spark systems.
 | Asynchronous scheduling | Disabled |
 | Qualified request types | Text, reasoning, and structured tools |
 
-Release 7 does not qualify asynchronous MiMo DFlash. Keep
+Release 8 does not qualify asynchronous MiMo DFlash. Keep
 `--no-async-scheduling` in the launch command. Audio and multimodal serving
 were not requalified with this configuration.
 
 ## Prepare both nodes
 
-Build the Release 7 image as described in [the build guide](../build/README.md),
-then transfer the exact image to both nodes. Download the linked model release
-and identify these two local directories:
+Build the Release 8 image with the clean image recipe in
+[`build/mimo_clean`](../build/mimo_clean), then transfer the exact image to
+both nodes. Download the linked model release and identify these two local
+directories:
 
 - the rank-sliced EXL3 target checkpoint;
 - the matching DFlash checkpoint included with the release.
@@ -42,7 +43,7 @@ current system.
 Set these variables on each node:
 
 ```bash
-export RUNNER_IMAGE='<release-7-image>'
+export RUNNER_IMAGE='<release-8-image>'
 export TARGET_MODEL='<absolute-path-to-mimo-exl3-target>'
 export DRAFT_MODEL='<absolute-path-to-mimo-dflash-checkpoint>'
 export CACHE_ROOT='<absolute-path-to-persistent-cache>'
@@ -77,14 +78,13 @@ docker run -d --name vllm-mimo-v26 \
   --device /dev/infiniband:/dev/infiniband \
   -v "$TARGET_MODEL:/models/target:ro" \
   -v "$DRAFT_MODEL:/models/dflash:ro" \
-  -v "$CACHE_ROOT:/cache" \
-  -v "$CACHE_ROOT/jit/b12x:/root/.cache/b12x" \
-  -v "$CACHE_ROOT/jit/flashinfer:/root/.cache/flashinfer" \
-  -v "$CACHE_ROOT/jit/vllm:/root/.cache/vllm" \
-  -v "$CACHE_ROOT/jit/triton:/root/.triton" \
+  -v "$CACHE_ROOT/huggingface:/root/.cache/huggingface" \
+  -v "$CACHE_ROOT/flashinfer:/root/.cache/flashinfer" \
+  -v "$CACHE_ROOT/vllm:/root/.cache/vllm" \
+  -v "$CACHE_ROOT/triton:/root/.triton" \
   -e FLASHINFER_DISABLE_VERSION_CHECK=1 \
-  -e FLASHINFER_WORKSPACE_BASE=/cache/jit/flashinfer \
-  -e HF_HOME=/cache/huggingface \
+  -e FLASHINFER_WORKSPACE_BASE=/root/.cache/flashinfer \
+  -e HF_HOME=/root/.cache/huggingface \
   -e NCCL_CROSS_NIC=0 \
   -e NCCL_CUMEM_ENABLE=0 \
   -e NCCL_DEBUG=WARN \
@@ -105,7 +105,6 @@ docker run -d --name vllm-mimo-v26 \
   -e TP_SOCKET_IFNAME="$FABRIC_IFACE" \
   -e MN_IF_NAME="$FABRIC_IFACE" \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-  -e VLLM_DFLASH_FP8_DRAFT_HEAD=1 \
   -e VLLM_ENGINE_READY_TIMEOUT_S=3600 \
   -e VLLM_EXL3_EXT_PATH=/usr/local/lib/python3.12/dist-packages \
   -e VLLM_HOST_IP="$HOST_IP" \
@@ -127,14 +126,12 @@ docker run -d --name vllm-mimo-v26 \
   --speculative-config '{"model":"/models/dflash","method":"dflash","num_speculative_tokens":4,"draft_tensor_parallel_size":2,"kv_cache_dtype":"bfloat16","draft_sample_method":"probabilistic"}' \
   --kv-cache-dtype fp8_e4m3 \
   --attention-backend TRITON_ATTN_DIFFKV \
-  --linear-backend b12x \
   --kv-cache-memory-bytes 7100000000 \
   --skip-mm-profiling \
   --tool-call-parser mimo \
   --enable-auto-tool-choice \
   --reasoning-parser mimo \
   --default-chat-template-kwargs '{"enable_thinking":true}' \
-  --jit-monitor-verbose \
   --no-async-scheduling \
   --distributed-executor-backend mp \
   --nnodes 2 \
@@ -154,5 +151,6 @@ docker run -d --name vllm-mimo-v26 \
    request through the intended client route.
 6. Check DFlash acceptance by draft position under the intended workload.
 
-The Release 7 qualification observed 27.3 percent overall draft-token
-acceptance. Acceptance by position was 61.1, 27.7, 13.2, and 7.2 percent.
+The Release 8 qualification covers the complete FP8 runner matrix, the original
+62,287-token agentic request, concurrent long requests, and a tool-result
+continuation. Broader production soak testing remains in progress.
