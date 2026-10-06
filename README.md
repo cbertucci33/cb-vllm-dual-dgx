@@ -1,7 +1,7 @@
 # cb-vllm-dual-dgx
 
 This repository is a performance-focused vLLM runner geared toward two-node
-NVIDIA DGX Spark deployments. Release 8 is qualified with
+NVIDIA DGX Spark deployments. Release 8 includes support for
 **[cbert33/MiMo-V2.6-Flash-MOPD-Heretic-Abliterated-EXL3-DGX-Sliced-Calibrated](https://huggingface.co/cbert33/MiMo-V2.6-Flash-MOPD-Heretic-Abliterated-EXL3-DGX-Sliced-Calibrated)**
 and
 **[cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced](https://huggingface.co/cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced)**.
@@ -21,6 +21,47 @@ allocation, network address, or model path.
 Other compatible EXL3 checkpoints must satisfy the rank-slicing contract
 documented below.
 
+## Current status and GLM production observations
+
+The GLM figures below cover one uninterrupted 8-hour, 42-minute lifecycle on
+2026-10-05 using a two-node DGX Spark deployment. They come from organic
+OpenAI-compatible traffic, not a controlled benchmark. Prompt length, output
+length, cache warmth, and reasoning depth varied.
+
+| Measurement | Result |
+| --- | ---: |
+| Completed engine requests | 354 of 354 |
+| Errors, aborts, length stops, repetition stops, or preemptions | 0 |
+| Prompt tokens | 28,282,386 |
+| Mean prompt length | 79,894 tokens |
+| Cached prompt tokens | 26,243,072 |
+| Prefix-cache reuse | 92.8% |
+| Newly computed prompt tokens | 2,039,314 |
+| Generated tokens | 150,943 |
+| Mean time to first token | 3.87 s |
+| Estimated median time to first token | 2.2 s |
+| Estimated P90 time to first token | 4.7 s |
+| Mean time per output token | 28.25 ms |
+| Per-request generation rate equivalent | 35.4 tokens/s |
+| Mean end-to-end request time | 18.02 s |
+| Estimated median end-to-end request time | 6.9 s |
+| Estimated P90 end-to-end request time | 37.6 s |
+| Mean queue time | 0.023 ms |
+| Overall DFlash2 draft-token acceptance | 32.2% |
+| Effective verification span | 3.26 tokens |
+
+The percentile estimates use the exported Prometheus histogram buckets. Four
+requests generated between 10,000 and 20,000 tokens; the same four requests
+account for the 240 to 480 second end-to-end tail. Both ranks completed the
+measurement window without a restart or out-of-memory event.
+
+Later progressive MiMo testing found that the Release 8 eight-way 3D DiffKV
+path can lose semantic coherence near 83K input tokens. The Release 8 MiMo
+qualification claim is withdrawn while that numerical boundary remains
+unresolved. The Release 8 source and results remain below for provenance. The
+GLM measurements above use the separate GLM serving path and are unaffected by
+that finding.
+
 ## Release 8 highlights
 
 - Corrected the MiMo FP8 DiffKV value dot by keeping probability and value
@@ -36,18 +77,19 @@ documented below.
 
 ## Release 8
 
-Release 8 supersedes Release 7 for MiMo serving. Release 7 used a 16-way 3D
-DiffKV reduction that passed narrow kernel checks but produced semantic
-corruption in a long agentic workload. Release 8 fixes that boundary and adds
-the missing executable coverage around the complete FP8 path.
+Release 8 superseded Release 7 in the original MiMo qualification. Release 7
+used a 16-way 3D DiffKV reduction that passed narrow kernel checks but produced
+semantic corruption in a long agentic workload. Release 8 replaced that
+reduction and added executable coverage around the complete FP8 path. The
+current status correction above supersedes the original qualification claim.
 
-The qualified configuration retains FP8 target KV cache, probabilistic DFlash
-K=4, prefix caching, an 800K-token context limit, and explicit
-`--no-async-scheduling`. The runner matrix passed 27 of 27 contracts on both
-DGX Spark ranks. Coverage includes single-token and multi-token 3D attention,
-empty tails, ragged verification batches, mixed prefill and decode metadata,
-CUDA graph replay, tensor-parallel rank agreement, 62,287-token requests, and
-the 799,999-token context boundary.
+The original qualification configuration retained FP8 target KV cache,
+probabilistic DFlash K=4, prefix caching, an 800K-token context limit, and
+explicit `--no-async-scheduling`. The runner matrix passed 27 of 27 contracts
+on both DGX Spark ranks. Coverage included single-token and multi-token 3D
+attention, empty tails, ragged verification batches, mixed prefill and decode
+metadata, CUDA graph replay, tensor-parallel rank agreement, 62,287-token
+requests, and the 799,999-token context boundary.
 
 Production-facing checks also passed the original 62,287-token agentic
 request, a concurrent 62,287-token plus 26,470-token workload, and a two-turn
@@ -56,10 +98,11 @@ request produced 33.8 output tokens/s in the tested deployment. These results
 describe one two-node system, not a hardware limit. Broader production soak
 testing is still in progress.
 
-Release 8 qualifies text, reasoning, and structured tools. Asynchronous MiMo
-DFlash, multimodal-prefix attention, R-SWA, and audio serving are not qualified.
-Release 7 remains available for provenance but should not be used for the MiMo
-route.
+The original Release 8 qualification covered text, reasoning, and structured
+tools. Asynchronous MiMo DFlash, multimodal-prefix attention, R-SWA, and audio
+serving were outside that scope. Later progressive testing withdrew the MiMo
+qualification as described above. Release 7 remains available for provenance
+but should not be used for the MiMo route.
 
 ## Release 7
 
