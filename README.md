@@ -6,6 +6,8 @@ on two-node NVIDIA DGX Spark deployments using vLLM 0.30. An upcoming release
 will provide better MiMo support. Performance tuning remains active; the
 verified GLM results and their scope are recorded below.
 
+*note that we are working on release 10 that will move everything to the vLLM .31 base and update many libraries*
+
 Model weights are published separately. The stable GLM source is tag
 `release-9` on the `release/v0.30` maintenance line. Experimental MiMo work
 remains on `main`; Releases 7 and 8 retain the earlier
