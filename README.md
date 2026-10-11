@@ -1,25 +1,83 @@
 # cb-vllm-dual-dgx
 
-This repository is a performance-focused vLLM runner geared toward two-node
-NVIDIA DGX Spark deployments. Release 8 includes support for
+Release 9 focuses on stability and performance for
+**[cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced](https://huggingface.co/cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced)**
+on two-node NVIDIA DGX Spark deployments using vLLM 0.30. An upcoming release
+will provide better MiMo support. Performance tuning remains active; the
+verified GLM results and their scope are recorded below.
+
+Model weights are published separately. The stable GLM source is tag
+`release-9` on the `release/v0.30` maintenance line. Experimental MiMo work
+remains on `main`; Releases 7 and 8 retain the earlier
 **[cbert33/MiMo-V2.6-Flash-MOPD-Heretic-Abliterated-EXL3-DGX-Sliced-Calibrated](https://huggingface.co/cbert33/MiMo-V2.6-Flash-MOPD-Heretic-Abliterated-EXL3-DGX-Sliced-Calibrated)**
-and
-**[cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced](https://huggingface.co/cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced)**.
-Development is focused on throughput, prefix-cache behavior, speculative
-acceptance, and long-context agentic workloads for these models. Performance
-tuning is ongoing, and verified results are published below as they complete.
+integration and the qualification caveat below. The vLLM 0.29 source remains
+available on `release/v0.29`.
 
-Model weights are published separately. The active line is Release 8 on vLLM
-0.30. The vLLM 0.29 source remains available on the `release/v0.29`
-maintenance line.
+The GLM runner retains chat, reasoning, tools, image input, hybrid KDA, native
+sparse MLA on GB10, EXL3 tensor parallelism and DFlash2. It does not hard-code a
+context length, concurrency limit, KV-cache allocation, network address or
+model path. Other compatible EXL3 checkpoints must satisfy the rank-slicing
+contract documented below.
 
-The runner supports MiMo and GLM chat, reasoning, tools, multimodal model
-paths, hybrid KDA, native sparse MLA on GB10, EXL3 tensor parallelism, and
-DFlash2. It does not hard-code a context length, concurrency limit, KV-cache
-allocation, network address, or model path.
+## Release 9
 
-Other compatible EXL3 checkpoints must satisfy the rank-slicing contract
-documented below.
+Release 9 focuses on stability and performance for GLM-5.3 Flash on vLLM
+0.30. It publishes the accepted GLM maintenance line as `release/v0.30`.
+An upcoming release will provide better MiMo support. The experimental MiMo
+integration remains on `main` and in earlier release tags; this release does
+not renew its withdrawn qualification.
+
+### Loading and cleanup repairs
+
+- Stream DFlash checkpoint tensors instead of retaining the complete source
+  iterator in a dictionary during weight loading.
+- Close the parameter source iterator in `finally`, including closure through
+  iterator wrappers when parameter loading raises.
+- Continue InstantTensor cleanup when stream synchronization fails. Preserve
+  the original error while attempting the remaining releases.
+- Release independent native resources even when an earlier CUDA cleanup
+  operation fails, retire the reader registry entry, and retain the shared RPC
+  response owner for its required lifetime.
+- Build and package cleanup-patched InstantTensor 0.2.0 build 1 from a pinned,
+  hash-verified source archive. Artifact finalization requires the patched
+  wheel.
+- Add CPU fault-injection coverage for iterator closure, native cleanup and
+  RPC response ownership, plus a DFlash streaming regression.
+
+### GLM regression results
+
+The accepted two-node DGX Spark deployment passed text, streamed Responses,
+single and parallel tool calls, tool-result continuation, actual image input,
+and an end-to-end client tool loop with cached continuation. DFlash remained
+active. Neither rank restarted, and neither recorded a CUDA allocation warning
+or OOM during the test window.
+
+| Larger-prefix regression | Result |
+| --- | ---: |
+| Input tokens | 65,580 |
+| Warm cached tokens | 59,904 |
+| Cold request time | 41.35 s |
+| Warm request time | 3.43 s |
+
+The cache-hit metric independently matched the warm cached-token count.
+Cache capacity, allocation budget, cache geometry and logged model-loading
+memory were unchanged from the same-deployment GLM baseline. Other free-memory
+counters varied; exact peak-memory equality was not established.
+
+These are bounded regression observations from one deployment, not a
+throughput benchmark or hardware limit. Performance tuning and broader soak
+testing remain in progress. This release does not establish a historical OOM
+root cause, requalify every context length, or qualify MiMo serving.
+
+### Upgrade notes
+
+- Clone tag `release-9` for this GLM source snapshot.
+- Follow `build/README.md` and rebuild with the patched InstantTensor wheel.
+  A source-only update leaves the native cleanup repair unapplied.
+- Run the same rebuilt immutable image on both tensor-parallel ranks.
+- Preserve your model, context, cache, sampling and network settings. The
+  repairs do not require a lower cache budget or disabled serving features.
+- Use the model-facing GLM options in the README and the GLM recipe.
 
 ## Current status and GLM production observations
 
@@ -187,11 +245,12 @@ they are not presented as Release 7 MiMo results.
 
 ## Model recipes
 
-- [MiMo V2.6 Flash MOPD Heretic EXL3 on two DGX Spark systems](recipes/mimo-v2.6-flash-mopd-heretic-exl3-dgx-spark-tp2.md)
-- [GLM-5.3 Flash Uncensored EXL3 on two DGX Spark systems](recipes/glm-5.3-flash-uncensored-exl3-dgx-spark-tp2.md)
+- [Historical MiMo V2.6 Flash MOPD Heretic EXL3 recipe (Release 8)](https://github.com/cbertucci33/cb-vllm-dual-dgx/blob/release-8/recipes/mimo-v2.6-flash-mopd-heretic-exl3-dgx-spark-tp2.md)
+- [GLM-5.3 Flash Uncensored EXL3 on two DGX Spark systems](https://github.com/cbertucci33/cb-vllm-dual-dgx/blob/release-9/recipes/glm-5.3-flash-uncensored-exl3-dgx-spark-tp2.md)
 
-Both recipes include the tested model settings, DFlash configuration, network
-placeholders, rank start order, and post-launch checks.
+The GLM recipe includes tested model settings, DFlash configuration, network
+placeholders, rank start order, and post-launch checks. The historical MiMo
+recipe is retained for provenance; its qualification caveat above still applies.
 
 ## Release 6
 
@@ -241,7 +300,7 @@ source revision, rank-sliced checkpoint, DFlash checkpoint, and runtime flags.
 1. Clone the source release and download the qualified models:
 
    ```bash
-   git clone --branch release-8 --single-branch \
+   git clone --branch release-9 --single-branch \
      https://github.com/cbertucci33/cb-vllm-dual-dgx.git
    cd cb-vllm-dual-dgx
    build/download_models.sh /srv/glm53/models
@@ -522,18 +581,20 @@ remain on the `release/v0.29` maintenance line.
 
 | Component | Pinned input |
 | --- | --- |
-| vLLM source | `0.29.0`, commit `98dff2a81d747d1dba01a47f939f48c3526d4206` |
-| vLLM runtime image | `vllm/vllm-openai:v0.29.0@sha256:c2914767605584b6d8f45686b82de173ecc99e781897aa3d0a66dacd72c51ae1` |
+| vLLM source | `0.30.0`, with the downstream GLM source pinned by tag `release-9` |
+| vLLM runtime image | `vllm/vllm-openai:v0.30.0@sha256:4864d46625cbc3307623e29ac742030655e27249feba7b97ec925ce4cc4dfb56` |
 | CUDA build image | `nvidia/cuda:13.0.2-devel-ubuntu24.04@sha256:5dc1bca23d05bd37b011be68ec470c03b403a5da07ec3a86e41af9470e9d0cc6` |
-| vLLM CUTLASS source | `da5e086dab31d63815acafdac9a9c5893b1c69e2` |
-| FlashInfer | `0.6.18`, commit `5cc867a9bb560bc89b91dbc738a9f63f09beb89b` |
+| vLLM CUTLASS source | `cb4247394dd82148787aed73e5dc7cef33cbf862` |
+| FlashInfer | `0.7.0`, commit `dc04f50c9aa3eabcdaa5feb0934edb3d85e9529a` |
 | FlashInfer CCCL | `16bd510c9b712e82b0ab6cbb630d8e29ba1f7116` |
 | FlashInfer CUTLASS | `b46b16d003484063bca4ed365e44095c4c6ed633` |
 | FlashInfer spdlog | `c3aed4b68373955e1cc94307683d44dca1515d2b` |
 | Sparkinfer (now `local-inference-lab/b12x`) | [`d4438d490691f79022fdfc8149e1c5f161d15445`](https://github.com/local-inference-lab/b12x/commit/d4438d490691f79022fdfc8149e1c5f161d15445) |
 | ExLlamaV3 | `c5d9c657966ffeeaa9353f0cc899f18629da4a13`, format `0.0.43` |
-| B12X dense-kernel package (`local-inference-lab/b12x`) | `1.2.6`, commit `ab6eea89b5b5e334ac6e9f2c503c1de60c3f216c` |
-| NVIDIA CUTLASS DSL | `4.7.0` |
+| B12X dense-kernel package (`local-inference-lab/b12x`) | `1.3.0`, commit `00b69ac22e21413622c4ecd98f607a2c3e015161` |
+| NVIDIA CUTLASS DSL | `4.7.1` |
+| InstantTensor | `0.2.0`, cleanup-patched build `1` from a hash-verified source archive |
+| FlashKDA | commit `17a037d98da546deb4591e967cf961a43c034d8b` |
 | GLM chat template | Z.ai revision `690b705278a3a58e538fcb37c2ca8b5f9511213c` |
 | Qualified target model | [`cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced`](https://huggingface.co/cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced), revision `43fe4b2aba293c2df3b413f63d926aa1a0725d26` |
 | DFlash2 model | [`local-inference-lab/GLM-5.3-Flash-DFlash2`](https://huggingface.co/local-inference-lab/GLM-5.3-Flash-DFlash2), revision `713226ab03bc38afdf955c7450436c2f7176f6f8` |

@@ -1,5 +1,65 @@
 # Release history
 
+## Release 9
+
+Release 9 focuses on stability and performance for GLM-5.3 Flash on vLLM
+0.30. It publishes the accepted GLM maintenance line as `release/v0.30`.
+An upcoming release will provide better MiMo support. The experimental MiMo
+integration remains on `main` and in earlier release tags; this release does
+not renew its withdrawn qualification.
+
+### Loading and cleanup repairs
+
+- Stream DFlash checkpoint tensors instead of retaining the complete source
+  iterator in a dictionary during weight loading.
+- Close the parameter source iterator in `finally`, including closure through
+  iterator wrappers when parameter loading raises.
+- Continue InstantTensor cleanup when stream synchronization fails. Preserve
+  the original error while attempting the remaining releases.
+- Release independent native resources even when an earlier CUDA cleanup
+  operation fails, retire the reader registry entry, and retain the shared RPC
+  response owner for its required lifetime.
+- Build and package cleanup-patched InstantTensor 0.2.0 build 1 from a pinned,
+  hash-verified source archive. Artifact finalization requires the patched
+  wheel.
+- Add CPU fault-injection coverage for iterator closure, native cleanup and
+  RPC response ownership, plus a DFlash streaming regression.
+
+### GLM regression results
+
+The accepted two-node DGX Spark deployment passed text, streamed Responses,
+single and parallel tool calls, tool-result continuation, actual image input,
+and an end-to-end client tool loop with cached continuation. DFlash remained
+active. Neither rank restarted, and neither recorded a CUDA allocation warning
+or OOM during the test window.
+
+| Larger-prefix regression | Result |
+| --- | ---: |
+| Input tokens | 65,580 |
+| Warm cached tokens | 59,904 |
+| Cold request time | 41.35 s |
+| Warm request time | 3.43 s |
+
+The cache-hit metric independently matched the warm cached-token count.
+Cache capacity, allocation budget, cache geometry and logged model-loading
+memory were unchanged from the same-deployment GLM baseline. Other free-memory
+counters varied; exact peak-memory equality was not established.
+
+These are bounded regression observations from one deployment, not a
+throughput benchmark or hardware limit. Performance tuning and broader soak
+testing remain in progress. This release does not establish a historical OOM
+root cause, requalify every context length, or qualify MiMo serving.
+
+### Upgrade notes
+
+- Clone tag `release-9` for this GLM source snapshot.
+- Follow `build/README.md` and rebuild with the patched InstantTensor wheel.
+  A source-only update leaves the native cleanup repair unapplied.
+- Run the same rebuilt immutable image on both tensor-parallel ranks.
+- Preserve your model, context, cache, sampling and network settings. The
+  repairs do not require a lower cache budget or disabled serving features.
+- Use the model-facing GLM options in the README and the GLM recipe.
+
 ## Release 8
 
 Release 8 supersedes Release 7 for MiMo serving. A long agentic workload
