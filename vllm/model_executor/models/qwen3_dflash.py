@@ -847,49 +847,38 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             result = result.squeeze(0)
         return result
 
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> set[str]:
-        model_weights = {}
-        includes_draft_id_mapping = False
-        includes_embed_tokens = False
-        for name, loaded_weight in weights:
-            assert "mask_hidden" not in name, (
-                "DFlash embeds masked slots via mask_token_id (optionally "
-                "overridden by a mask_embedding.pt file); it should not ship a "
-                "mask_hidden weight."
-            )
-            if "t2d" in name:
-                continue
-            if "d2t" in name:
-                name = name.replace("d2t", "draft_id_to_target_id")
-                includes_draft_id_mapping = True
-            elif "lm_head" not in name:
-                name = "model." + name
-            if "embed_tokens" in name:
-                includes_embed_tokens = True
-            model_weights[name] = loaded_weight
-            process_eagle_weight(self, name)
-
-        # Route the separately-trained mask embedding (if shipped) through the
-        # standard weight loader alongside the rest of the draft weights.
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         mask_embedding = self._read_mask_embedding()
         if mask_embedding is not None:
-            model_weights["model.mask_embedding"] = mask_embedding
             self.model.has_separate_mask_embedding = True
 
-        orig_to_new_substr = {}
-        if not includes_draft_id_mapping:
-            orig_to_new_substr["draft_id_to_target_id"] = None
-        if not includes_embed_tokens:
-            orig_to_new_substr["embed_tokens"] = None
+        def iter_model_weights():
+            for name, loaded_weight in weights:
+                assert "mask_hidden" not in name, (
+                    "DFlash embeds masked slots via mask_token_id (optionally "
+                    "overridden by a mask_embedding.pt file); it should not ship a "
+                    "mask_hidden weight."
+                )
+                if "t2d" in name:
+                    continue
+                if "d2t" in name:
+                    name = name.replace("d2t", "draft_id_to_target_id")
+                elif "lm_head" not in name:
+                    name = "model." + name
+                process_eagle_weight(self, name)
+                yield name, loaded_weight
+            if mask_embedding is not None:
+                yield "model.mask_embedding", mask_embedding
+
+        orig_to_new_substr: dict[str, None] = {}
         if not self.model.use_aux_hidden_state:
             orig_to_new_substr["fc."] = None
         if not self.model.has_separate_mask_embedding:
             orig_to_new_substr["mask_embedding"] = None
         mapper = WeightsMapper(orig_to_new_substr=orig_to_new_substr)
         loader = AutoWeightsLoader(self)
-        loaded = loader.load_weights(model_weights.items(), mapper=mapper)
+        loaded = loader.load_weights(iter_model_weights(), mapper=mapper)
+        mask_embedding = None
         self.model._build_fused_kv_buffers()
         if not self.model.has_separate_mask_embedding:
             # This zero buffer is intentionally unused without an override.

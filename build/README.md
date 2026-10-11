@@ -81,7 +81,7 @@ docker build \
   -f build/Dockerfile.builder \
   --build-arg BASE_IMAGE="$VLLM_BASE_IMAGE" \
   --build-arg CUDA_DEVEL_IMAGE="$CUDA_DEVEL_IMAGE" \
-  -t glm53-runner-builder:internal-v3.1 .
+  -t cb-vllm-builder:release-9 .
 ```
 
 Use the builder for all Python and CUDA artifacts:
@@ -96,7 +96,7 @@ run_builder() {
     -v "$repo:/repo:ro" \
     -v "$work:/work" \
     -w /repo \
-    glm53-runner-builder:internal-v3.1 -lc "$1"
+    cb-vllm-builder:release-9 -lc "$1"
 }
 
 run_builder 'build/download_build_deps.sh /work/build-deps'
@@ -128,6 +128,11 @@ Each script verifies its source revision or input manifest. The FlashInfer
 wheel is built from the pinned checkout instead of relying on an unpublished
 binary.
 
+The wheel build includes cleanup-patched InstantTensor 0.2.0 build 1. The
+finalization step rejects artifacts without that wheel. Build the native
+repair as well as the Python source; replacing source files alone does not
+apply the full Release 9 cleanup fix.
+
 ## Build the runner image
 
 Create the minimal Docker context and build the final image:
@@ -154,7 +159,7 @@ docker build \
   --build-arg FLASHKDA_COMMIT="$FLASHKDA_COMMIT" \
   --build-arg RUNNER_VERSION="$RUNNER_VERSION" \
   --build-arg RUNNER_SOURCE_URL="$RUNNER_SOURCE_URL" \
-  -t glm53-flash-exl3:internal-v3.1 \
+  -t cb-vllm-dual-dgx:release-9 \
   /srv/glm53/build/image-context
 ```
 

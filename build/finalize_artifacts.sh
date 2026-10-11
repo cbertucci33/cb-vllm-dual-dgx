@@ -23,6 +23,14 @@ if [[ ${#flashkda_extensions[@]} -ne 1 ]]; then
   exit 1
 fi
 
+mapfile -t instanttensor_wheels < <(
+  find "$artifact_dir" -maxdepth 1 -type f -name 'instanttensor-0.2.0-1-*.whl'
+)
+if [[ ${#instanttensor_wheels[@]} -ne 1 ]]; then
+  echo "expected one cleanup-patched InstantTensor wheel" >&2
+  exit 1
+fi
+
 shopt -s nullglob
 wheels=("$artifact_dir"/*.whl)
 if [[ ${#wheels[@]} -lt 4 ]]; then

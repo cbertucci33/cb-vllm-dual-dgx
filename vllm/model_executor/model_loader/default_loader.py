@@ -19,6 +19,7 @@ from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.ep_weight_filter import (
     compute_local_expert_ids,
 )
+from vllm.model_executor.model_loader.iterator_utils import closing_weights_iterator
 from vllm.model_executor.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
@@ -315,8 +316,14 @@ class DefaultModelLoader(BaseModelLoader):
 
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()
+
         # Apply the prefix.
-        return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+        def prefixed_weights():
+            with closing_weights_iterator(weights_iterator):
+                for name, tensor in weights_iterator:
+                    yield source.prefix + name, tensor
+
+        return prefixed_weights()
 
     def get_all_weights(
         self,
@@ -424,7 +431,10 @@ class DefaultModelLoader(BaseModelLoader):
 
         self._init_ep_weight_filter(model_config)
 
-        loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
+        with closing_weights_iterator(
+            self.get_all_weights(model_config, model)
+        ) as weights:
+            loaded_weights = model.load_weights(weights)
 
         self.counter_after_loading_weights = time.perf_counter()
         logger.info_once(

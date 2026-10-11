@@ -57,5 +57,8 @@ cp "$build_deps_dir"/nvidia_cutlass_dsl_libs_*.whl "$output_dir/"
 "$python_bin" -m pip wheel --no-deps --no-build-isolation \
   --wheel-dir "$output_dir" "$work_dir/b12x"
 
+"$python_bin" "$script_dir/build_instanttensor.py" --version 0.2.0 \
+  --work-dir "$work_dir/instanttensor-build" --wheel-dir "$output_dir"
+
 cp "$flashinfer_wheel" \
   "$output_dir/flashinfer_python-${FLASHINFER_VERSION}-py3-none-any.whl"

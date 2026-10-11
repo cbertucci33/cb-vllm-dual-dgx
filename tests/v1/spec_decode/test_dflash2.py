@@ -533,3 +533,101 @@ def test_dflash2_model_decoder_layer_cls(monkeypatch):
     # 4. Assert that the layers are DFlash2Qwen3DecoderLayer (the subclass)
     assert len(model.layers) == 2
     assert isinstance(model.layers[0], DFlash2Qwen3DecoderLayer)
+
+
+@pytest.mark.parametrize("with_mask", [False, True])
+@pytest.mark.parametrize("use_aux", [False, True])
+@pytest.mark.parametrize("own_weights", [False, True])
+def test_dflash_load_weights_releases_consumed_inputs(with_mask, use_aux, own_weights):
+    """Stream inputs without retaining the checkpoint through fused-buffer setup."""
+    import gc
+    import weakref
+
+    from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
+
+    draft = torch.nn.Module()
+    draft.supports_eagle = True
+    draft.has_own_lm_head = False
+    draft.has_own_embed_tokens = False
+    draft.model = torch.nn.Module()
+    draft.model.use_aux_hidden_state = use_aux
+    draft.model.has_separate_mask_embedding = False
+    draft.model.fc = torch.nn.Linear(2, 2, bias=False)
+    draft.model.embed_tokens = torch.nn.Embedding(2, 2)
+    draft.lm_head = torch.nn.Linear(2, 2, bias=False)
+    draft.register_parameter(
+        "draft_id_to_target_id", torch.nn.Parameter(torch.zeros(2), requires_grad=False)
+    )
+    draft.model.register_parameter(
+        "mask_embedding", torch.nn.Parameter(torch.zeros(2), requires_grad=False)
+    )
+    for index in range(8):
+        draft.model.register_parameter(
+            f"weight{index}", torch.nn.Parameter(torch.zeros(2), requires_grad=False)
+        )
+
+    embed_before = draft.model.embed_tokens.weight.detach().clone()
+    head_before = draft.lm_head.weight.detach().clone()
+    refs = []
+    weight_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+    early_release = []
+
+    def weights():
+        specs: list[tuple[str, tuple[int, ...], int]] = [
+            (f"weight{i}", (2,), i + 1) for i in range(8)
+        ]
+        specs += [
+            ("fc.weight", (2, 2), 9),
+            ("embed_tokens.weight", (2, 2), 10),
+            ("lm_head.weight", (2, 2), 11),
+            ("d2t", (2,), 12),
+            ("t2d", (2,), 13),
+        ]
+        for name, shape, value in specs:
+            if not own_weights and name in {"embed_tokens.weight", "lm_head.weight"}:
+                continue
+            if name == "weight7":
+                gc.collect()
+                early_release.append(weight_refs[0]() is None)
+            tensor = torch.full(shape, float(value))
+            refs.append(weakref.ref(tensor))
+            weight_refs.append(weakref.ref(tensor))
+            yield name, tensor
+            del tensor
+
+    def read_mask():
+        if not with_mask:
+            return None
+        tensor = torch.full((2,), 14.0)
+        refs.append(weakref.ref(tensor))
+        return tensor
+
+    def build_fused():
+        gc.collect()
+        assert early_release == [True], "loader accumulated the checkpoint"
+        assert all(ref() is None for ref in refs), "inputs retained at fused setup"
+        for index in range(8):
+            torch.testing.assert_close(
+                getattr(draft.model, f"weight{index}"), torch.full((2,), index + 1.0)
+            )
+        if use_aux:
+            torch.testing.assert_close(draft.model.fc.weight, torch.full((2, 2), 9.0))
+        torch.testing.assert_close(
+            draft.model.embed_tokens.weight,
+            torch.full((2, 2), 10.0) if own_weights else embed_before,
+        )
+        torch.testing.assert_close(
+            draft.lm_head.weight,
+            torch.full((2, 2), 11.0) if own_weights else head_before,
+        )
+        torch.testing.assert_close(draft.draft_id_to_target_id, torch.full((2,), 12.0))
+        torch.testing.assert_close(
+            draft.model.mask_embedding, torch.full((2,), 14.0 if with_mask else 0.0)
+        )
+        assert draft.has_own_lm_head == own_weights
+        assert draft.has_own_embed_tokens == own_weights
+        assert draft.model.has_separate_mask_embedding == with_mask
+
+    draft._read_mask_embedding = read_mask
+    draft.model._build_fused_kv_buffers = build_fused
+    DFlashQwen3ForCausalLM.load_weights(draft, weights())
