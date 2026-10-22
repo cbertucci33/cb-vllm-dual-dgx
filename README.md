@@ -2,13 +2,13 @@
 
 *Note that we've been working on Release 10 - first we ported to vLLM .31, then .32, but we just haven't been happy with the quality. It's currently available on the dev branch, but it's just not a marked improvement yet. So we're still working on it until I feel good about the next update.*
 
+----
+
 Release 9 focuses on stability and performance for
 **[cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced](https://huggingface.co/cbert33/GLM-5.3-Flash-Uncensored-EXL3-DGX-Sliced)**
 on two-node NVIDIA DGX Spark deployments using vLLM 0.30. An upcoming release
 will provide better MiMo support. Performance tuning remains active; the
 verified GLM results and their scope are recorded below.
-
-*note that we are working on release 10 that will move everything to the vLLM .31 base and update many libraries*
 
 Model weights are published separately. The stable GLM source is tag
 `release-9` on the `release/v0.30` maintenance line. Experimental MiMo work
