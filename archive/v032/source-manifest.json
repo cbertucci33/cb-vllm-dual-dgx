@@ -173542,5 +173542,227 @@
     "file": "archive/v032/reproducers/glm-async-grammar-parser-20261021/prepare_parser_probe.py",
     "source_sha256": "c27cbae97b7e6a6326eca3f95324dad198291b111a4fd932cf80d12b7c61de19",
     "archived_sha256": "569beaa8e6078dbf30cbf1774985052e63747fbbab4b9f920afc69c82f74eb75"
+  },
+  {
+    "source_group": "node1",
+    "file": "archive/v032/reproducers/node1/launch-mimo-repaired-20261021.sh",
+    "source_sha256": "081748e261a1db94bebb314a06134d58743602b319b28c1c9344175f945fbe4b",
+    "archived_sha256": "b8291d332e66b3ad218770a40921b8a4c3a1244c973b8aad99e34654277bb660"
+  },
+  {
+    "source_group": "node1",
+    "file": "archive/v032/reproducers/node1/launch-mimo-9gb.sh",
+    "source_sha256": "d4221e13a04737beb3603c21f6fa6d2fbd8ecd8e0b3cea045beb0c12d1807506",
+    "archived_sha256": "f509db95f7902e19645866e031d8b4c3d8c614815e39f20db2878a417cae0b33"
+  },
+  {
+    "source_group": "node1",
+    "file": "archive/v032/reproducers/node1/evidence/recorder-glm32-cutover-20261021/launch-glm-v032-candidate.sh",
+    "source_sha256": "050193b2d46814711b1cf0461e814ca3ae49174f9c9375d250584852b8ef1235",
+    "archived_sha256": "3059db0ae563745b39cc556197cbb4582839332754896ffd800a2c74d3a7127d"
+  },
+  {
+    "source_group": "node1",
+    "file": "archive/v032/reproducers/node1/evidence/recorder-glm32-cutover-20261021/glm-v032-definition-gate.py",
+    "source_sha256": "d3f1a5783e8baa017139b435b926e7b496f9f72181c60eb8cd9fea3dd7785a90",
+    "archived_sha256": "d3f1a5783e8baa017139b435b926e7b496f9f72181c60eb8cd9fea3dd7785a90"
+  },
+  {
+    "source_group": "node1",
+    "file": "archive/v032/reproducers/node1/evidence/glm32-functional-regressions-20261021/diagnostic_model_runner.py",
+    "source_sha256": "93762bd32d34199bfd98bf6947915c32a79180e2b025feb0904c5f422d3636f3",
+    "archived_sha256": "93762bd32d34199bfd98bf6947915c32a79180e2b025feb0904c5f422d3636f3"
+  },
+  {
+    "source_group": "node1",
+    "file": "archive/v032/reproducers/node1/evidence/glm32-functional-regressions-20261021/reclaim-gate.py",
+    "source_sha256": "677d771b23fa524345820c00fee7237ee80ca9a5be8469523b60c2ec0e9f98ba",
+    "archived_sha256": "677d771b23fa524345820c00fee7237ee80ca9a5be8469523b60c2ec0e9f98ba"
+  },
+  {
+    "source_group": "node1",
+    "file": "archive/v032/reproducers/node1/evidence/glm32-functional-regressions-20261021/launch-final-glm.sh",
+    "source_sha256": "98ae81672960cf7494049a0b3c973eac723dbd002e199e72a9fcda219afae712",
+    "archived_sha256": "f545a5dd17622e242c121b72241158d4d750a3cc0a7c1e5711e9bc93c9ba7ba0"
+  },
+  {
+    "source_group": "node1",
+    "file": "archive/v032/reproducers/node1/evidence/glm32-functional-regressions-20261021/glm-v032-definition-gate.py",
+    "source_sha256": "d3f1a5783e8baa017139b435b926e7b496f9f72181c60eb8cd9fea3dd7785a90",
+    "archived_sha256": "d3f1a5783e8baa017139b435b926e7b496f9f72181c60eb8cd9fea3dd7785a90"
+  },
+  {
+    "source_group": "node1",
+    "file": "archive/v032/reproducers/node1/evidence/glm32-functional-regressions-20261021/preflight.py",
+    "source_sha256": "1521a91ea374c95129795d6e61899a274255c7379b58788cbbcf831c21ab3efa",
+    "archived_sha256": "65a8b467c050dba25c1223b6265200afe34912e31e9ae60b2b9fd89a99161713"
+  },
+  {
+    "source_group": "node1",
+    "file": "archive/v032/reproducers/node1/evidence/glm32-functional-regressions-20261021/launch-prefill-glm.sh",
+    "source_sha256": "0b19da30aa52040f1c57355c067a31252cf8b052420183d12de574639f8330c9",
+    "archived_sha256": "e72c068ffe844a293e37db68cc78fd6a9600ec36a5903b62c34d851ec4d22b9b"
+  },
+  {
+    "source_group": "node1",
+    "file": "archive/v032/reproducers/node1/evidence/glm32-functional-regressions-20261021/launch-diagnostic.sh",
+    "source_sha256": "e0abe38c7395a556868055fcbd8d6c7d1848c06f548c8f5ae1476e94c32ae445",
+    "archived_sha256": "f2c333a60c524410ac5f8d2bcca986d25d35ef152bc3ea6b77af4e5788f0b338"
+  },
+  {
+    "source_group": "node1",
+    "file": "archive/v032/reproducers/node1/evidence/glm32-functional-regressions-20261021/analyze_capture.py",
+    "source_sha256": "b494b995ce2d7f5104b92214248b8d2dced4fe00c8008fa3f6eee3eac9a966f6",
+    "archived_sha256": "b494b995ce2d7f5104b92214248b8d2dced4fe00c8008fa3f6eee3eac9a966f6"
+  },
+  {
+    "source_group": "node1",
+    "file": "archive/v032/reproducers/node1/evidence/glm32-compact-cache-repair-20261021/launch-glm-v032-compact.sh",
+    "source_sha256": "568c776771267b921e79e37567ce1d7249cbcc6fc65365573a73e570eb5eb358",
+    "archived_sha256": "839b137a31e11e7b2d2fa177a0205d12c9a88b6229cdb32872f2bcb6c7d7d6f1"
+  },
+  {
+    "source_group": "node1",
+    "file": "archive/v032/reproducers/node1/evidence/glm32-compact-cache-repair-20261021/glm-v032-definition-gate.py",
+    "source_sha256": "d3f1a5783e8baa017139b435b926e7b496f9f72181c60eb8cd9fea3dd7785a90",
+    "archived_sha256": "d3f1a5783e8baa017139b435b926e7b496f9f72181c60eb8cd9fea3dd7785a90"
+  },
+  {
+    "source_group": "node1",
+    "file": "archive/v032/reproducers/node1/evidence/glm32-compact-cache-repair-20261021/preflight.py",
+    "source_sha256": "1521a91ea374c95129795d6e61899a274255c7379b58788cbbcf831c21ab3efa",
+    "archived_sha256": "65a8b467c050dba25c1223b6265200afe34912e31e9ae60b2b9fd89a99161713"
+  },
+  {
+    "source_group": "node1",
+    "file": "archive/v032/reproducers/node1/evidence/vllm-v032-migration-20261019/mimo-qualification-preparation/guard-removal/launch.sh",
+    "source_sha256": "fdfc29a8afa6d42756bbe764247fffeb3fc624e9bbca94ba339af46c0ae1aed7",
+    "archived_sha256": "d77fc293be32b7957552694af974a445935f73eb4cf7a941cbea2e0babd0b817"
+  },
+  {
+    "source_group": "node1",
+    "file": "archive/v032/reproducers/node1/evidence/vllm-v032-migration-20261019/mimo-qualification-preparation/guard-removal/mem_utils.py",
+    "source_sha256": "6c4e6f251a05b1ec072bac72f9b75e2a0f11416b4715ade9fb599a8ea831fd9a",
+    "archived_sha256": "6c4e6f251a05b1ec072bac72f9b75e2a0f11416b4715ade9fb599a8ea831fd9a"
+  },
+  {
+    "source_group": "node1",
+    "file": "archive/v032/reproducers/node1/evidence/vllm-v032-migration-20261019/mimo-qualification-preparation/guard-removal/launch-upstream-profile.sh",
+    "source_sha256": "1a5c652faa39f628e2da2eb8478cc7ac6c2ecc0a9202fe7df622bfc244477c55",
+    "archived_sha256": "1a0e80a203f21d5ab4a72faab8c85ff0ce9a970b424471257817955e2ec2f174"
+  },
+  {
+    "source_group": "node1",
+    "file": "archive/v032/reproducers/node1/evidence/vllm-v032-migration-20261019/mimo-qualification-preparation/guard-removal/encoder_runner.py",
+    "source_sha256": "ffae094e77b41d39d075d8174495fd5cb24c61a34e3d41dad0ba2b1409a4de01",
+    "archived_sha256": "ffae094e77b41d39d075d8174495fd5cb24c61a34e3d41dad0ba2b1409a4de01"
+  },
+  {
+    "source_group": "node1",
+    "file": "archive/v032/reproducers/node1/evidence/vllm-v032-migration-20261019/mimo-qualification-preparation/guard-removal/launch-upstream-startup.sh",
+    "source_sha256": "d6a06efb7a6bf01e1191e963b7a8f52f735718bd13c429d7b683ee21a4ca85cf",
+    "archived_sha256": "49a5506626b554fed739b1525f164054ef4322022343a9623d5e70872d7f63eb"
+  },
+  {
+    "source_group": "node1",
+    "file": "archive/v032/reproducers/node1/evidence/vllm-v032-migration-20261019/mimo-qualification-preparation/guard-removal/model_runner.py",
+    "source_sha256": "70072ec222a125147c1bf5a42293996b8dab4085cb531b143e48a17915e159d3",
+    "archived_sha256": "70072ec222a125147c1bf5a42293996b8dab4085cb531b143e48a17915e159d3"
+  },
+  {
+    "source_group": "node1",
+    "file": "archive/v032/reproducers/node1/evidence/vllm-v032-migration-20261019/mimo-qualification-preparation/guard-removal/mimo_v2_omni.py",
+    "source_sha256": "94ad6beae9cb0150af6d3c7ebea9da1c68cdaa1813451eee5da3f5c765b0f296",
+    "archived_sha256": "94ad6beae9cb0150af6d3c7ebea9da1c68cdaa1813451eee5da3f5c765b0f296"
+  },
+  {
+    "source_group": "cutover",
+    "file": "archive/v032/reproducers/cutover/launch-glm-v032-candidate.sh",
+    "source_sha256": "050193b2d46814711b1cf0461e814ca3ae49174f9c9375d250584852b8ef1235",
+    "archived_sha256": "3059db0ae563745b39cc556197cbb4582839332754896ffd800a2c74d3a7127d"
+  },
+  {
+    "source_group": "cutover",
+    "file": "archive/v032/reproducers/cutover/glm-v032-definition-gate.py",
+    "source_sha256": "d3f1a5783e8baa017139b435b926e7b496f9f72181c60eb8cd9fea3dd7785a90",
+    "archived_sha256": "d3f1a5783e8baa017139b435b926e7b496f9f72181c60eb8cd9fea3dd7785a90"
+  },
+  {
+    "source_group": "mimo-cutover",
+    "file": "archive/v032/reproducers/mimo-cutover/installed-v1_worker_gpu_mm_encoder_runner.py",
+    "source_sha256": "b117572f74df9b8aeaf876ad1641cbac59d027dbe27f95c41a4d22fff7a48695",
+    "archived_sha256": "b117572f74df9b8aeaf876ad1641cbac59d027dbe27f95c41a4d22fff7a48695"
+  },
+  {
+    "source_group": "mimo-cutover",
+    "file": "archive/v032/reproducers/mimo-cutover/model_runner.py-override.diff",
+    "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "archived_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "source_group": "mimo-cutover",
+    "file": "archive/v032/reproducers/mimo-cutover/mem_utils.py-override.diff",
+    "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "archived_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "source_group": "mimo-cutover",
+    "file": "archive/v032/reproducers/mimo-cutover/installed-model_executor_models_mimo_v2_omni.py",
+    "source_sha256": "94ad6beae9cb0150af6d3c7ebea9da1c68cdaa1813451eee5da3f5c765b0f296",
+    "archived_sha256": "94ad6beae9cb0150af6d3c7ebea9da1c68cdaa1813451eee5da3f5c765b0f296"
+  },
+  {
+    "source_group": "mimo-cutover",
+    "file": "archive/v032/reproducers/mimo-cutover/installed-utils_mem_utils.py",
+    "source_sha256": "6c4e6f251a05b1ec072bac72f9b75e2a0f11416b4715ade9fb599a8ea831fd9a",
+    "archived_sha256": "6c4e6f251a05b1ec072bac72f9b75e2a0f11416b4715ade9fb599a8ea831fd9a"
+  },
+  {
+    "source_group": "mimo-cutover",
+    "file": "archive/v032/reproducers/mimo-cutover/mimo_v2_omni.py-override.diff",
+    "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "archived_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "source_group": "mimo-cutover",
+    "file": "archive/v032/reproducers/mimo-cutover/accept_direct.py",
+    "source_sha256": "7aaa46b02a437e7cd9d26e83ddfca0899b5c84eedca13f6e0b406b8ae0279ccb",
+    "archived_sha256": "5fbee3f3cc4cd31238fe0d18048c90fec291063254c276234d13ea988633da7c"
+  },
+  {
+    "source_group": "mimo-cutover",
+    "file": "archive/v032/reproducers/mimo-cutover/launch-mimo.sh",
+    "source_sha256": "081748e261a1db94bebb314a06134d58743602b319b28c1c9344175f945fbe4b",
+    "archived_sha256": "b8291d332e66b3ad218770a40921b8a4c3a1244c973b8aad99e34654277bb660"
+  },
+  {
+    "source_group": "mimo-cutover",
+    "file": "archive/v032/reproducers/mimo-cutover/installed-v1_worker_gpu_model_runner.py",
+    "source_sha256": "70072ec222a125147c1bf5a42293996b8dab4085cb531b143e48a17915e159d3",
+    "archived_sha256": "70072ec222a125147c1bf5a42293996b8dab4085cb531b143e48a17915e159d3"
+  },
+  {
+    "source_group": "mimo-cutover",
+    "file": "archive/v032/reproducers/mimo-cutover/check-response.py",
+    "source_sha256": "a2afe920bd8721930342a5285a1dea706ff254063cab70c9dd2f9016f52592b9",
+    "archived_sha256": "566cd6658dd8e363d3c030bc69ae7d34b12dc54a99c02e4adf4a276f1453d77f"
+  },
+  {
+    "source_group": "mimo-cutover",
+    "file": "archive/v032/reproducers/mimo-cutover/check-tools.py",
+    "source_sha256": "6494361c9b903456b019b7bca3bf9bd17f44f8efa01a390973104b2e94a50546",
+    "archived_sha256": "dd101ebd79e5d37c37d9bd54e8fcd546e9089ae69f071c73041ffe95356cc8d2"
+  },
+  {
+    "source_group": "mimo-cutover",
+    "file": "archive/v032/reproducers/mimo-cutover/installed-v1_core_kv_cache_coordinator.py",
+    "source_sha256": "e75c867276b8f37a02849ba384a0b4da19f649df286cc2a9036d2921df071428",
+    "archived_sha256": "e75c867276b8f37a02849ba384a0b4da19f649df286cc2a9036d2921df071428"
+  },
+  {
+    "source_group": "mimo-cutover",
+    "file": "archive/v032/reproducers/mimo-cutover/encoder_runner.py-override.diff",
+    "source_sha256": "937d94006752cb6f4a65aa08f1cbbd47ad1f3419109d27dd9e0ecd2229613183",
+    "archived_sha256": "f07668f1c470c27701a42d9e13af00cd03b73fc9eedb29de7020a959ad2fadd2"
   }
 ]

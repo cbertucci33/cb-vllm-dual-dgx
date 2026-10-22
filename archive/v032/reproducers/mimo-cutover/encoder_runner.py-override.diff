@@ -1,0 +1,11 @@
+--- /opt/project/evidence/vllm-v032-migration-20261019/mimo-qualification-preparation/guard-removal/encoder_runner.py	2026-10-19 18:11:37.979411915 -0500
++++ /opt/project/worktrees/glm32-three-improvements-20261020/vllm/v1/worker/gpu/mm/encoder_runner.py	2026-10-21 06:57:33.754673690 -0500
+@@ -18,7 +18,7 @@
+     group_and_batch_mm_kwargs,
+     set_mm_embedding_modality,
+ )
+-from vllm.utils.mem_utils import check_startup_memory, record_startup_memory_peak
++from vllm.utils.mem_utils import check_startup_memory
+ from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
+ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+ from vllm.v1.worker.utils import (
