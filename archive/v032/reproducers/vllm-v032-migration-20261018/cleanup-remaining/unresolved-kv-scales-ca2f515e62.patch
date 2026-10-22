@@ -1,0 +1,280 @@
+commit ca2f515e62f95b6c83a8f196373242efcffc5888
+Author: operator Bertucci <cbertucci33@users.noreply.github.com>
+Date:   Sun Oct 11 20:52:35 2026 -0500
+
+    Load calibrated EXL3 attention KV scales from checkpoint inventory
+    
+    Co-authored-by: Codex <codex@openai.com>
+
+diff --git a/tests/quantization/test_exl3.py b/tests/quantization/test_exl3.py
+index 1d7fd67184..52552384a7 100644
+--- a/tests/quantization/test_exl3.py
++++ b/tests/quantization/test_exl3.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import json
+ from types import SimpleNamespace
+ 
+ import pytest
+@@ -8,6 +9,7 @@ import torch
+ 
+ import vllm.model_executor.layers.quantization.exl3 as exl3_module
+ import vllm.model_executor.parameter as parameter_module
++from vllm.model_executor.layers.linear import QKVParallelLinear
+ from vllm.model_executor.layers.quantization import get_quantization_config
+ from vllm.model_executor.layers.quantization.exl3 import (
+     Exl3Config,
+@@ -16,7 +18,6 @@ from vllm.model_executor.layers.quantization.exl3 import (
+     Exl3MoEParameter,
+     Exl3Parameter,
+ )
+-from vllm.model_executor.layers.linear import QKVParallelLinear
+ from vllm.model_executor.models.glm4_moe_mtp import Glm4MoeMTP
+ from vllm.models.glm5next.common.mtp import Glm5NextMTP
+ 
+@@ -89,10 +90,10 @@ def test_rank_sliced_metadata_fails_closed(overrides, message):
+         config.maybe_update_config("unused", hf_config)
+ 
+ 
+-def test_rank_sliced_metadata_admits_only_declared_moe_layers():
++def test_rank_sliced_metadata_admits_only_declared_moe_layers(tmp_path):
+     config = Exl3Config(tensor_storage=_dense_storage())
+     config.maybe_update_config(
+-        "unused",
++        str(tmp_path),
+         SimpleNamespace(hybrid_tr3_tail=_rank_sliced_metadata()),
+     )
+ 
+@@ -196,10 +197,10 @@ def test_dense_exl3_eager_check_does_not_cache_unresolved_or_failed_state(
+     assert config._eager_checked
+ 
+ 
+-def test_rank_sliced_weight_name_keeps_only_local_tp_rank(monkeypatch):
++def test_rank_sliced_weight_name_keeps_only_local_tp_rank(monkeypatch, tmp_path):
+     config = Exl3Config(tensor_storage=_dense_storage())
+     config.maybe_update_config(
+-        "unused",
++        str(tmp_path),
+         SimpleNamespace(hybrid_tr3_tail=_rank_sliced_metadata()),
+     )
+     monkeypatch.setattr(exl3_module, "get_tensor_model_parallel_rank", lambda: 2)
+@@ -563,3 +564,121 @@ def test_draft_role_stamp_wins_over_name() -> None:
+     assert not exl3_mod._is_draft_layer(
+         SimpleNamespace(layer_name="model.layers.30.mlp.experts")
+     )
++
++
++@pytest.mark.parametrize("cache_dtype", ["fp8", "fp8_e4m3"])
++def test_calibrated_exl3_kv_scales_survive_loading_and_attention_postload(
++    tmp_path, cache_dtype
++):
++    """Guard the 48-layer calibration against missing parameters and unit reset.
++
++    Initialize only the quantization portion of real Attention layers; this is
++    a CPU scale-loading contract, not backend/model execution acceptance.
++    """
++    from vllm.model_executor.layers.attention import Attention
++    from vllm.model_executor.layers.attention.attention import _init_kv_cache_quant
++    from vllm.model_executor.model_loader.utils import process_weights_after_loading
++    from vllm.model_executor.models.utils import AutoWeightsLoader
++    from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
++
++    values = {
++        f"model.layers.{i}.self_attn.{scale}_scale": torch.tensor(
++            (i + 1) * (0.0005 if scale == "k" else 0.001), dtype=torch.float32
++        )
++        for i in range(48)
++        for scale in ("k", "v")
++    }
++    (tmp_path / "model.safetensors.index.json").write_text(
++        json.dumps({"weight_map": dict.fromkeys(values, "scales.safetensors")})
++    )
++    config = Exl3Config(tensor_storage=_dense_storage())
++    config.maybe_update_config(str(tmp_path))
++
++    model = torch.nn.Module()
++    model.quant_config = config
++    model.model = torch.nn.Module()
++    model.model.layers = torch.nn.ModuleList()
++    for i in range(48):
++        decoder = torch.nn.Module()
++        decoder.self_attn = torch.nn.Module()
++        layer = Attention.__new__(Attention)
++        torch.nn.Module.__init__(layer)
++        layer.kv_cache_dtype = cache_dtype
++        layer.quant_config = config
++        layer.layer_name = f"model.layers.{i}.self_attn.attn"
++        # Use the real inherited no-op backend post-load hook. No kernels run.
++        layer.impl = TritonAttentionImpl.__new__(TritonAttentionImpl)
++        _init_kv_cache_quant(layer, config, layer.layer_name)
++        decoder.self_attn.attn = layer
++        model.model.layers.append(decoder)
++
++    loaded = AutoWeightsLoader(model).load_weights(values.items())
++    assert len(loaded) == 96
++    process_weights_after_loading(
++        model,
++        SimpleNamespace(
++            dtype=torch.bfloat16,
++            quantization="exl3",
++            word_embeddings_untied_by_checkpoint=False,
++        ),
++        torch.device("cpu"),
++    )
++    for i, decoder in enumerate(model.model.layers):
++        layer = decoder.self_attn.attn
++        for scale in ("k", "v"):
++            expected = values[f"model.layers.{i}.self_attn.{scale}_scale"]
++            torch.testing.assert_close(getattr(layer, f"_{scale}_scale"), expected)
++            torch.testing.assert_close(getattr(layer, f"_{scale}_scale_cpu"), expected)
++            assert getattr(layer, f"_{scale}_scale_float") == expected.item()
++            assert not hasattr(layer, f"{scale}_scale")
++        assert layer._q_scale.item() == 1.0
++        assert layer._prob_scale.item() == 1.0
++
++
++def test_exl3_without_checkpoint_kv_calibration_preserves_attention_dispatch(tmp_path):
++    from vllm.model_executor.layers.attention import Attention
++
++    config = Exl3Config(tensor_storage=_dense_storage())
++    config.maybe_update_config(str(tmp_path))
++    layer = Attention.__new__(Attention)
++    torch.nn.Module.__init__(layer)
++
++    assert config.get_quant_method(layer, "model.layers.0.self_attn.attn") is None
++    assert config._kv_cache_scale_names == set()
++
++
++def test_exl3_kv_scale_index_is_read_once_and_preserves_model_mapper(
++    monkeypatch, tmp_path
++):
++    from vllm.model_executor.layers.attention import Attention
++    from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
++    from vllm.model_executor.models.utils import WeightsMapper
++
++    weight_map = {
++        "model.layers.0.self_attn.k_scale": "scales.safetensors",
++        "model.layers.0.self_attn.v_scale": "scales.safetensors",
++    }
++    (tmp_path / "model.safetensors.index.json").write_text(
++        json.dumps({"weight_map": weight_map})
++    )
++    config = Exl3Config(tensor_storage=_dense_storage())
++    config.maybe_update_config(str(tmp_path))
++    config.apply_vllm_mapper(
++        WeightsMapper(orig_to_new_prefix={"model.": "language_model."})
++    )
++    monkeypatch.setattr(
++        exl3_module,
++        "get_hf_file_to_dict",
++        lambda *args, **kwargs: pytest.fail("index was read more than once"),
++    )
++    config.maybe_update_config(str(tmp_path))
++    layer = Attention.__new__(Attention)
++    torch.nn.Module.__init__(layer)
++
++    assert isinstance(
++        config.get_quant_method(layer, "language_model.layers.0.self_attn.attn"),
++        BaseKVCacheMethod,
++    )
++    assert (
++        config.get_quant_method(layer, "language_model.layers.1.self_attn.attn") is None
++    )
+diff --git a/vllm/model_executor/layers/quantization/exl3.py b/vllm/model_executor/layers/quantization/exl3.py
+index 1cf4ee8bbe..c50410c4c5 100644
+--- a/vllm/model_executor/layers/quantization/exl3.py
++++ b/vllm/model_executor/layers/quantization/exl3.py
+@@ -34,6 +34,7 @@ from vllm.distributed import (
+     get_tensor_model_parallel_world_size,
+ )
+ from vllm.logger import init_logger
++from vllm.model_executor.layers.attention import Attention
+ from vllm.model_executor.layers.fused_moe import (
+     FusedMoEMethodBase,
+     FusedMoEQuantConfig,
+@@ -51,6 +52,7 @@ from vllm.model_executor.layers.quantization.base_config import (
+     QuantizationConfig,
+     QuantizeMethodBase,
+ )
++from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
+ from vllm.model_executor.parameter import BasevLLMParameter
+ from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
+ 
+@@ -303,6 +305,8 @@ class Exl3Config(QuantizationConfig):
+         self.version = version
+         self.tensor_storage = tensor_storage or {}
+         self._eager_checked = False
++        self._kv_cache_scale_names: set[str] = set()
++        self._kv_cache_scales_initialized = False
+         self.rank_sliced_metadata: dict[str, Any] | None = None
+ 
+     def get_name(self) -> QuantizationMethods:
+@@ -359,14 +363,16 @@ class Exl3Config(QuantizationConfig):
+         ):
+             self._configure_rank_sliced(rank_sliced)
+ 
++        resolved_revision = revision
++        if resolved_revision is None and hf_config is not None:
++            resolved_revision = getattr(hf_config, "_commit_hash", None)
++        self._load_kv_cache_scale_names(model_name, resolved_revision)
++
+         # vLLM returns the summary embedded in config.json without consulting
+         # get_config_filenames().  Hydrate the per-module records explicitly.
+         # Rank-sliced checkpoints still need these records for dense linears;
+         # only routed-expert storage is described by rank_sliced_metadata.
+         if not self.tensor_storage:
+-            resolved_revision = revision
+-            if resolved_revision is None and hf_config is not None:
+-                resolved_revision = getattr(hf_config, "_commit_hash", None)
+             config = get_hf_file_to_dict(
+                 "quantization_config.json",
+                 model_name,
+@@ -394,6 +400,27 @@ class Exl3Config(QuantizationConfig):
+         self._validate_storage_metadata()
+         self._force_independent_lm_head(hf_config)
+ 
++    def _load_kv_cache_scale_names(self, model_name: str, revision: str | None) -> None:
++        if self._kv_cache_scales_initialized:
++            return
++        index = get_hf_file_to_dict(
++            "model.safetensors.index.json", model_name, revision=revision
++        )
++        weight_map = index.get("weight_map", {}) if index else {}
++        scale_names = [
++            name for name in weight_map if name.endswith((".k_scale", ".v_scale"))
++        ]
++        self._kv_cache_scale_names = set(
++            self.get_cache_scale_mapper().apply_list(scale_names)
++        )
++        self._kv_cache_scales_initialized = True
++
++    def _has_kv_cache_scales(self, prefix: str) -> bool:
++        return all(
++            f"{prefix}.{scale}_scale" in self._kv_cache_scale_names
++            for scale in ("k", "v")
++        )
++
+     def _configure_rank_sliced(self, metadata: dict[str, Any]) -> None:
+         required = {
+             "bits",
+@@ -439,6 +466,9 @@ class Exl3Config(QuantizationConfig):
+         # source-matrix discovery intentionally refers to the unstacked HF name.
+         mapped = hf_to_vllm_mapper.apply_dict(self.tensor_storage)
+         self.tensor_storage = {**self.tensor_storage, **mapped}
++        self._kv_cache_scale_names.update(
++            hf_to_vllm_mapper.apply_list(list(self._kv_cache_scale_names))
++        )
+ 
+     def _validate_storage_metadata(self) -> None:
+         bad: list[str] = []
+@@ -515,6 +545,8 @@ class Exl3Config(QuantizationConfig):
+         self, layer: torch.nn.Module, prefix: str
+     ) -> QuantizeMethodBase | None:
+         self._require_enforce_eager()
++        if isinstance(layer, Attention) and self._has_kv_cache_scales(prefix):
++            return BaseKVCacheMethod(self)
+         is_lm_head = layer.__class__.__name__ == "ParallelLMHead"
+         if is_lm_head and not prefix:
+             prefix = "lm_head"

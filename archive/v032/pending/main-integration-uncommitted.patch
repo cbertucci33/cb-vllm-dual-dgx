@@ -1,0 +1,292 @@
+diff --git a/vllm/model_executor/models/mimo_v2_omni.py b/vllm/model_executor/models/mimo_v2_omni.py
+index 7f9478bd5a..046dde7f78 100644
+--- a/vllm/model_executor/models/mimo_v2_omni.py
++++ b/vllm/model_executor/models/mimo_v2_omni.py
+@@ -1043,48 +1043,51 @@ class MiMoV2OmniProcessingInfo(BaseProcessingInfo):
+             mm_kwargs={},
+         )
+ 
+-    def _get_video_profile(self, seq_len: int) -> tuple[int, ImageSize, int]:
+-        processor = self.get_hf_processor().mimo_processor
+-        maximum_frames = processor._vid_kw["max_frames"]
+-        if maximum_frames is None:
+-            raise ValueError(
+-                "MiMo video profiling needs its declared max_frames policy"
+-            )
+-        best: tuple[int, ImageSize, int] | None = None
+-        for frames in range(1, int(maximum_frames) + 1):
+-            size = self.get_image_size_with_most_features(
+-                processor.video_pixel_budget(frames)
+-            )
+-            _, tokens = self._get_vision_info(
+-                image_width=size.width,
+-                image_height=size.height,
+-                num_frames=frames,
+-                image_processor=self.get_image_processor(),
++    def _get_max_video_frames(self, max_tokens: int, start_num_frames: int = 1) -> int:
++        image_processor = self.get_image_processor()
++        target_width, target_height = self.get_image_size_with_most_features()
++        num_frames = start_num_frames
++        while True:
++            next_num_frames = num_frames + 1
++            next_max_tokens = self.get_num_video_tokens(
++                image_width=target_width,
++                image_height=target_height,
++                num_frames=next_num_frames,
++                image_processor=image_processor,
+                 mm_kwargs={},
+-                is_video=True,
+             )
+-            if tokens <= seq_len - 2 and (best is None or tokens > best[2]):
+-                best = (frames, size, tokens)
+-        if best is None:
+-            raise ValueError("MiMo context cannot contain one profiled video item")
+-        return best
++            if next_max_tokens > max_tokens:
++                break
++            num_frames = next_num_frames
++        return num_frames
+ 
+     def get_num_frames_with_most_features(
+         self,
+         seq_len: int,
+         mm_counts: Mapping[str, int],
++        max_frames_per_video: int = 14,
+     ) -> int:
+-        return self._get_video_profile(seq_len)[0]
++        max_videos = mm_counts.get("video", 0)
++        max_total_frames = self._get_max_video_frames(seq_len)
++        max_frames_per_video = min(
++            max_total_frames // max(max_videos, 1), max_frames_per_video
++        )
++        return max(max_frames_per_video, 1)
+ 
+     def get_max_video_tokens(
+         self,
+         seq_len: int,
+         mm_counts: Mapping[str, int],
+     ) -> int:
+-        video_tokens = self._get_video_profile(seq_len)[2]
+-        if getattr(self.get_hf_config(), "audio_config", None) is not None:
+-            return min(seq_len - 2, video_tokens + self._get_audio_profile(seq_len)[1])
+-        return video_tokens
++        image_processor = self.get_image_processor()
++        target_width, target_height = self.get_image_size_with_most_features()
++        return self.get_num_video_tokens(
++            image_width=target_width,
++            image_height=target_height,
++            num_frames=self.get_num_frames_with_most_features(seq_len, mm_counts),
++            image_processor=image_processor,
++            mm_kwargs={},
++        )
+ 
+ 
+ class MiMoV2OmniMultiModalProcessor(BaseMultiModalProcessor[MiMoV2OmniProcessingInfo]):
+@@ -1401,11 +1404,10 @@ class MiMoV2OmniDummyInputsBuilder(BaseDummyInputsBuilder[MiMoV2OmniProcessingIn
+         mm_options: MultiModalDummyOptions,
+     ) -> MultiModalDataDict:
+         target_width, target_height = self.info.get_image_size_with_most_features()
+-        if mm_counts.get("video", 0):
+-            target_num_frames, video_size, _ = self.info._get_video_profile(seq_len)
+-        else:
+-            target_num_frames = 0
+-            video_size = ImageSize(width=target_width, height=target_height)
++        target_num_frames = self.info.get_num_frames_with_most_features(
++            seq_len, mm_counts
++        )
++        video_size = ImageSize(width=target_width, height=target_height)
+ 
+         return {
+             "image": self._get_dummy_images(
+diff --git a/vllm/utils/mem_utils.py b/vllm/utils/mem_utils.py
+index 8f3ddd4eb0..2d496a4ad1 100644
+--- a/vllm/utils/mem_utils.py
++++ b/vllm/utils/mem_utils.py
+@@ -353,37 +353,8 @@ _STARTUP_ALLOCATOR_FRACTIONS: dict[int, float] = {}
+ def configure_startup_memory_guard(
+     snapshot: MemorySnapshot, requested_bytes: int
+ ) -> None:
+-    """Install a utilization-derived startup budget before model construction."""
+-    device = snapshot.device_
+-    index = device.index
+-    assert index is not None
+-    if index in _STARTUP_ALLOCATOR_FRACTIONS:
+-        restore_startup_allocator_limit(device)
+-    budget = StartupMemoryBudget(
+-        initial_available=snapshot.free_memory,
+-        requested_bytes=requested_bytes,
+-        integrated=current_platform.is_integrated_gpu(index),
+-        initial_host_available=psutil.virtual_memory().available,
+-    )
+-    previous = torch.cuda.get_per_process_memory_fraction(device)
+-    fraction = min(
+-        previous,
+-        (requested_bytes + snapshot.torch_memory) / snapshot.total_memory,
+-    )
+-    try:
+-        torch.cuda.set_per_process_memory_fraction(fraction, device)
+-    except BaseException as exc:
+-        try:
+-            torch.cuda.set_per_process_memory_fraction(previous, device)
+-        except BaseException as restore_exc:
+-            _STARTUP_ALLOCATOR_FRACTIONS[index] = previous
+-            if hasattr(exc, "add_note"):
+-                exc.add_note(
+-                    f"Restoring startup allocator policy failed: {restore_exc}"
+-                )
+-        raise
+-    _STARTUP_ALLOCATOR_FRACTIONS[index] = previous
+-    _STARTUP_MEMORY_BUDGETS[index] = budget
++    """Compatibility hook; custom startup admission policy has been removed."""
++    return
+ 
+ 
+ def restore_startup_allocator_limit(device=None) -> None:
+@@ -457,33 +428,8 @@ def check_startup_memory(
+     device=None,
+     respect_reserve: bool = True,
+ ) -> None:
+-    """Admit known allocations against one physical budget on UMA."""
+-    if device_bytes < 0 or host_bytes < 0:
+-        raise ValueError("Allocation byte counts must be nonnegative")
+-    state = _startup_memory_state(device)
+-    if state is None:
+-        # CPU preprocessing also runs in frontends that do not own CUDA.
+-        # Admit its declared host demand without creating a device context.
+-        host_demand = host_bytes
+-        if device is not None and torch.device(device).type == "cpu":
+-            host_demand += device_bytes
+-        if host_demand:
+-            host_available = psutil.virtual_memory().available
+-            if host_demand > host_available:
+-                raise MemoryError(
+-                    f"{label}: host allocation requires {host_demand} bytes, "
+-                    f"only {host_available} bytes are available"
+-                )
+-        return
+-    budget, available, host_available = state
+-    budget.check(
+-        device_bytes=device_bytes,
+-        host_bytes=host_bytes,
+-        available=available,
+-        host_available=host_available,
+-        label=label,
+-        respect_reserve=respect_reserve,
+-    )
++    """Compatibility hook; allocation succeeds or fails through the allocator."""
++    return
+ 
+ 
+ def record_startup_memory_peak(device=None) -> None:
+diff --git a/vllm/v1/worker/gpu/mm/encoder_runner.py b/vllm/v1/worker/gpu/mm/encoder_runner.py
+index 9fb7f8c117..eedd6002e0 100644
+--- a/vllm/v1/worker/gpu/mm/encoder_runner.py
++++ b/vllm/v1/worker/gpu/mm/encoder_runner.py
+@@ -114,58 +114,43 @@ class EncoderRunner:
+         return mm_hashes, mm_kwargs
+ 
+     @torch.inference_mode()
+-    def profile_encoder_cache(self, budget: MultiModalBudget) -> None:
+-        """Profile each requested encoder and its full retained-cache budget."""
+-        if budget.get_encoder_budget() <= 0:
++    def profile_encoder_cache(
++        self,
++        dummy_mm_inputs: list[tuple[str, MultiModalKwargsItem]],
++        budget: MultiModalBudget,
++    ) -> None:
++        """Profile multimodal encoder and temporary encoder cache memory."""
++        if (encoder_budget := budget.get_encoder_budget()) <= 0:
+             return
++
+         if not budget.mm_max_toks_per_item:
+-            logger.info("Skipping encoder profiling for embedding-only mode")
+-            return
+-        for modality in budget.get_encoder_profile_modalities():
+-            self.encoder_cache.encoder_outputs.clear()
+-            dummy = budget.get_dummy_encoder_profile_inputs(modality=modality)
+-            num_items = len(dummy)
+-            reserved = budget.get_profile_cache_padding(modality, num_items)
+-            if reserved:
+-                check_startup_memory(
+-                    device_bytes=reserved * self.hidden_size * self.dtype.itemsize,
+-                    label=f"{modality} retained encoder cache",
+-                    device=self.device,
+-                )
+-                self.encoder_cache.encoder_outputs["_profile_reserved"] = torch.empty(
+-                    reserved, self.hidden_size, dtype=self.dtype, device=self.device
+-                )
+-            outputs = self.execute_mm_encoder(dummy)
+-            sanity_check_mm_encoder_outputs(outputs, expected_num_items=num_items)
+-            actual = sum(output.shape[0] for output in outputs)
+-            remaining = budget.get_profile_cache_padding(modality, num_items, actual)
+-            self.encoder_cache.encoder_outputs.update(
+-                (f"tmp_{i}", output) for i, output in enumerate(outputs)
+-            )
+-            if remaining > reserved:
+-                check_startup_memory(
+-                    device_bytes=(remaining - reserved)
+-                    * self.hidden_size
+-                    * self.dtype.itemsize,
+-                    label=f"{modality} encoder cache padding",
+-                    device=self.device,
+-                )
+-                self.encoder_cache.encoder_outputs["_profile_padding"] = torch.empty(
+-                    remaining - reserved,
+-                    self.hidden_size,
+-                    dtype=self.dtype,
+-                    device=self.device,
+-                )
+             logger.info(
+-                "Profiled %s encoder: %d items, %d embeddings, %d cache slots",
+-                modality,
+-                num_items,
+-                actual,
+-                budget.encoder_cache_size,
++                "Skipping encoder profiling for embedding-only mode "
++                "(all modality limits=0 with enable_mm_embeds=True).",
+             )
+-            record_startup_memory_peak(device=self.device)
+-            budget.reset_cache()
+-            del dummy, outputs
++            return
++
++        assert dummy_mm_inputs, "Dummy inputs should be generated for encoder profiling"
++        dummy_modality = dummy_mm_inputs[0][0]
++        max_mm_items_per_batch = len(dummy_mm_inputs)
++
++        logger.info_once(
++            "Encoder cache will be initialized with a budget of %s tokens, "
++            "and profiled with %s %s items of the maximum feature size.",
++            encoder_budget,
++            max_mm_items_per_batch,
++            dummy_modality,
++        )
++
++        dummy_encoder_outputs = self.execute_mm_encoder(dummy_mm_inputs)
++
++        sanity_check_mm_encoder_outputs(
++            dummy_encoder_outputs,
++            expected_num_items=max_mm_items_per_batch,
++        )
++        self.encoder_cache.encoder_outputs.update(
++            (f"tmp_{i}", output) for i, output in enumerate(dummy_encoder_outputs)
++        )
+ 
+     @torch.inference_mode()
+     def execute_mm_encoder(
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index a91de8a855..36d2c22084 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1026,7 +1026,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 mm_budget = MultiModalBudget(
+                     self.vllm_config, self.mm_registry, enable_cache=False
+                 )
+-                self.model_state.encoder_runner.profile_encoder_cache(mm_budget)
++                dummy_mm_inputs = mm_budget.get_dummy_encoder_profile_inputs()
++                self.model_state.encoder_runner.profile_encoder_cache(
++                    dummy_mm_inputs, mm_budget
++                )
+ 
+         hidden_states, sample_hidden_states = self._dummy_run(
+             self.max_num_tokens,

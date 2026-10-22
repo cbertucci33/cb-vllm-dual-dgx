@@ -17,7 +17,6 @@ QuantizationMethods = Literal[
     "auto_awq",
     "fp8",
     "fbgemm_fp8",
-    "exl3",
     "fp_quant",
     "modelopt",
     "modelopt_fp4",
@@ -37,6 +36,7 @@ QuantizationMethods = Literal[
     "mxfp4",
     "gpt_oss_mxfp4",
     "deepseek_v4_fp8",
+    "exl3",
     "online",
     # Below are online quant shorthand names (see vllm.config.quantization).
     # Listed here as strings to avoid a circular import; kept in sync with
@@ -83,6 +83,7 @@ def register_quantization_config(quantization: str):
         >>>
         >>> get_quantization_config("my_quant")
         <class 'MyQuantConfig'>
+
     """  # noqa: E501
 
     def _wrapper(quant_config_cls):
@@ -160,7 +161,6 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "auto_awq": AutoAWQConfig,
         "fp8": Fp8Config,
         "fbgemm_fp8": FBGEMMFp8Config,
-        "exl3": Exl3Config,
         "fp_quant": FPQuantConfig,
         "modelopt": ModelOptFp8Config,
         "modelopt_fp4": ModelOptNvFp4Config,
@@ -171,6 +171,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "gptq_marlin": AutoGPTQConfig,
         "compressed-tensors": CompressedTensorsConfig,
         "experts_int8": ExpertsInt8Config,
+        "exl3": Exl3Config,
         "quark": QuarkConfig,
         "moe_wna16": MoeWNA16Config,
         "torchao": TorchAOConfig,

@@ -1,0 +1,480 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index 7dc9005..ebec05b 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -10,11 +10,10 @@ license-files = ["LICENSE"]
+ dependencies = [
+   "torch>=2.12.0",
+   "cuda-python",
+-  "nvidia-cutlass-dsl==4.6.0",
+-  "nvidia-cutlass-dsl-libs-base==4.6.0",
+-  "nvidia-cutlass-dsl-libs-core==4.6.0",
+-  "nvidia-cutlass-dsl-libs-cu12==4.6.0",
+-  "nvidia-cutlass-dsl-libs-cu13==4.6.0",
++  "nvidia-cutlass-dsl>=4.7.0,<5",
++  "nvidia-cutlass-dsl-libs-base>=4.7.0,<5",
++  "nvidia-cutlass-dsl-libs-core>=4.7.0,<5",
++  "nvidia-cutlass-dsl-libs-cu13>=4.7.0,<5",
+   "apache-tvm-ffi>=0.1.6,!=0.1.8,!=0.1.8.post0,<0.2",
+   "rich>=13",
+   "transformers>=4.51",
+diff --git a/sparkinfer/_lib/intrinsics.py b/sparkinfer/_lib/intrinsics.py
+index 5131a51..ccb2916 100644
+--- a/sparkinfer/_lib/intrinsics.py
++++ b/sparkinfer/_lib/intrinsics.py
+@@ -662,7 +662,7 @@ def st_global_v4_f32(
+             Float32(v3).ir_value(loc=loc, ip=ip),
+         ],
+         "st.global.v4.f32 [$0], {$1, $2, $3, $4};",
+-        "l,f,f,f,f",
++        "l,f,f,f,f,~{memory}",
+         has_side_effects=True,
+         is_align_stack=False,
+         asm_dialect=llvm.AsmDialect.AD_ATT,
+@@ -681,7 +681,7 @@ def ld_global_v4_f32(
+         llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+         [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
+         "ld.global.v4.f32 {$0, $1, $2, $3}, [$4];",
+-        "=f,=f,=f,=f,l",
++        "=f,=f,=f,=f,l,~{memory}",
+         has_side_effects=True,
+         is_align_stack=False,
+         asm_dialect=llvm.AsmDialect.AD_ATT,
+@@ -742,7 +742,7 @@ def st_global_v4_u32(
+             Uint32(v3).ir_value(loc=loc, ip=ip),
+         ],
+         "st.global.v4.u32 [$0], {$1, $2, $3, $4};",
+-        "l,r,r,r,r",
++        "l,r,r,r,r,~{memory}",
+         has_side_effects=True,
+         is_align_stack=False,
+         asm_dialect=llvm.AsmDialect.AD_ATT,
+@@ -783,7 +783,7 @@ def ldmatrix_m8n8x4_b16(
+         llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+         [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+         "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {$0, $1, $2, $3}, [$4];",
+-        "=r,=r,=r,=r,r",
++        "=r,=r,=r,=r,r,~{memory}",
+         has_side_effects=True,
+         is_align_stack=False,
+         asm_dialect=llvm.AsmDialect.AD_ATT,
+@@ -869,7 +869,7 @@ def ldmatrix_m8n8x2_b16(
+         llvm.StructType.get_literal([T.i32(), T.i32()]),
+         [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+         "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {$0, $1}, [$2];",
+-        "=r,=r,r",
++        "=r,=r,r,~{memory}",
+         has_side_effects=True,
+         is_align_stack=False,
+         asm_dialect=llvm.AsmDialect.AD_ATT,
+@@ -997,7 +997,7 @@ def ld_shared_v4_u32(
+         llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+         [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+         "ld.shared.v4.u32 {$0, $1, $2, $3}, [$4];",
+-        "=r,=r,=r,=r,r",
++        "=r,=r,=r,=r,r,~{memory}",
+         has_side_effects=True,
+         is_align_stack=False,
+         asm_dialect=llvm.AsmDialect.AD_ATT,
+@@ -1018,7 +1018,7 @@ def ld_shared_v2_u32(smem_addr: Int32, *, loc=None, ip=None) -> Tuple[Uint32, Ui
+         llvm.StructType.get_literal([T.i32(), T.i32()]),
+         [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+         "ld.shared.v2.u32 {$0, $1}, [$2];",
+-        "=r,=r,r",
++        "=r,=r,r,~{memory}",
+         has_side_effects=True,
+         is_align_stack=False,
+         asm_dialect=llvm.AsmDialect.AD_ATT,
+@@ -1069,7 +1069,7 @@ def st_shared_v4_u32(
+             Uint32(v3).ir_value(loc=loc, ip=ip),
+         ],
+         "st.shared.v4.u32 [$0], {$1, $2, $3, $4};",
+-        "r,r,r,r,r",
++        "r,r,r,r,r,~{memory}",
+         has_side_effects=True,
+         is_align_stack=False,
+         asm_dialect=llvm.AsmDialect.AD_ATT,
+@@ -1300,7 +1300,7 @@ def cp_async4_shared_global(smem_addr: Int32, gmem_addr: Int64, *, loc=None, ip=
+             Int64(gmem_addr).ir_value(loc=loc, ip=ip),
+         ],
+         "cp.async.cg.shared.global [$0], [$1], 16;",
+-        "r,l",
++        "r,l,~{memory}",
+         has_side_effects=True,
+         is_align_stack=False,
+         asm_dialect=llvm.AsmDialect.AD_ATT,
+@@ -1322,7 +1322,7 @@ def cp_async4_shared_global_pred(
+             Int64(gmem_addr).ir_value(loc=loc, ip=ip),
+         ],
+         "{ .reg .pred p; setp.ne.b32 p, $0, 0; @p cp.async.cg.shared.global [$1], [$2], 16; }",
+-        "r,r,l",
++        "r,r,l,~{memory}",
+         has_side_effects=True,
+         is_align_stack=False,
+         asm_dialect=llvm.AsmDialect.AD_ATT,
+@@ -1385,6 +1385,27 @@ def atomic_add_global_i32(addr: Int64, val: Int32, *, loc=None, ip=None) -> Int3
+     )
+ 
+ 
++@dsl_user_op
++def atomic_add_global_acq_rel_i32(addr: Int64, val: Int32, *, loc=None, ip=None) -> Int32:
++    """Publish this CTA and acquire prior arrivals at a GPU-scope barrier."""
++    return Int32(
++        llvm.inline_asm(
++            T.i32(),
++            [
++                Int64(addr).ir_value(loc=loc, ip=ip),
++                Int32(val).ir_value(loc=loc, ip=ip),
++            ],
++            "atom.acq_rel.gpu.global.add.s32 $0, [$1], $2;",
++            "=r,l,r,~{memory}",
++            has_side_effects=True,
++            is_align_stack=False,
++            asm_dialect=llvm.AsmDialect.AD_ATT,
++            loc=loc,
++            ip=ip,
++        )
++    )
++
++
+ @dsl_user_op
+ def red_add_global_release_i32(addr: Int64, val: Int32, *, loc=None, ip=None):
+     """No-return global int32 add with a GPU-scope release fence."""
+@@ -1395,7 +1416,7 @@ def red_add_global_release_i32(addr: Int64, val: Int32, *, loc=None, ip=None):
+             Int32(val).ir_value(loc=loc, ip=ip),
+         ],
+         "fence.acq_rel.gpu;\nred.relaxed.gpu.global.add.s32 [$0], $1;",
+-        "l,r",
++        "l,r,~{memory}",
+         has_side_effects=True,
+         is_align_stack=False,
+         asm_dialect=llvm.AsmDialect.AD_ATT,
+@@ -1649,7 +1670,7 @@ def ld_shared_i32_relaxed(addr: Int32, *, loc=None, ip=None) -> Int32:
+             T.i32(),
+             [Int32(addr).ir_value(loc=loc, ip=ip)],
+             "ld.shared.s32 $0, [$1];",
+-            "=r,r",
++            "=r,r,~{memory}",
+             has_side_effects=True,
+             is_align_stack=False,
+             asm_dialect=llvm.AsmDialect.AD_ATT,
+@@ -1667,7 +1688,7 @@ def ld_shared_u32(addr: Int32, *, loc=None, ip=None) -> Uint32:
+             T.i32(),
+             [Int32(addr).ir_value(loc=loc, ip=ip)],
+             "ld.shared.u32 $0, [$1];",
+-            "=r,r",
++            "=r,r,~{memory}",
+             has_side_effects=True,
+             is_align_stack=False,
+             asm_dialect=llvm.AsmDialect.AD_ATT,
+@@ -1687,7 +1708,7 @@ def st_shared_i32(addr: Int32, val: Int32, *, loc=None, ip=None):
+             Int32(val).ir_value(loc=loc, ip=ip),
+         ],
+         "st.shared.s32 [$0], $1;",
+-        "r,r",
++        "r,r,~{memory}",
+         has_side_effects=True,
+         is_align_stack=False,
+         asm_dialect=llvm.AsmDialect.AD_ATT,
+@@ -1706,7 +1727,7 @@ def st_shared_u32(addr: Int32, val: Uint32, *, loc=None, ip=None):
+             Uint32(val).ir_value(loc=loc, ip=ip),
+         ],
+         "st.shared.u32 [$0], $1;",
+-        "r,r",
++        "r,r,~{memory}",
+         has_side_effects=True,
+         is_align_stack=False,
+         asm_dialect=llvm.AsmDialect.AD_ATT,
+@@ -1723,7 +1744,7 @@ def ld_shared_f32(addr: Int32, *, loc=None, ip=None) -> Float32:
+             T.f32(),
+             [Int32(addr).ir_value(loc=loc, ip=ip)],
+             "ld.shared.f32 $0, [$1];",
+-            "=f,r",
++            "=f,r,~{memory}",
+             has_side_effects=True,
+             is_align_stack=False,
+             asm_dialect=llvm.AsmDialect.AD_ATT,
+@@ -1768,7 +1789,7 @@ def ld_shared_v4_f32(
+         llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+         [Int32(addr).ir_value(loc=loc, ip=ip)],
+         "ld.shared.v4.f32 {$0, $1, $2, $3}, [$4];",
+-        "=f,=f,=f,=f,r",
++        "=f,=f,=f,=f,r,~{memory}",
+         has_side_effects=True,
+         is_align_stack=False,
+         asm_dialect=llvm.AsmDialect.AD_ATT,
+@@ -1810,7 +1831,7 @@ def st_shared_f32(addr: Int32, val: Float32, *, loc=None, ip=None):
+             Float32(val).ir_value(loc=loc, ip=ip),
+         ],
+         "st.shared.f32 [$0], $1;",
+-        "r,f",
++        "r,f,~{memory}",
+         has_side_effects=True,
+         is_align_stack=False,
+         asm_dialect=llvm.AsmDialect.AD_ATT,
+@@ -1869,7 +1890,7 @@ def st_shared_v4_f32(
+             Float32(v3).ir_value(loc=loc, ip=ip),
+         ],
+         "st.shared.v4.f32 [$0], {$1, $2, $3, $4};",
+-        "r,f,f,f,f",
++        "r,f,f,f,f,~{memory}",
+         has_side_effects=True,
+         is_align_stack=False,
+         asm_dialect=llvm.AsmDialect.AD_ATT,
+@@ -1907,7 +1928,7 @@ def st_shared_f16_from_f32(addr: Int32, val: Float32, *, loc=None, ip=None):
+             Float32(val).ir_value(loc=loc, ip=ip),
+         ],
+         "{ .reg .b16 tmp; cvt.rn.f16.f32 tmp, $1; st.shared.b16 [$0], tmp; }",
+-        "r,f",
++        "r,f,~{memory}",
+         has_side_effects=True,
+         is_align_stack=False,
+         asm_dialect=llvm.AsmDialect.AD_ATT,
+@@ -1926,7 +1947,7 @@ def st_global_i32(addr: Int64, val: Int32, *, loc=None, ip=None):
+             Int32(val).ir_value(loc=loc, ip=ip),
+         ],
+         "st.global.s32 [$0], $1;",
+-        "l,r",
++        "l,r,~{memory}",
+         has_side_effects=True,
+         is_align_stack=False,
+         asm_dialect=llvm.AsmDialect.AD_ATT,
+@@ -1946,7 +1967,7 @@ def ld_global_acquire_i32(addr: Int64, *, loc=None, ip=None) -> Int32:
+             T.i32(),
+             [Int64(addr).ir_value(loc=loc, ip=ip)],
+             "ld.global.acquire.gpu.s32 $0, [$1];",
+-            "=r,l",
++            "=r,l,~{memory}",
+             has_side_effects=True,
+             is_align_stack=False,
+             asm_dialect=llvm.AsmDialect.AD_ATT,
+@@ -2034,7 +2055,7 @@ def threadfence(*, loc=None, ip=None):
+         None,
+         [],
+         "membar.gl;",
+-        "",
++        "~{memory}",
+         has_side_effects=True,
+         is_align_stack=False,
+         asm_dialect=llvm.AsmDialect.AD_ATT,
+diff --git a/sparkinfer/moe/_shared/kernels/w4a16/kernel.py b/sparkinfer/moe/_shared/kernels/w4a16/kernel.py
+index 9035937..2cfd008 100644
+--- a/sparkinfer/moe/_shared/kernels/w4a16/kernel.py
++++ b/sparkinfer/moe/_shared/kernels/w4a16/kernel.py
+@@ -21,7 +21,7 @@ from sparkinfer._lib.compiler import (
+     compile as sparkinfer_compile,
+ )
+ from sparkinfer._lib.intrinsics import (
+-    atomic_add_global_i32,
++    atomic_add_global_acq_rel_i32,
+     bf16_mma_m16n8k16_f32,
+     bf16_mma_rhs_fragments_as_mma_a_m16n8k16_f32,
+     bfloat2_broadcast_lane,
+@@ -173,6 +173,40 @@ def _materialize_w4a16_topk_route_f32(value, *, loc=None, ip=None):
+     )
+ 
+ 
++@dsl_user_op
++def _clamp_swiglu_f32(gate, up, limit, *, loc=None, ip=None):
++    # Preserve FP32, subnormals and NaNs. A positive limit makes xorsign.abs
++    # clamp the up magnitude while retaining its sign (SM86+, including GB10).
++    limit_ir = cutlass.Float32(limit).ir_value(loc=loc, ip=ip)
++    gate = cutlass.Float32(
++        llvm.inline_asm(
++            T.f32(),
++            [cutlass.Float32(gate).ir_value(loc=loc, ip=ip), limit_ir],
++            "min.NaN.f32 $0, $1, $2;",
++            "=f,f,f",
++            has_side_effects=False,
++            is_align_stack=False,
++            asm_dialect=llvm.AsmDialect.AD_ATT,
++            loc=loc,
++            ip=ip,
++        )
++    )
++    up = cutlass.Float32(
++        llvm.inline_asm(
++            T.f32(),
++            [cutlass.Float32(up).ir_value(loc=loc, ip=ip), limit_ir],
++            "min.NaN.xorsign.abs.f32 $0, $1, $2;",
++            "=f,f,f",
++            has_side_effects=False,
++            is_align_stack=False,
++            asm_dialect=llvm.AsmDialect.AD_ATT,
++            loc=loc,
++            ip=ip,
++        )
++    )
++    return gate, up
++
++
+ def _m_specialization_key(size_m: int) -> int:
+     """M bucket for branches that genuinely specialize on token count."""
+     return 1 if int(size_m) == 1 else 0
+@@ -4686,10 +4720,9 @@ class W4A16FusedMoeKernel:
+                 raise ValueError(
+                     "intermediate_rotation is only supported for trellis3_t256"
+                 )
+-            if not is_gated or self.activation_is_swigluoai or self.has_swiglu_limit:
++            if not is_gated or self.activation_is_swigluoai:
+                 raise ValueError(
+-                    "intermediate_rotation requires plain gated silu "
+-                    "(no swiglu limit/oai)"
++                    "intermediate_rotation requires gated silu (no swiglu oai)"
+                 )
+             if int(intermediate_size) % 128 != 0:
+                 raise ValueError(
+@@ -4838,14 +4871,9 @@ class W4A16FusedMoeKernel:
+         up: cutlass.Float32,
+     ):
+         if cutlass.const_expr(self.has_swiglu_limit):
+-            limit = cutlass.Float32(self.swiglu_limit)
+-            neg_limit = cutlass.Float32(-self.swiglu_limit)
+-            if gate > limit:
+-                gate = limit
+-            if up > limit:
+-                up = limit
+-            if up < neg_limit:
+-                up = neg_limit
++            gate, up = _clamp_swiglu_f32(
++                gate, up, cutlass.Float32(self.swiglu_limit)
++            )
+         return gate, up
+ 
+     @cute.jit
+@@ -5227,7 +5255,9 @@ class W4A16FusedMoeKernel:
+             count_addr = get_ptr_as_int64(locks_i32_flat, Int32(self.barrier_count_off))
+             sense_addr = get_ptr_as_int64(locks_i32_flat, Int32(self.barrier_sense_off))
+             old_sense = ld_global_acquire_i32(sense_addr)
+-            old_count = atomic_add_global_i32(count_addr, Int32(1))
++            # Every arriving CTA must publish its writes. The last arrival
++            # acquires the preceding RMW chain before releasing the new sense.
++            old_count = atomic_add_global_acq_rel_i32(count_addr, Int32(1))
+             if old_count == grid_x - Int32(1):
+                 st_global_i32(count_addr, Int32(0))
+                 threadfence()
+@@ -5396,6 +5426,12 @@ class W4A16FusedMoeKernel:
+                 iu1 = uh1 * svu1
+                 iu2 = uh2 * svu2
+                 iu3 = uh3 * svu3
++                # Clamp in logical projection space, after inverse rotation
++                # and svh scaling, before SiLU and the down-input transform.
++                ig0, iu0 = self._clamp_swiglu_inputs(ig0, iu0)
++                ig1, iu1 = self._clamp_swiglu_inputs(ig1, iu1)
++                ig2, iu2 = self._clamp_swiglu_inputs(ig2, iu2)
++                ig3, iu3 = self._clamp_swiglu_inputs(ig3, iu3)
+                 down = isz + isz
+                 sd0 = rot_scales_flat[s_base + down + Int32(0)].to(cutlass.Float32)
+                 sd1 = rot_scales_flat[s_base + down + Int32(1)].to(cutlass.Float32)
+@@ -5658,6 +5694,10 @@ class W4A16FusedMoeKernel:
+                 iu2_1 = uh1 * svu1
+                 iu2_2 = uh2 * svu2
+                 iu2_3 = uh3 * svu3
++                ig2_0, iu2_0 = self._clamp_swiglu_inputs(ig2_0, iu2_0)
++                ig2_1, iu2_1 = self._clamp_swiglu_inputs(ig2_1, iu2_1)
++                ig2_2, iu2_2 = self._clamp_swiglu_inputs(ig2_2, iu2_2)
++                ig2_3, iu2_3 = self._clamp_swiglu_inputs(ig2_3, iu2_3)
+                 # silu(gate) * up, then pre-scale suh_down
+                 d2 = isz + isz
+                 sd0 = rot_scales_flat[s_base + d2 + Int32(0)].to(cutlass.Float32)
+diff --git a/sparkinfer/moe/_shared/kernels/w4a16/route_pack.py b/sparkinfer/moe/_shared/kernels/w4a16/route_pack.py
+index d3656ad..d41bd16 100644
+--- a/sparkinfer/moe/_shared/kernels/w4a16/route_pack.py
++++ b/sparkinfer/moe/_shared/kernels/w4a16/route_pack.py
+@@ -112,7 +112,9 @@ def _workspace_slice(
+     return tensor[:elements]
+ 
+ 
+-@triton.jit
++@triton.jit(
++    do_not_specialize=["live_numel", "max_packed_routes", "max_route_blocks"]
++)
+ def _pack_topk_routes_post_prefix_kernel(
+     packed_route_indices,
+     block_expert_ids,
+@@ -120,8 +122,8 @@ def _pack_topk_routes_post_prefix_kernel(
+     live_numel,
+     BLOCK_SIZE: tl.constexpr,
+     NUM_EXPERTS: tl.constexpr,
+-    MAX_PACKED_ROUTES: tl.constexpr,
+-    MAX_ROUTE_BLOCKS: tl.constexpr,
++    max_packed_routes,
++    max_route_blocks,
+     BLOCK_T: tl.constexpr,
+ ):
+     pid = tl.program_id(0)
+@@ -129,12 +131,12 @@ def _pack_topk_routes_post_prefix_kernel(
+     tl.store(
+         packed_route_indices + offsets,
+         live_numel,
+-        mask=offsets < MAX_PACKED_ROUTES,
++        mask=offsets < max_packed_routes,
+     )
+ 
+     block_rows = offsets * BLOCK_SIZE
+     block_experts = tl.full((BLOCK_T,), -1, dtype=tl.int32)
+-    valid_blocks = offsets < MAX_ROUTE_BLOCKS
++    valid_blocks = offsets < max_route_blocks
+     for expert in tl.range(0, NUM_EXPERTS):
+         start = tl.load(expert_offsets + expert)
+         end = tl.load(expert_offsets + expert + 1)
+@@ -485,10 +487,10 @@ def pack_topk_routes_by_expert(
+             block_expert_ids,
+             expert_offsets,
+             numel,
++            max_packed_routes=max_packed_routes,
++            max_route_blocks=max_route_blocks,
+             BLOCK_SIZE=int(block_size),
+             NUM_EXPERTS=int(num_experts),
+-            MAX_PACKED_ROUTES=max_packed_routes,
+-            MAX_ROUTE_BLOCKS=max_route_blocks,
+             BLOCK_T=_POST_PREFIX_BLOCK_T,
+             num_warps=4,
+         )
+diff --git a/sparkinfer/moe/trellis_moe/_impl.py b/sparkinfer/moe/trellis_moe/_impl.py
+index ef16a19..854542c 100644
+--- a/sparkinfer/moe/trellis_moe/_impl.py
++++ b/sparkinfer/moe/trellis_moe/_impl.py
+@@ -9,6 +9,7 @@ from math import prod
+ import torch
+ 
+ from ..._lib.scratch import ScratchBufferSpec, scratch_buffer_spec, scratch_tensor
++from .._shared.kernels.activations import normalize_swiglu_limit_for_activation
+ from .._shared.kernels.w4a16.host import (
+     W4A16BufferPlan,
+     max_packed_route_slots,
+@@ -104,6 +105,7 @@ class TrellisMoECaps:
+     trellis_bits: int = 3
+     tile_config: tuple[int, int, int, int] = _DEFAULT_TILE_CONFIG
+     activation: str = "silu"
++    swiglu_limit: float | None = None
+     fast_math: bool = True
+ 
+     def __post_init__(self) -> None:
+@@ -169,6 +171,10 @@ class TrellisMoECaps:
+         if str(self.activation).strip().lower() != "silu":
+             raise ValueError("the validated full-rotation Trellis recipe requires silu")
+         object.__setattr__(self, "activation", "silu")
++        object.__setattr__(
++            self, "swiglu_limit",
++            normalize_swiglu_limit_for_activation("silu", self.swiglu_limit),
++        )
+         object.__setattr__(self, "fast_math", bool(self.fast_math))
+ 
+     @property
+@@ -510,6 +516,7 @@ def plan_trellis_moe(caps: TrellisMoECaps) -> TrellisMoEPlan:
+             num_experts=caps.num_experts,
+             top_k=caps.num_topk,
+             activation=caps.activation,
++            swiglu_limit=caps.swiglu_limit,
+             apply_router_weight_on_input=False,
+             zero_fc2_output=False,
+             moe_block_size=caps.block_size_m,
+@@ -731,6 +738,7 @@ def run_trellis_moe(*, binding: TrellisMoEBinding) -> torch.Tensor:
+         binding.topk_weights,
+         binding.topk_ids,
+         activation=caps.activation,
++        swiglu_limit=caps.swiglu_limit,
+         intermediate_cache13=binding.intermediate_cache13,
+         intermediate_cache2=binding.intermediate_cache2,
+         output=binding.output,

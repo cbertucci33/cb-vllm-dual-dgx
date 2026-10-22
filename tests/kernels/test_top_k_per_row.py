@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+from functools import partial
+
 import numpy as np
 import pytest
 import torch
@@ -157,8 +159,7 @@ def compare_top_k_results(
     top_k: int,
     tolerance: float = 1e-5,
 ) -> bool:
-    """
-    Compare results from CUDA top_k_per_row with torch.topk.
+    """Compare results from CUDA top_k_per_row with torch.topk.
     Both results should be sorted and contain the same top-k elements.
     """
     num_rows = cuda_indices.shape[0]
@@ -213,8 +214,7 @@ def validate_topk_against_reference(
     top_k: int,
     kernel_name: str,
 ) -> None:
-    """
-    Validate CUDA top-k results against PyTorch reference implementation.
+    """Validate CUDA top-k results against PyTorch reference implementation.
 
     Args:
         logits: Input logits tensor
@@ -223,6 +223,7 @@ def validate_topk_against_reference(
         row_ends: Row end positions
         top_k: Number of top elements to select
         kernel_name: Name of the kernel being tested (for error messages)
+
     """
     num_rows = cuda_indices.shape[0]
     torch_indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
@@ -248,9 +249,7 @@ def test_top_k_per_row(
     top_k: int,
     clean_logits: bool,
 ) -> None:
-    """
-    Test top_k_per_row.
-    """
+    """Test top_k_per_row."""
     set_random_seed(0)
     torch.set_default_device("cuda:0")
 
@@ -298,9 +297,7 @@ def _run_top_k_per_row_decode_test(
     clean_logits: bool,
     data_generation: str,
 ) -> None:
-    """
-    Helper function to run top_k_per_row_decode test with given parameters.
-    """
+    """Helper function to run top_k_per_row_decode test with given parameters."""
     torch.set_default_device("cuda:0")
 
     # Create test data
@@ -365,9 +362,7 @@ def test_top_k_per_row_decode(
     clean_logits: bool,
     data_generation: str,
 ) -> None:
-    """
-    Test top_k_per_row with seq_lens tensor.
-    """
+    """Test top_k_per_row with seq_lens tensor."""
     set_random_seed(0)
     vocab_size = 20000
     _run_top_k_per_row_decode_test(
@@ -379,9 +374,7 @@ def test_top_k_per_row_decode(
 @pytest.mark.parametrize("clean_logits", [True, False])
 @torch.inference_mode()
 def test_top_k_per_row_decode_large_vocab_size(clean_logits: bool) -> None:
-    """
-    Test top_k_per_row_decode with large vocabulary size.
-    """
+    """Test top_k_per_row_decode with large vocabulary size."""
     set_random_seed(0)
     top_k = 2048
     batch_size = 2
@@ -645,8 +638,8 @@ def test_top_k_per_row_decode_gfx950_k512_masked_graph_replay() -> None:
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="This test requires ROCm")
 @torch.inference_mode()
 def test_aiter_c4a_prefill_topk_returns_sequence_local_indices() -> None:
+    from vllm._aiter_ops import rocm_aiter_ops
     from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
-        _get_aiter_top_k_kernel,
         _launch_aiter_top_k_per_row_prefill,
     )
 
@@ -656,17 +649,14 @@ def test_aiter_c4a_prefill_topk_returns_sequence_local_indices() -> None:
     top_k = 4
     indices = torch.empty((3, top_k), dtype=torch.int32, device="cuda")
 
-    aiter_topk_kernel = _get_aiter_top_k_kernel(
+    if not rocm_aiter_ops.is_indexer_top_k_supported(
         is_prefill=True,
         compress_ratio=4,
         num_rows=logits.shape[0],
-        on_gfx950=True,
-    )
-    if aiter_topk_kernel is None:
+    ):
         pytest.skip("AITER top-k is unavailable")
     assert (
         _launch_aiter_top_k_per_row_prefill(
-            aiter_topk_kernel,
             logits,
             row_starts,
             row_ends,
@@ -692,10 +682,7 @@ def test_aiter_c4a_prefill_topk_returns_sequence_local_indices() -> None:
 def test_aiter_c4a_decode_topk_uses_exact_mtp_lengths(
     num_speculative_tokens: int,
 ) -> None:
-    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
-        _get_aiter_top_k_kernel,
-        _launch_aiter_top_k_per_row_decode,
-    )
+    from vllm._aiter_ops import rocm_aiter_ops
 
     query_tokens = num_speculative_tokens + 1
     offsets = torch.arange(query_tokens, dtype=torch.int32, device="cuda")
@@ -710,20 +697,18 @@ def test_aiter_c4a_decode_topk_uses_exact_mtp_lengths(
     top_k = 4
     indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
 
-    aiter_topk_kernel = _get_aiter_top_k_kernel(
+    if not rocm_aiter_ops.is_indexer_top_k_supported(
         is_prefill=False,
         compress_ratio=4,
         num_rows=num_rows,
         max_valid_seq_len=seq_lens.max().item(),
-        on_gfx950=True,
-    )
-    if aiter_topk_kernel is None:
+    ):
         pytest.skip("AITER top-k is unavailable")
     assert (
-        _launch_aiter_top_k_per_row_decode(
-            aiter_topk_kernel,
+        rocm_aiter_ops.indexer_top_k_decode(
             logits,
-            seq_lens,
+            1,
+            seq_lens.reshape(-1),
             indices,
             top_k,
         )
@@ -738,130 +723,107 @@ def test_aiter_c4a_decode_topk_uses_exact_mtp_lengths(
         assert torch.all(indices[row_idx, num_valid:] == -1)
 
 
-def test_aiter_c4a_topk_kernel_selection(monkeypatch) -> None:
-    from vllm.v1.attention.ops import rocm_aiter_mla_sparse
+@requires_gfx950
+@torch.inference_mode()
+def test_aiter_decode_topk_matches_per_row_under_mtp() -> None:
+    """The aiter backend expands (B, 1) seq_lens into per-row ends before
+    launching, so next_n > 1 must agree with the in-tree kernel, including
+    the rows that clamp to a zero-length prefix.
+    """
+    from vllm.model_executor.layers.indexer_topk import get_indexer_topk
 
-    def prefill_kernel(*args, **kwargs) -> None:
-        pass
+    next_n = 4
+    top_k = 512
+    num_columns = 1024
+    seq_lens = torch.tensor([[2], [513], [700]], dtype=torch.int32, device="cuda")
+    num_rows = seq_lens.shape[0] * next_n
 
-    def decode_kernel(*args, **kwargs) -> None:
-        pass
+    torch.manual_seed(0)
+    logits = torch.randn(num_rows, num_columns, dtype=torch.float32, device="cuda")
+
+    outputs = {}
+    for backend in ("aiter", "per_row"):
+        indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
+        get_indexer_topk(backend)(logits, seq_lens, next_n, indices, top_k, num_columns)
+        outputs[backend] = indices
+
+    row_ends = (
+        (seq_lens - next_n + 1 + torch.arange(next_n, device="cuda"))
+        .clamp_(min=0)
+        .reshape(-1)
+        .tolist()
+    )
+    assert row_ends[:next_n] == [0, 0, 1, 2]
+
+    for row_idx, row_end in enumerate(row_ends):
+        num_valid = min(top_k, row_end)
+        aiter_row = outputs["aiter"][row_idx]
+        assert set(aiter_row[:num_valid].tolist()) == set(
+            outputs["per_row"][row_idx][:num_valid].tolist()
+        )
+        assert torch.all(aiter_row[num_valid:] == -1)
+
+
+def _enable_aiter_topk(monkeypatch, enabled: bool = True) -> None:
+    from vllm._aiter_ops import rocm_aiter_ops
 
     monkeypatch.setattr(
-        rocm_aiter_mla_sparse,
-        "_get_aiter_topk_ops",
-        lambda: (prefill_kernel, decode_kernel),
+        rocm_aiter_ops, "is_indexer_top_k_enabled", lambda: enabled, raising=True
     )
-    get_kernel = rocm_aiter_mla_sparse._get_aiter_top_k_kernel
+
+
+def test_aiter_c4a_topk_kernel_selection(monkeypatch) -> None:
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    _enable_aiter_topk(monkeypatch)
+    is_supported = rocm_aiter_ops.is_indexer_top_k_supported
 
     eligible_cases = [
-        (
-            dict(is_prefill=True, compress_ratio=4, num_rows=1, on_gfx950=True),
-            prefill_kernel,
+        dict(is_prefill=True, compress_ratio=4, num_rows=1),
+        dict(is_prefill=False, compress_ratio=4, num_rows=1, max_valid_seq_len=65_536),
+        dict(
+            is_prefill=False,
+            compress_ratio=4,
+            num_rows=257,
+            max_valid_seq_len=250_000,
         ),
-        (
-            dict(
-                is_prefill=False,
-                compress_ratio=4,
-                num_rows=1,
-                max_valid_seq_len=65_536,
-                on_gfx950=True,
-            ),
-            decode_kernel,
-        ),
-        (
-            dict(
-                is_prefill=False,
-                compress_ratio=4,
-                num_rows=257,
-                max_valid_seq_len=250_000,
-                num_columns=524_288,
-                on_gfx950=True,
-            ),
-            decode_kernel,
-        ),
-        (
-            dict(
-                is_prefill=False,
-                compress_ratio=2,
-                num_rows=385,
-                max_valid_seq_len=250_000,
-                num_columns=524_288,
-                topk_tokens=512,
-                on_gfx950=True,
-            ),
-            decode_kernel,
-        ),
-        (
-            dict(
-                is_prefill=False,
-                compress_ratio=2,
-                num_rows=384,
-                max_valid_seq_len=50_000,
-                num_columns=1_048_577,
-                topk_tokens=512,
-                on_gfx950=True,
-            ),
-            decode_kernel,
-        ),
-    ]
-    for kwargs, expected_kernel in eligible_cases:
-        assert get_kernel(**kwargs) is expected_kernel
-
-    def fail_if_imported() -> None:
-        pytest.fail("ineligible shapes must not import AITER top-k")
-
-    monkeypatch.setattr(
-        rocm_aiter_mla_sparse,
-        "_get_aiter_topk_ops",
-        fail_if_imported,
-    )
-    ineligible_cases = [
-        dict(is_prefill=True, compress_ratio=1, num_rows=1, on_gfx950=True),
         dict(
             is_prefill=False,
             compress_ratio=2,
             num_rows=384,
             max_valid_seq_len=1_048_576,
-            num_columns=1_048_576,
-            topk_tokens=512,
-            on_gfx950=True,
         ),
-        dict(
-            is_prefill=False,
-            compress_ratio=4,
-            num_rows=1,
-            max_valid_seq_len=65_537,
-            on_gfx950=True,
-        ),
+    ]
+    for kwargs in eligible_cases:
+        assert is_supported(**kwargs) is True
+
+    ineligible_cases = [
+        dict(is_prefill=True, compress_ratio=1, num_rows=1),
+        dict(is_prefill=False, compress_ratio=4, num_rows=1, max_valid_seq_len=65_537),
         dict(
             is_prefill=False,
             compress_ratio=4,
             num_rows=256,
             max_valid_seq_len=125_000,
-            on_gfx950=True,
-        ),
-        dict(
-            is_prefill=False,
-            compress_ratio=4,
-            num_rows=320,
-            max_valid_seq_len=2_500,
-            on_gfx950=False,
         ),
     ]
     for kwargs in ineligible_cases:
-        assert get_kernel(**kwargs) is None
+        assert is_supported(**kwargs) is False
 
-    monkeypatch.setattr(rocm_aiter_mla_sparse, "_get_aiter_topk_ops", lambda: None)
-    assert (
-        get_kernel(
-            is_prefill=True,
-            compress_ratio=4,
-            num_rows=1,
-            on_gfx950=True,
-        )
-        is None
-    )
+    _enable_aiter_topk(monkeypatch, enabled=False)
+    assert is_supported(is_prefill=True, compress_ratio=4, num_rows=1) is False
+
+
+def test_dsv4_native_top_k_window() -> None:
+    """The in-tree decode kernel's measured advantage band over AITER, which
+    applies to the DSV4 indexer only."""
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    prefers_native = rocm_aiter_ops.dsv4_indexer_prefers_native_top_k
+    assert prefers_native(num_rows=128, num_columns=524_288, topk_tokens=512) is True
+    assert prefers_native(num_rows=385, num_columns=524_288, topk_tokens=512) is False
+    assert prefers_native(num_rows=128, num_columns=1_048_577, topk_tokens=512) is False
+    assert prefers_native(num_rows=128, num_columns=524_288, topk_tokens=1024) is False
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
@@ -886,8 +848,7 @@ def test_deepseek_workspace_topk(
     next_n: int,
     backend: str,
 ) -> None:
-    """
-    Test workspace top-k backends with varying sequence lengths and speculative
+    """Test workspace top-k backends with varying sequence lengths and speculative
     decoding.
     Supports speculative decoding with next_n > 1.
     """
@@ -932,6 +893,106 @@ def test_deepseek_workspace_topk(
     )
 
 
+@pytest.mark.skipif(not _has_device_capability(80), reason="Requires SM80+")
+@pytest.mark.parametrize("rows", [65, 128])
+@pytest.mark.parametrize("top_k", [512, 1024, 2048])
+@pytest.mark.parametrize(
+    "distribution", ["random", "10LSBits", "ascending", "constant", "sampled_peaks"]
+)
+@torch.inference_mode()
+def test_persistent_topk_sampled_graph(
+    rows: int, top_k: int, distribution: str
+) -> None:
+    """Sampling and both fallbacks preserve exact values across graph replays."""
+    if torch.cuda.get_device_properties(0).shared_memory_per_block_optin < 144 * 1024:
+        pytest.skip("Sampled top-k requires at least 144 KiB of shared memory")
+    set_random_seed(42)
+    min_sampled_length = 98304 if top_k == 512 else 65536
+    width = min_sampled_length + 3
+    lengths = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+    logits = create_random_logits(
+        torch.zeros_like(lengths),
+        lengths,
+        torch.float32,
+        42,
+        False,
+        "10LSBits" if distribution == "10LSBits" else "random",
+    )
+    if distribution == "ascending":
+        logits.copy_(torch.arange(width, device="cuda", dtype=torch.float32))
+    elif distribution == "constant":
+        logits.fill_(1.0)
+    elif distribution == "sampled_peaks":
+        # A biased sample leaves fewer than k survivors and must fall back.
+        logits.zero_()
+        sample = torch.arange(4096, device="cuda")
+        positions = (sample // 32) * (width // 128) + sample % 32
+        logits[:, positions] = 1 + sample.float() / 4096
+    original = logits.clone()
+    indices = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+    workspace = torch.empty(RADIX_TOPK_WORKSPACE_SIZE, dtype=torch.uint8, device="cuda")
+
+    def run() -> None:
+        torch.ops._C.persistent_topk(
+            logits,
+            lengths.view(-1, 4 if rows == 128 else 1),
+            indices,
+            workspace,
+            top_k,
+            width,
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    positions = torch.arange(width, device="cuda")
+    slots = torch.arange(top_k, device="cuda")
+    for step in range(3):
+        bounds = torch.tensor(
+            [
+                -1,
+                0,
+                1,
+                top_k - 1,
+                top_k,
+                32769,
+                min_sampled_length - 1,
+                min_sampled_length,
+                width,
+                width + 17,
+            ],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        lengths.copy_(
+            bounds[(torch.arange(rows, device="cuda") + step) % bounds.numel()]
+        )
+        logits.copy_(original if step != 1 else original.flip(1))
+        logits.masked_fill_(positions[None] >= lengths[:, None], float("nan"))
+        indices.fill_(-2)
+        graph.replay()
+        valid = slots[None] < lengths.clamp(max=top_k)[:, None]
+        assert torch.all(indices[~valid] == -1)
+        assert torch.all(((indices >= 0) & (indices < lengths[:, None])) == valid)
+        ordered_indices = indices.sort(dim=1).values
+        assert torch.all(
+            (ordered_indices[:, 1:] != ordered_indices[:, :-1])
+            | (ordered_indices[:, 1:] == -1)
+        )
+        selected = logits.gather(1, indices.clamp_min(0).long())
+        selected.masked_fill_(~valid, -float("inf"))
+        expected = logits.masked_fill(
+            positions[None] >= lengths[:, None], -float("inf")
+        )
+        torch.testing.assert_close(
+            selected.sort(dim=1, descending=True).values,
+            expected.topk(top_k, dim=1).values,
+            atol=0,
+            rtol=0,
+        )
+
+
 def run_large_context_topk_test(
     batch_size: int,
     seq_lens: list[int],
@@ -940,8 +1001,7 @@ def run_large_context_topk_test(
     seed: int = 42,
     backend: str = "cooperative_topk",
 ) -> None:
-    """
-    Helper to run a top-k backend test with given parameters.
+    """Helper to run a top-k backend test with given parameters.
 
     Args:
         batch_size: Number of rows/sequences
@@ -950,6 +1010,7 @@ def run_large_context_topk_test(
         data_type: Type of test data to generate
         seed: Random seed for reproducibility
         backend: Top-k backend to test
+
     """
     torch.set_default_device("cuda:0")
     set_random_seed(seed)
@@ -1174,8 +1235,7 @@ def test_cooperative_topk_cs2(top_k: int) -> None:
 @pytest.mark.parametrize("backend", WORKSPACE_TOPK_BACKENDS)
 @torch.inference_mode()
 def test_workspace_topk_correctness(test_config: dict, backend: str) -> None:
-    """
-    Comprehensive correctness tests covering:
+    """Comprehensive correctness tests covering:
     - Sequence length edge cases (trivial, boundary, varied)
     - Very small sequences (< 100 elements)
     - Mixed sequence lengths in same batch
@@ -1239,8 +1299,7 @@ def test_workspace_topk_correctness(test_config: dict, backend: str) -> None:
 @pytest.mark.parametrize("backend", WORKSPACE_TOPK_BACKENDS)
 @torch.inference_mode()
 def test_workspace_topk_algorithm_paths(test_config: dict, backend: str) -> None:
-    """
-    Test different algorithm execution paths (capped at 163840 for DeepSeek V3.2):
+    """Test different algorithm execution paths (capped at 163840 for DeepSeek V3.2):
     - Batch size scalability (1, 4, 32, 256)
     - Single-CTA vs Multi-CTA execution
     - Extreme configurations (large batch, max context length)
@@ -1257,8 +1316,7 @@ def test_workspace_topk_algorithm_paths(test_config: dict, backend: str) -> None
 @pytest.mark.parametrize("backend", WORKSPACE_TOPK_BACKENDS)
 @torch.inference_mode()
 def test_workspace_topk_stress(backend: str) -> None:
-    """
-    Stress test with random configurations to catch edge cases.
+    """Stress test with random configurations to catch edge cases.
     Capped at 163840 (DeepSeek V3.2 max context) for realistic testing.
     """
     torch.set_default_device("cuda:0")
@@ -1405,8 +1463,7 @@ def test_cooperative_topk_512_tie_workspace_is_per_row() -> None:
 @pytest.mark.parametrize("backend", WORKSPACE_TOPK_BACKENDS)
 @torch.inference_mode()
 def test_workspace_topk(test_config: dict, top_k: int, backend: str) -> None:
-    """
-    Tests specific to workspace top-k backends:
+    """Tests specific to workspace top-k backends:
     - Mixed medium/large rows in the same batch (dynamic per-row dispatch)
     - Boundary around LARGE_THRESHOLD (32K)
     - Trivial + medium + large rows in a single batch
@@ -1463,76 +1520,26 @@ def test_persistent_topk_reused_group_after_short_row() -> None:
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
-@pytest.mark.parametrize(
-    ("top_k", "seq_len", "num_rows"),
-    [
-        pytest.param(512, 800_000, 1, id="glm53-production-shape"),
-        pytest.param(2048, 400_000, 2, id="deepseek-long-context-shape"),
-        pytest.param(1024, 32_769, 2, id="radix-threshold-boundary"),
-    ],
-)
 @torch.inference_mode()
-def test_persistent_topk_low_smem_long_rows_are_exact(
-    top_k: int, seq_len: int, num_rows: int
-) -> None:
-    """The low-smem, non-cooperative path must preserve exact top-k values."""
-    props = torch.cuda.get_device_properties(0)
-    if props.shared_memory_per_block_optin >= 128 * 1024:
-        pytest.skip("The non-cooperative path requires less than 128 KiB opt-in smem")
-
-    set_random_seed(7)
-    logits = torch.randn(num_rows, seq_len, dtype=torch.float32, device="cuda")
-    if num_rows > 1:
-        logits[1, : top_k + 64] = 1.0
-    lengths = torch.full((num_rows,), seq_len, dtype=torch.int32, device="cuda")
-    indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
-
-    _run_topk_backend(
-        "persistent_topk", logits, lengths, indices, top_k, seq_len
-    )
-    torch.accelerator.synchronize()
-
-    actual = logits.gather(1, indices.to(torch.int64)).sort(dim=1).values
-    expected = logits.topk(top_k, dim=1).values.sort(dim=1).values
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
-@torch.inference_mode()
-def test_persistent_topk_low_smem_is_deterministic() -> None:
-    """Identical GB10 rows must produce byte-identical selected indices."""
-    props = torch.cuda.get_device_properties(0)
-    if props.shared_memory_per_block_optin >= 128 * 1024:
-        pytest.skip("The non-cooperative path requires less than 128 KiB opt-in smem")
-
+def test_persistent_topk_overflowing_threshold_bin_is_exact() -> None:
+    """Decode and medium paths must not truncate an oversized threshold bin."""
     top_k = 512
-    seq_len = 35_000
-    num_rows = 4
-    set_random_seed(260919)
-    logits = torch.randn(num_rows, seq_len, dtype=torch.float32, device="cuda")
-    logits[0].fill_(-1.0)
-    logits[0, : top_k + 128] = 1.0
-    logits[1].fill_(-1.0)
-    logits[1, 0 : 2 * top_k : 2] = 0.0
-    logits[1, 1 : 2 * top_k : 2] = -0.0
-    lengths = torch.full((num_rows,), seq_len, dtype=torch.int32, device="cuda")
+    width = 8193
+    lengths = torch.tensor([8192, 8193], dtype=torch.int32, device="cuda")
+    # Distinct FP32 scores share one FP16 decode bin and one coarse FP32 byte
+    # bin. Both single-CTA paths therefore exceed their tie buffers.
+    row = torch.arange(width, dtype=torch.float32, device="cuda") * 2**-23 + 1.0
+    logits = row.expand(2, -1).clone()
+    indices = torch.empty((2, top_k), dtype=torch.int32, device="cuda")
 
-    reference = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
-    _run_topk_backend(
-        "persistent_topk", logits, lengths, reference, top_k, seq_len
-    )
-    torch.accelerator.synchronize()
-    expected_tie_indices = torch.arange(top_k, dtype=torch.int32, device="cuda")
-    torch.testing.assert_close(reference[0], expected_tie_indices, rtol=0, atol=0)
-    torch.testing.assert_close(reference[1], expected_tie_indices, rtol=0, atol=0)
+    _run_topk_backend("persistent_topk", logits, lengths, indices, top_k, width)
 
-    for _ in range(20):
-        actual = torch.empty_like(reference)
-        _run_topk_backend(
-            "persistent_topk", logits, lengths, actual, top_k, seq_len
-        )
-        torch.accelerator.synchronize()
-        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    for row_idx, length in enumerate((8192, 8193)):
+        row_indices = indices[row_idx]
+        assert torch.unique(row_indices).numel() == top_k
+        selected = logits[row_idx, row_indices.long()].sort(descending=True).values
+        expected = logits[row_idx, :length].topk(top_k).values
+        assert torch.equal(selected, expected)
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
@@ -1540,8 +1547,7 @@ def test_persistent_topk_low_smem_is_deterministic() -> None:
 @pytest.mark.parametrize("backend", WORKSPACE_TOPK_BACKENDS)
 @torch.inference_mode()
 def test_workspace_topk_padded_stride(top_k: int, backend: str) -> None:
-    """
-    Test workspace top-k backends with padded logits (large stride, small seq_len)
+    """Test workspace top-k backends with padded logits (large stride, small seq_len)
     to simulate the e2e CUDAGraph scenario where fp8_paged_mqa_logits
     returns [B, max_model_len] with max_model_len=163840.
     """
@@ -1683,29 +1689,6 @@ def _has_flashinfer_topk() -> bool:
     return importlib.util.find_spec("flashinfer") is not None
 
 
-def _has_flashinfer_gvr2() -> bool:
-    """FlashInfer with the gvr_2 top_k_varlen backend (SM100 family only).
-    Probes the package tree so collection does not import flashinfer."""
-    if not _has_flashinfer_topk() or not current_platform.is_device_capability_family(
-        100
-    ):
-        return False
-    import importlib.util
-    import os
-
-    spec = importlib.util.find_spec("flashinfer")
-    assert spec is not None and spec.submodule_search_locations
-    return any(
-        os.path.exists(os.path.join(p, "topk_varlen", "kernels", "gvr2_topk_host.py"))
-        for p in spec.submodule_search_locations
-    )
-
-
-requires_flashinfer_gvr2 = pytest.mark.skipif(
-    not _has_flashinfer_gvr2(), reason="requires flashinfer gvr_2 top-k on SM100"
-)
-
-
 def _has_cooperative_topk() -> bool:
     return _has_device_capability(
         90
@@ -1739,7 +1722,6 @@ SPARSE_INDEXER_EXPLICIT_BACKENDS = [
             not _has_flashinfer_topk(), reason="requires flashinfer top-k"
         ),
     ),
-    pytest.param("flashinfer_gvr2", marks=requires_flashinfer_gvr2),
     pytest.param("deep_select", marks=requires_sm100),
 ]
 
@@ -1815,7 +1797,6 @@ def test_sparse_indexer_decode_topk_explicit_backends(
                 not _has_flashinfer_topk(), reason="requires flashinfer top-k"
             ),
         ),
-        pytest.param("flashinfer_gvr2", marks=requires_flashinfer_gvr2),
         pytest.param("deep_select", marks=requires_sm100),
     ],
 )
@@ -1872,59 +1853,44 @@ def test_sparse_indexer_topk_backend_resolution() -> None:
 
     def resolve(
         backend: str,
-        t: torch.Tensor | None = None,
+        t: torch.Tensor = logits,
         k: int = 2048,
         num_rows: int = 64,
     ) -> str:
         cfg = VllmConfig(kernel_config={"sparse_indexer_topk_backend": backend})
         with set_current_vllm_config(cfg):
-            return SparseIndexerTopk().resolve_backend(
-                logits if t is None else t, k, num_rows
-            )
+            return SparseIndexerTopk().resolve_backend(t, k, num_rows)
 
     is_sm100 = current_platform.is_device_capability_family(100)
     has_coop = _has_cooperative_topk()
     has_fi = _has_flashinfer_topk()
-    has_gvr2 = _has_flashinfer_gvr2()
 
-    if has_gvr2:
-        # Wide rows (>= 32K) go to gvr_2 regardless of the row count or the
-        # DeepSelect alignment; narrow rows keep the pre-existing chain.
-        assert resolve("auto") == "flashinfer_gvr2"
-        assert resolve("auto", k=512, num_rows=128) == "flashinfer_gvr2"
-        assert resolve("auto", unaligned_logits, num_rows=128) == "flashinfer_gvr2"
-        assert resolve("auto", k=5000) == "per_row"
-        assert resolve("flashinfer_gvr2", num_rows=1) == "flashinfer_gvr2"
-        with pytest.raises(RuntimeError, match="topk_tokens must be in"):
-            resolve("flashinfer_gvr2", k=3000)
-        with pytest.raises(RuntimeError, match="fp32"):
-            resolve("flashinfer_gvr2", logits.to(torch.bfloat16))
-        # Row pitch not a multiple of 4 (float4 loads): refused explicitly,
-        # and "auto" never picks gvr_2 for it.
-        odd_pitch = torch.randn(64, 131074, dtype=torch.float32, device="cuda")[
-            :, :131072
-        ]
-        with pytest.raises(RuntimeError, match="multiple of 4"):
-            resolve("flashinfer_gvr2", odd_pitch)
-        assert resolve("auto", odd_pitch) != "flashinfer_gvr2"
-        logits = logits[:, :16384]
-        unaligned_logits = unaligned_logits[:, :16384]
-    else:
-        with pytest.raises(RuntimeError, match="gvr_2|SM100|CUDA"):
-            resolve("flashinfer_gvr2")
-
-    # Otherwise "auto" is exactly the pre-existing chain: cooperative ->
-    # persistent -> per_row. It must never select the opt-in backends by
-    # itself.
+    # "auto" is the chain cooperative -> persistent -> per_row, with the
+    # cooperative/persistent switch at cooperative_topk's cluster-wave row
+    # limit. It must never select the opt-in backends by itself.
     if has_coop:
-        assert resolve("auto") == "cooperative"
+        from vllm.model_executor.layers.indexer_topk import (
+            AUTO_COOPERATIVE_MAX_ROWS,
+        )
+
+        # cooperative for every batch within its cluster-wave row limit...
+        assert (
+            resolve("auto", k=512, num_rows=AUTO_COOPERATIVE_MAX_ROWS) == "cooperative"
+        )
         assert resolve("auto", k=512, num_rows=8) == "cooperative"
-        # Past cooperative's 64-row limit -> persistent, even where
-        # DeepSelect would be applicable.
+        # ...persistent past the row limit, even where DeepSelect would be
+        # applicable.
+        assert (
+            resolve("auto", k=512, num_rows=AUTO_COOPERATIVE_MAX_ROWS + 1)
+            == "persistent"
+        )
         assert resolve("auto", k=512, num_rows=128) == "persistent"
-        # 16B-aligned (cooperative TMA ok) but not DeepSelect-aligned:
-        # still cooperative at <= 64 rows...
-        assert resolve("auto", unaligned_logits, num_rows=64) == "cooperative"
+        # 16B-aligned (cooperative TMA ok) but not DeepSelect-aligned: the
+        # same row-limit logic applies.
+        assert (
+            resolve("auto", unaligned_logits, num_rows=AUTO_COOPERATIVE_MAX_ROWS)
+            == "cooperative"
+        )
     # ...and persistent past the row limit.
     assert resolve("auto", unaligned_logits, num_rows=128) == "persistent"
     # Unsupported topk (outside {512, 1024, 2048} for the workspace kernels)
@@ -1939,7 +1905,7 @@ def test_sparse_indexer_topk_backend_resolution() -> None:
         assert resolve("cooperative") == "cooperative"
     if has_fi:
         assert resolve("flashinfer") == "flashinfer"
-    if is_sm100 and hasattr(torch.ops.deep_select, "get_alignment_requirement"):
+    if is_sm100:
         # Explicit deep_select has no row-count requirement.
         assert resolve("deep_select", num_rows=1) == "deep_select"
         with pytest.raises(RuntimeError, match="constraints"):
@@ -1955,3 +1921,337 @@ def test_sparse_indexer_topk_backend_resolution() -> None:
     if not is_sm100:
         with pytest.raises(RuntimeError, match="SM100a/SM103a"):
             resolve("deep_select")
+
+
+def _patch_aiter_topk(monkeypatch, decode_kernel, enabled: bool = True) -> None:
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    _enable_aiter_topk(monkeypatch, enabled=enabled)
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: enabled, raising=True)
+    monkeypatch.setattr(rocm_aiter_ops, "indexer_top_k_decode", decode_kernel)
+
+
+def _make_topk(backend: str):
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.indexer_topk import SparseIndexerTopk
+
+    cfg = VllmConfig(kernel_config={"sparse_indexer_topk_backend": backend})
+    with set_current_vllm_config(cfg):
+        return SparseIndexerTopk()
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
+def test_sparse_indexer_topk_aiter_requires_rocm() -> None:
+    """Explicitly requesting the ROCm-only backend must fail fast elsewhere."""
+    logits = torch.randn(8, 4096, dtype=torch.float32, device="cuda")
+    with pytest.raises(RuntimeError, match="ROCm"):
+        _make_topk("aiter").resolve_backend(logits, 2048, 8)
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="requires ROCm")
+def test_sparse_indexer_topk_backend_resolution_aiter(monkeypatch) -> None:
+    """Aiter is opt-in only: "auto" never selects it (the shape-dependent perf
+    gate lives at the call site), and an explicit request validates hard
+    capability only."""
+
+    def decode_kernel(*args, **kwargs) -> None:
+        pass
+
+    _patch_aiter_topk(monkeypatch, decode_kernel)
+    logits = torch.randn(8, 4096, dtype=torch.float32, device="cuda")
+
+    assert _make_topk("auto").resolve_backend(logits, 2048, 8) == "per_row"
+    assert _make_topk("aiter").resolve_backend(logits, 2048, 8) == "aiter"
+    # Shapes the call-site perf gate would decline still resolve.
+    assert _make_topk("aiter").resolve_backend(logits, 512, 8) == "aiter"
+    with pytest.raises(RuntimeError, match="topk_tokens must be in"):
+        _make_topk("aiter").resolve_backend(logits, 3000, 8)
+
+    _enable_aiter_topk(monkeypatch, enabled=False)
+    with pytest.raises(RuntimeError, match="no tuned indexer top-k kernels"):
+        _make_topk("aiter").resolve_backend(logits, 2048, 8)
+
+    _patch_aiter_topk(monkeypatch, decode_kernel, enabled=False)
+    assert _make_topk("auto").resolve_backend(logits, 2048, 8) == "per_row"
+    with pytest.raises(RuntimeError, match="VLLM_ROCM_USE_AITER"):
+        _make_topk("aiter").resolve_backend(logits, 2048, 8)
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="requires ROCm")
+@torch.inference_mode()
+def test_sparse_indexer_topk_aiter_applies_no_shape_gate(monkeypatch) -> None:
+    """Shape-dependent perf gating belongs to the call site: once "aiter" is
+    requested the dispatcher must run it for every supported k, including the
+    k=512 band the in-tree kernel wins on DSV4's compressed-KV logits."""
+    from vllm.model_executor.layers import indexer_topk
+
+    calls: list[tuple] = []
+    _patch_aiter_topk(monkeypatch, lambda *args: calls.append(args))
+    monkeypatch.setattr(
+        indexer_topk.ops,
+        "top_k_per_row_decode",
+        lambda *args: pytest.fail("an explicit aiter request must not fall back"),
+    )
+
+    num_rows = 8
+    logits = torch.randn(num_rows, 4096, dtype=torch.float32, device="cuda")
+    seq_lens = torch.full((num_rows, 1), 4096, dtype=torch.int32, device="cuda")
+    indices = torch.empty((num_rows, 512), dtype=torch.int32, device="cuda")
+    op = _make_topk("aiter")
+
+    op(logits, seq_lens, 1, indices, 512, 4096)
+    # Past the compressed-context boundary the call-site gate declines on.
+    op(logits, seq_lens, 1, indices, 512, 4 * (64 * 1024 + 1))
+    assert len(calls) == 2
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="requires ROCm")
+@torch.inference_mode()
+def test_sparse_indexer_topk_auto_stays_on_per_row(monkeypatch) -> None:
+    """The "auto" chain must not reach AITER on its own: the decode top-k runs
+    through top_k_per_row_decode unless the caller asks for the aiter backend."""
+    from vllm.model_executor.layers import indexer_topk
+
+    def decode_kernel(*args, **kwargs) -> None:
+        pytest.fail("AITER is opt-in only")
+
+    _patch_aiter_topk(monkeypatch, decode_kernel)
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        indexer_topk.ops, "top_k_per_row_decode", lambda *args: calls.append(args)
+    )
+
+    num_rows = 8
+    logits = torch.randn(num_rows, 4096, dtype=torch.float32, device="cuda")
+    seq_lens = torch.full((num_rows, 1), 4096, dtype=torch.int32, device="cuda")
+    indices = torch.empty((num_rows, 1024), dtype=torch.int32, device="cuda")
+
+    _make_topk("auto")(logits, seq_lens, 1, indices, 1024, 4096)
+    assert len(calls) == 1
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="requires ROCm")
+@torch.inference_mode()
+def test_sparse_indexer_topk_aiter_expands_mtp_row_ends(monkeypatch) -> None:
+    """AITER's decode kernel only implements the next_n == 1 form, so spec
+    decode batches must be handed the equivalent expanded per-row ends."""
+    from vllm.model_executor.layers import indexer_topk
+
+    recorded: dict = {}
+
+    def decode_kernel(logits, next_n, seq_lens, *args, **kwargs) -> None:
+        recorded["next_n"] = next_n
+        recorded["row_ends"] = seq_lens.tolist()
+
+    _patch_aiter_topk(monkeypatch, decode_kernel)
+    monkeypatch.setattr(
+        indexer_topk.ops,
+        "top_k_per_row_decode",
+        lambda *args: pytest.fail("an explicit aiter request must not fall back"),
+    )
+
+    next_n = 2
+    logits = torch.randn(4, 4096, dtype=torch.float32, device="cuda")
+    seq_lens = torch.tensor([[100], [200]], dtype=torch.int32, device="cuda")
+    indices = torch.empty((4, 1024), dtype=torch.int32, device="cuda")
+
+    _make_topk("aiter")(logits, seq_lens, next_n, indices, 1024, 800)
+
+    assert recorded["next_n"] == 1
+    assert recorded["row_ends"] == [99, 100, 199, 200]
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@pytest.mark.parametrize("top_k", [512, 1024, 2048])
+@pytest.mark.parametrize("graph", [False, True])
+@torch.inference_mode()
+def test_persistent_topk_decode_tail_is_not_a_candidate(top_k, graph) -> None:
+    """Poison physically present float4 tails; only logical rows may be read."""
+    device = "cuda"
+    width = top_k + 4
+    lengths = torch.tensor(
+        [top_k + 1, top_k + 2, top_k + 3], dtype=torch.int32, device=device
+    )
+    logits = torch.full((3, width), float("-inf"), device=device)
+    for row, length in enumerate((top_k + 1, top_k + 2, top_k + 3)):
+        logits[row, length:] = float("inf")
+    indices = torch.full((3, top_k), -1, dtype=torch.int32, device=device)
+    workspace = torch.empty(RADIX_TOPK_WORKSPACE_SIZE, dtype=torch.uint8, device=device)
+
+    def run():
+        torch.ops._C.persistent_topk(logits, lengths, indices, workspace, top_k, width)
+
+    run()
+    if graph:
+        captured = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(captured):
+            run()
+        captured.replay()
+    torch.accelerator.synchronize()
+    for row, length in enumerate((top_k + 1, top_k + 2, top_k + 3)):
+        selected = indices[row]
+        assert ((selected >= 0) & (selected < length)).all()
+        assert torch.unique(selected).numel() == top_k
+        assert torch.isneginf(logits[row, selected.long()]).all()
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@pytest.mark.parametrize("top_k", [512, 1024, 2048])
+@pytest.mark.parametrize("graph", [False, True])
+@torch.inference_mode()
+def test_persistent_topk_histogram_publication_and_reuse(top_k, graph) -> None:
+    """Alternating score bytes must not reuse incomplete/stale CTA histograms."""
+    device = "cuda"
+    # Each row exceeds RADIX_THRESHOLD; all have an unaligned logical tail.
+    row_lengths = (32769, 65539, 131075)
+    width = 131076
+    lengths = torch.tensor(row_lengths, dtype=torch.int32, device=device)
+    ramp = torch.arange(width, dtype=torch.float32, device=device)
+    logits = torch.empty((len(row_lengths), width), device=device)
+    indices = torch.empty((len(row_lengths), top_k), dtype=torch.int32, device=device)
+    workspace = torch.empty(RADIX_TOPK_WORKSPACE_SIZE, dtype=torch.uint8, device=device)
+
+    def run():
+        torch.ops._C.persistent_topk(logits, lengths, indices, workspace, top_k, width)
+
+    logits.copy_(ramp.expand_as(logits))
+    run()
+    captured = None
+    if graph:
+        captured = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(captured):
+            run()
+    # Three histogram-ring positions, each exercised with both score orders.
+    for ring_position in range(3):
+        for descending in (False, True):
+            logits.copy_((-ramp if descending else ramp).expand_as(logits))
+            if captured is None:
+                run()
+            else:
+                captured.replay()
+            torch.accelerator.synchronize()
+            for row, length in enumerate(row_lengths):
+                selected = indices[row]
+                assert ((selected >= 0) & (selected < length)).all()
+                assert torch.unique(selected).numel() == top_k
+                values = logits[row, selected.long()].sort().values
+                expected = logits[row, :length].topk(top_k).values.sort().values
+                torch.testing.assert_close(values, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@pytest.mark.parametrize("top_k", [512, 1024, 2048])
+@pytest.mark.parametrize("stride1", [1, 2])
+@pytest.mark.parametrize("scores", ["negative_infinity", "ramp"])
+@pytest.mark.parametrize("graph_mode", [False, True])
+@torch.inference_mode()
+def test_generic_topk_padding_and_split_row_contract(
+    top_k: int, stride1: int, scores: str, graph_mode: bool
+) -> None:
+    """Neither radix sort padding nor short split segments are real entries."""
+    for width in (16384, 200001):
+        row_lengths = [0, top_k - 1, top_k, top_k + 1, 3 * top_k + 1, width]
+        storage = torch.full(
+            (len(row_lengths), width * stride1),
+            float("inf"),
+            dtype=torch.float32,
+            device="cuda",
+        )
+        logits = storage[:, ::stride1]
+        for row, length in enumerate(row_lengths):
+            if scores == "negative_infinity":
+                logits[row, :length] = float("-inf")
+                # Force a partially filled -inf threshold bin for K=2048 too.
+                if length > top_k:
+                    logits[row, 0] = 1.0
+            else:
+                logits[row, :length] = torch.arange(
+                    length, dtype=torch.float32, device="cuda"
+                )
+        lengths = torch.tensor(row_lengths, dtype=torch.int32, device="cuda")
+        output = torch.empty(
+            (len(row_lengths), top_k), dtype=torch.int32, device="cuda"
+        )
+
+        launch = partial(
+            _run_topk_backend,
+            "top_k_per_row_decode",
+            logits,
+            lengths,
+            output,
+            top_k,
+            width,
+        )
+
+        launch()
+        if graph_mode:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                launch()
+            graph.replay()
+        torch.accelerator.synchronize()
+
+        for row, length in enumerate(row_lengths):
+            valid_count = min(top_k, length)
+            actual = output[row, :valid_count].long()
+            assert bool(((actual >= 0) & (actual < length)).all())
+            assert actual.unique().numel() == valid_count
+            assert bool((output[row, valid_count:] == -1).all())
+            selected = logits[row, actual].sort().values
+            reference = logits[row, :length].topk(valid_count).values.sort().values
+            assert torch.equal(selected, reference)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@pytest.mark.parametrize("top_k", [512, 1024, 2048])
+@pytest.mark.parametrize("stride1", [1, 2])
+@pytest.mark.parametrize("graph_mode", [False, True])
+@torch.inference_mode()
+def test_generic_prefill_radix_negative_infinity_is_not_padding(
+    top_k: int, stride1: int, graph_mode: bool
+) -> None:
+    """Row 12288 selects the prefill radix kernel; earlier rows stay empty."""
+    num_rows = 12289
+    row_start = 7
+    width = row_start + top_k + 1
+    storage = torch.full(
+        (num_rows, width * stride1),
+        float("inf"),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    logits = storage[:, ::stride1]
+    logits[-1, row_start:] = float("-inf")
+    logits[-1, row_start] = 1.0
+    starts = torch.full((num_rows,), row_start, dtype=torch.int32, device="cuda")
+    ends = starts.clone()
+    ends[-1] = width
+    output = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
+
+    def launch():
+        torch.ops._C.top_k_per_row_prefill(
+            logits,
+            starts,
+            ends,
+            output,
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            top_k,
+        )
+
+    launch()
+    if graph_mode:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launch()
+        graph.replay()
+    torch.accelerator.synchronize()
+
+    assert bool((output[:-1] == -1).all())
+    actual = output[-1].long()
+    assert bool(((actual >= 0) & (actual < top_k + 1)).all())
+    assert actual.unique().numel() == top_k
+    selected = logits[-1, row_start + actual].sort().values
+    reference = logits[-1, row_start:].topk(top_k).values.sort().values
+    assert torch.equal(selected, reference)

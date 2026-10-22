@@ -1,0 +1,156 @@
+commit 201abe31aa56f597412efdf67ab651206b93c6d0
+Author: operator <operator@localhost>
+Date:   Sun Oct 18 14:41:20 2026 -0500
+
+    Fix sparse MLA verification for scoped autotuning
+    
+    Preserve the public decode target, sparse fallback and export checks. Test the shipped wrapper and reject broken routes.
+    
+    Assisted-by: OpenClaw operator
+    
+    Signed-off-by: operator <operator@localhost>
+
+diff --git a/build/verify_runtime.py b/build/verify_runtime.py
+index c8bda07c07..3462a9c095 100644
+--- a/build/verify_runtime.py
++++ b/build/verify_runtime.py
+@@ -334,6 +334,35 @@ def verify_flashinfer_memory_ordering_headers(
+             )
+ 
+ 
++def verify_flashinfer_sparse_mla_wrapper(source: str, exports: list[str]) -> None:
++    """Require the exported decode route to preserve scoped sparse autotuning."""
++    wrapper_name = "flashinfer_trtllm_batch_decode_with_kv_cache_mla"
++    expected = ast.parse(
++        "_autotune_sparse_mla_call(_lazy_import_wrapper("
++        "'flashinfer.decode', 'trtllm_batch_decode_with_kv_cache_mla', "
++        "fallback_fn=_missing_sparse_mla))",
++        mode="eval",
++    ).body
++    assignments = [
++        node.value
++        for node in ast.parse(source).body
++        if isinstance(node, ast.Assign)
++        and any(
++            isinstance(target, ast.Name) and target.id == wrapper_name
++            for target in node.targets
++        )
++    ]
++    if (
++        len(assignments) != 1
++        or ast.dump(assignments[0]) != ast.dump(expected)
++        or wrapper_name not in exports
++    ):
++        raise RuntimeError(
++            "vllm.utils.flashinfer wrapper must retain scoped autotuning around "
++            "the public FlashInfer decode symbol and sparse-MLA fallback"
++        )
++
++
+ def verify_flashinfer() -> None:
+     required = {
+         "query",
+@@ -448,25 +477,9 @@ def verify_flashinfer() -> None:
+             "vllm.utils.flashinfer sparse-MLA route does not resolve to FlashInfer"
+         )
+     utils_path = Path(inspect.getsourcefile(utils) or "")
+-    utils_tree = ast.parse(utils_path.read_text(encoding="utf-8"))
+-    alias_found = any(
+-        isinstance(node, ast.Assign)
+-        and any(
+-            isinstance(target, ast.Name) and target.id == wrapper_name
+-            for target in node.targets
+-        )
+-        and isinstance(node.value, ast.Call)
+-        and isinstance(node.value.func, ast.Name)
+-        and node.value.func.id == "_lazy_import_wrapper"
+-        and tuple(ast.literal_eval(arg) for arg in node.value.args[:2])
+-        == ("flashinfer.decode", "trtllm_batch_decode_with_kv_cache_mla")
+-        for node in ast.walk(utils_tree)
++    verify_flashinfer_sparse_mla_wrapper(
++        utils_path.read_text(encoding="utf-8"), utils.__all__
+     )
+-    if not alias_found or wrapper_name not in utils.__all__:
+-        raise RuntimeError(
+-            "vllm.utils.flashinfer wrapper is not wired to the public "
+-            "FlashInfer decode symbol"
+-        )
+ 
+     impl_path = Path(inspect.getsourcefile(impl) or "")
+     impl_tree = ast.parse(impl_path.read_text(encoding="utf-8"))
+diff --git a/tests/build/test_verify_runtime.py b/tests/build/test_verify_runtime.py
+index 58d9f11812..12fc143adb 100644
+--- a/tests/build/test_verify_runtime.py
++++ b/tests/build/test_verify_runtime.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import ast
+ from importlib.util import module_from_spec, spec_from_file_location
+ from pathlib import Path
+ from types import SimpleNamespace
+@@ -219,3 +220,50 @@ def test_dependency_closure_rejects_arbitrary_active_mismatch(monkeypatch) -> No
+ 
+     with pytest.raises(RuntimeError, match="requires dependency==1"):
+         verify_runtime.verify_dependency_closure()
++
++
++def _sparse_mla_wrapper_contract() -> tuple[str, list[str]]:
++    source = (_MODULE_PATH.parents[1] / "vllm/utils/flashinfer.py").read_text()
++    exports = next(
++        ast.literal_eval(node.value)
++        for node in ast.parse(source).body
++        if isinstance(node, ast.Assign)
++        and any(isinstance(t, ast.Name) and t.id == "__all__" for t in node.targets)
++    )
++    return source, exports
++
++
++def test_sparse_mla_verifier_accepts_actual_scoped_public_route() -> None:
++    """The shipped autotuning wrapper must not fail the old direct-alias check."""
++    verify_runtime.verify_flashinfer_sparse_mla_wrapper(*_sparse_mla_wrapper_contract())
++
++
++@pytest.mark.parametrize(
++    ("original", "replacement"),
++    [
++        ('"flashinfer.decode",', '"flashinfer.mla",'),
++        ('"trtllm_batch_decode_with_kv_cache_mla",', '"wrong_decode",'),
++        ("fallback_fn=_missing_sparse_mla,", "fallback_fn=_missing,"),
++        (
++            (
++                "flashinfer_trtllm_batch_decode_with_kv_cache_mla = "
++                "_autotune_sparse_mla_call("
++            ),
++            "flashinfer_trtllm_batch_decode_with_kv_cache_mla = (",
++        ),
++    ],
++)
++def test_sparse_mla_verifier_rejects_broken_route(original, replacement) -> None:
++    source, exports = _sparse_mla_wrapper_contract()
++    assert original in source
++    with pytest.raises(RuntimeError, match="must retain scoped autotuning"):
++        verify_runtime.verify_flashinfer_sparse_mla_wrapper(
++            source.replace(original, replacement, 1), exports
++        )
++
++
++def test_sparse_mla_verifier_requires_public_export() -> None:
++    source, exports = _sparse_mla_wrapper_contract()
++    exports.remove("flashinfer_trtllm_batch_decode_with_kv_cache_mla")
++    with pytest.raises(RuntimeError, match="must retain scoped autotuning"):
++        verify_runtime.verify_flashinfer_sparse_mla_wrapper(source, exports)
+diff --git a/tools/pre_commit/test_tethering_allowlist.txt b/tools/pre_commit/test_tethering_allowlist.txt
+index cc5294cf26..5e53d1b2b0 100644
+--- a/tools/pre_commit/test_tethering_allowlist.txt
++++ b/tools/pre_commit/test_tethering_allowlist.txt
+@@ -70,3 +70,8 @@ tests/platforms/test_cpu.py  # CPU-only unit test; no job targets tests/platform
+ 
+ # tests/tools/
+ tests/tools/test_config_validator.py  # logic covered by the validate-config pre-commit hook; no test_areas job
++
++# Downstream runner build verification.
++tests/build/test_verify_runtime.py  # downstream runner packaging suite; run locally for image acceptance, not upstream Buildkite
++tests/models/test_mimo_v2_forward_contract.py  # downstream model-contract suite; local runner validation, not upstream Buildkite
++tests/tools/test_slice_exl3_checkpoint.py  # downstream EXL3 slicer-contract suite; local artifact validation, not upstream Buildkite

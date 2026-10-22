@@ -1,0 +1,50 @@
+diff --git a/tests/quantization/test_exl3_prefill_plan.py b/tests/quantization/test_exl3_prefill_plan.py
+index 0ac8d8c6ea..51f350a92d 100644
+--- a/tests/quantization/test_exl3_prefill_plan.py
++++ b/tests/quantization/test_exl3_prefill_plan.py
+@@ -216,10 +216,9 @@ def _zero_mcg_full_rotation_reference(x, up_sign, limit):
+ @pytest.mark.parametrize("limit", [10.0, None], ids=["glm-limit10", "no-limit"])
+ @pytest.mark.parametrize("up_sign", [1.0, -1.0], ids=["positive-up", "negative-up"])
+ @pytest.mark.parametrize("num_rows", [1, 32, 33])
+-@pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
+ @torch.inference_mode()
+ def test_rank_sliced_real_rotated_swiglu_limit_and_graph_replay(
+-    monkeypatch, limit, up_sign, num_rows, ids_dtype
++    monkeypatch, limit, up_sign, num_rows
+ ):
+     """G01 regression: real planned native math, expected to fail until G01 repair.
+ 
+@@ -286,7 +285,7 @@ def test_rank_sliced_real_rotated_swiglu_limit_and_graph_replay(
+     x[:, 0] = amplitudes[torch.arange(num_rows, device=device) % 4] / (
+         128 * _ZERO_MCG_WEIGHT
+     )
+-    ids = torch.zeros((num_rows, 1), device=device, dtype=ids_dtype)
++    ids = torch.zeros((num_rows, 1), device=device, dtype=torch.int64)
+     routing = torch.ones((num_rows, 1), device=device, dtype=torch.float32)
+     expected = _zero_mcg_full_rotation_reference(x, up_sign, limit)
+     try:
+@@ -309,24 +308,3 @@ def test_rank_sliced_real_rotated_swiglu_limit_and_graph_replay(
+                 torch.testing.assert_close(captured, expected, rtol=2e-2, atol=2e-3)
+     finally:
+         method.release_runtime_resources()
+-
+-
+-@pytest.mark.parametrize("rank_sliced", [False, True])
+-@pytest.mark.parametrize("input_dtype", [torch.int32, torch.int64])
+-def test_exl3_router_id_dtype_avoids_rank_sliced_cast(rank_sliced, input_dtype):
+-    from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
+-
+-    method = _make_method()
+-    if not rank_sliced:
+-        method.quant_config.rank_sliced_metadata = None
+-    expected_dtype = torch.int32 if rank_sliced else torch.int64
+-    native_ids = torch.tensor([[0, 1, 255, 287]], dtype=input_dtype)
+-    # Exercise the conversion used by BaseRouter._select_experts.
+-    routed_ids = BaseRouter._convert_indices_dtype(
+-        None, native_ids, method.topk_indices_dtype
+-    )
+-    assert routed_ids.dtype == expected_dtype
+-    assert torch.equal(routed_ids.to(torch.int64), native_ids.to(torch.int64))
+-    if input_dtype == expected_dtype:
+-        assert routed_ids is native_ids
+-        assert routed_ids.data_ptr() == native_ids.data_ptr()

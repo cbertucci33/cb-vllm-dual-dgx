@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""
-Standard attention benchmark runner - shared utilities for non-MLA benchmarks.
+"""Standard attention benchmark runner - shared utilities for non-MLA benchmarks.
 
 This module provides helpers for running standard attention backends
 (FlashAttention, Triton, FlashInfer) with real vLLM integration.
@@ -57,8 +56,7 @@ from vllm.v1.kv_cache_interface import (
 
 
 def _get_backend_config(backend: str) -> dict:
-    """
-    Get backend configuration from AttentionBackendEnum.
+    """Get backend configuration from AttentionBackendEnum.
 
     Args:
         backend: Backend name matching AttentionBackendEnum exactly
@@ -66,6 +64,7 @@ def _get_backend_config(backend: str) -> dict:
 
     Returns:
         Dict with backend_class
+
     """
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -224,12 +223,11 @@ def _create_backend_impl(
 
     scale = get_attention_scale(config.head_dim)
 
-    # Set v_head_dim for diff-headdim backends. Always reset (defaulting to
-    # head_dim) so a prior run's value doesn't leak into this one via the
-    # backend's class-level state.
-    if hasattr(backend_class, "set_head_size_v"):
-        v_dim = config.v_head_dim if config.v_head_dim is not None else config.head_dim
-        backend_class.set_head_size_v(v_dim)
+    impl_kwargs = {}
+    if backend_class.get_name() in ("FLASH_ATTN_DIFFKV", "TRITON_ATTN_DIFFKV"):
+        impl_kwargs["head_size_v"] = (
+            config.v_head_dim if config.v_head_dim is not None else config.head_dim
+        )
 
     impl = backend_class.get_impl_cls()(
         num_heads=config.num_q_heads,
@@ -239,12 +237,14 @@ def _create_backend_impl(
         alibi_slopes=None,
         sliding_window=None,
         kv_cache_dtype=config.kv_cache_dtype,
+        **impl_kwargs,
     )
 
     kv_cache_spec = FullAttentionSpec(
         block_size=config.block_size,
         num_kv_heads=config.num_kv_heads,
         head_size=config.head_dim,
+        head_size_v=config.v_head_dim,
         dtype=dtype,
     )
 
@@ -360,6 +360,7 @@ def _create_kv_cache(
         block_size=config.block_size,
         num_kv_heads=config.num_kv_heads,
         head_size=config.head_dim,
+        head_size_v=config.v_head_dim,
         dtype=cache_dtype,
     )
     # Apply the backend's page customization, as the worker does for the real spec.
@@ -409,6 +410,7 @@ def _run_single_benchmark(
     Returns:
         (timing_stats, mem_stats) where timing_stats is a dict with
         mean/std/min/max in seconds per layer.
+
     """
     total_q = q_list[0].shape[0]
     v_dim = config.v_head_dim if config.v_head_dim is not None else config.head_dim
@@ -458,8 +460,7 @@ def _run_single_benchmark(
 
 
 def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
-    """
-    Run standard attention benchmark with real kernels.
+    """Run standard attention benchmark with real kernels.
 
     Supports: FLASH_ATTN, TRITON_ATTN, FLASHINFER
 
@@ -468,6 +469,7 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
 
     Returns:
         BenchmarkResult with timing and memory statistics
+
     """
     device = torch.device(config.device)
     torch.accelerator.set_device_index(device)
@@ -514,6 +516,7 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
                 block_size=config.block_size,
                 num_kv_heads=config.num_kv_heads,
                 head_size=config.head_dim,
+                head_size_v=config.v_head_dim,
                 dtype=dtype,
             )
 

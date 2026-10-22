@@ -1,0 +1,193 @@
+# syntax=docker/dockerfile:1.7
+# Overlay the image produced by the repository's official docker/Dockerfile.
+# This is the single model-agnostic image overlay; no checkpoint/model is copied.
+ARG VLLM_BASE_IMAGE
+ARG VLLM_BASE_IMAGE_ID
+ARG BUILD_BASE_IMAGE
+ARG CUDA_DEVEL_IMAGE
+ARG FINAL_BASE_IMAGE
+FROM ${CUDA_DEVEL_IMAGE} AS cuda-devel
+
+FROM ${VLLM_BASE_IMAGE} AS runner
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ARG VLLM_BASE_IMAGE
+ARG VLLM_BASE_IMAGE_ID
+ARG BUILD_BASE_IMAGE
+ARG CUDA_DEVEL_IMAGE
+ARG FINAL_BASE_IMAGE
+ARG VLLM_SOURCE_COMMIT
+ARG CUDA_VERSION=13.0.3
+ARG PYTHON_VERSION=3.12
+ARG NCCL_VERSION=2.30.7
+ARG CUSPARSELT_VERSION=0.8.1
+ARG CUSPARSELT_WHEEL_SHA256
+ARG FLASHINFER_COMMIT
+ARG FLASHINFER_CCCL_COMMIT
+ARG FLASHINFER_CUTLASS_COMMIT
+ARG FLASHINFER_NIXL_COMMIT
+ARG FLASHINFER_SPDLOG_COMMIT
+ARG SPARKINFER_COMMIT
+ARG EXLLAMAV3_COMMIT
+ARG B12X_COMMIT
+ARG B12X_VERSION=1.3.0
+ARG FLASHKDA_COMMIT
+ARG FLASHKDA_CUTLASS_COMMIT
+ARG VLLM_CUTLASS_COMMIT
+ARG NVIDIA_CUTLASS_DSL_VERSION=4.8.0
+ARG CMAKE_VERSION=4.1.0
+ARG NINJA_VERSION=1.13.0
+ARG MAX_JOBS=2
+ARG NVCC_THREADS=1
+
+# Downstream native patches share an upstream FlashInfer revision. Keep their
+# persistent JIT artifacts separate across runner revisions and rollbacks.
+ENV TORCH_CUDA_ARCH_LIST=12.1a \
+    VLLM_SOURCE_COMMIT=${VLLM_SOURCE_COMMIT} \
+    VLLM_EXL3_EXT_PATH=/usr/local/lib/python3.12/dist-packages \
+    FLASHINFER_CUDA_ARCH_LIST=12.1a \
+    MAX_JOBS=${MAX_JOBS} \
+    NVCC_THREADS=${NVCC_THREADS} \
+    FLASHINFER_WORKSPACE_BASE=/cache/jit/flashinfer/${FLASHINFER_COMMIT}/${VLLM_SOURCE_COMMIT}
+
+# vLLM's runtime image intentionally omits CUDA headers. The matching 13.0.3
+# development toolchain is used here for native builds and is retained in this
+# overlay stage; the vLLM base and its public/runtime package pins remain those
+# produced by docker/Dockerfile.
+COPY --from=cuda-devel /usr/local/cuda-13.0/ /usr/local/cuda-13.0/
+COPY build/versions.env build/verify_runtime.py build/build_flashinfer_topk.py build/reconcile_torch_nccl_metadata.py build/provenance.json /opt/vllm-runner/
+COPY cmake/external_projects/vllm_flash_attn.cmake /opt/vllm-runner/source-manifests/vllm_flash_attn.cmake
+COPY cmake/external_projects/deepgemm.cmake /opt/vllm-runner/source-manifests/deepgemm.cmake
+COPY build/build_instanttensor.py /opt/vllm-runner/build_instanttensor.py
+COPY build/media-requirements.txt /opt/vllm-runner/media-requirements.txt
+COPY build/patches/ /opt/vllm-runner/patches/
+COPY build/tests/flashinfer_compact_cache_contract.cu /opt/vllm-runner/
+COPY build/profiles/ /opt/vllm-runner/profiles/
+COPY build/assets/glm53/chat_template.jinja /opt/glm53/chat_template.jinja
+COPY tools/dflash_calibration/*.py tools/dflash_calibration/README.md /opt/vllm-runner/tools/dflash_calibration/
+WORKDIR /opt/vllm-runner
+RUN set -eux; \
+    flashkda_path="$(python3 -c 'import importlib.util,pathlib; print(next(pathlib.Path(importlib.util.find_spec("vllm").origin).parent.glob("_flashkda_C*.so")))')"; \
+    flashkda_sha256="$(sha256sum "${flashkda_path}" | cut -d' ' -f1)"; \
+    printf '{"schema_version":1,"origin":"official_source_build","base_image_id":"%s","path":"%s","sha256":"%s"}\n' \
+      "${VLLM_BASE_IMAGE_ID}" "${flashkda_path}" "${flashkda_sha256}" \
+      > /opt/vllm-runner/inherited-native.json; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends git build-essential; \
+    python3 -c 'import importlib.metadata as m; assert m.version("transformers") == "5.17.0"'; \
+    transformers_root="$(python3 -c 'import importlib.util,pathlib; print(pathlib.Path(importlib.util.find_spec("transformers").origin).parent)')"; \
+    git -C "${transformers_root}" apply --check /opt/vllm-runner/patches/transformers-glm5next-temporal-budget.patch; \
+    git -C "${transformers_root}" apply /opt/vllm-runner/patches/transformers-glm5next-temporal-budget.patch; \
+    printf 'nvidia-cusparselt-cu13==%s --hash=sha256:%s\n' \
+      "${CUSPARSELT_VERSION}" "${CUSPARSELT_WHEEL_SHA256}" > /tmp/cusparselt.txt; \
+    python3 -m pip install --no-deps --force-reinstall --require-hashes \
+      --index-url https://pypi.org/simple -r /tmp/cusparselt.txt; \
+    python3 /opt/vllm-runner/reconcile_torch_nccl_metadata.py \
+      --nccl-version "${NCCL_VERSION}" \
+      --cusparselt-version "${CUSPARSELT_VERSION}"; \
+    rm -f /tmp/cusparselt.txt; \
+    rm -rf /var/lib/apt/lists/*; \
+    test "$(python3 -c 'import torch; print(torch.__version__.split("+")[0])')" = "2.13.0"; \
+    python3 -c 'import pathlib,site,shutil; roots=[pathlib.Path(p) for p in site.getsitepackages()]; candidates=[q for root in roots for q in root.glob("ninja-*.dist-info")]; [shutil.rmtree(p) for p in candidates]'; \
+    python3 -m pip install --no-deps "cmake==${CMAKE_VERSION}" "ninja==${NINJA_VERSION}"; \
+    python3 -m pip uninstall -y flashinfer-python flashinfer-cubin flashinfer-jit-cache; \
+    python3 -c 'import pathlib,site,shutil; roots=[pathlib.Path(p) for p in site.getsitepackages()]; candidates=[q for root in roots for n in ("flashinfer","flashinfer_cubin","flashinfer_jit_cache") for q in [root/n] if q.exists() or q.is_symlink()]; candidates += [q for root in roots for q in root.glob("flashinfer*.dist-info")]; candidates += list(pathlib.Path("/root/.cache").glob("flashinfer*")); candidates += [pathlib.Path("/cache/jit/flashinfer")]; [(shutil.rmtree(p) if p.is_dir() and not p.is_symlink() else p.unlink()) for p in candidates if p.exists() or p.is_symlink()]'; \
+    mkdir -p /opt/vllm-runner/sources; \
+    git init --quiet /opt/vllm-runner/sources/flashinfer; \
+    git -C /opt/vllm-runner/sources/flashinfer remote add origin https://github.com/flashinfer-ai/flashinfer.git; \
+    git -C /opt/vllm-runner/sources/flashinfer fetch --quiet --depth 1 origin "${FLASHINFER_COMMIT}"; \
+    git -C /opt/vllm-runner/sources/flashinfer checkout --quiet --detach FETCH_HEAD; \
+    test "$(git -C /opt/vllm-runner/sources/flashinfer rev-parse HEAD)" = "${FLASHINFER_COMMIT}"; \
+    git -C /opt/vllm-runner/sources/flashinfer submodule update --init --recursive --depth 1; \
+    test "$(git -C /opt/vllm-runner/sources/flashinfer/3rdparty/cccl rev-parse HEAD)" = "${FLASHINFER_CCCL_COMMIT}"; \
+    test "$(git -C /opt/vllm-runner/sources/flashinfer/3rdparty/cutlass rev-parse HEAD)" = "${FLASHINFER_CUTLASS_COMMIT}"; \
+    test "$(git -C /opt/vllm-runner/sources/flashinfer/3rdparty/nixl rev-parse HEAD)" = "${FLASHINFER_NIXL_COMMIT}"; \
+    test "$(git -C /opt/vllm-runner/sources/flashinfer/3rdparty/spdlog rev-parse HEAD)" = "${FLASHINFER_SPDLOG_COMMIT}"; \
+    git -C /opt/vllm-runner/sources/flashinfer apply --check /opt/vllm-runner/patches/flashinfer-sm120-memory-order.patch; \
+    git -C /opt/vllm-runner/sources/flashinfer apply /opt/vllm-runner/patches/flashinfer-sm120-memory-order.patch; \
+    git -C /opt/vllm-runner/sources/flashinfer apply --check /opt/vllm-runner/patches/flashinfer-glm53-compact-cache.patch; \
+    git -C /opt/vllm-runner/sources/flashinfer apply /opt/vllm-runner/patches/flashinfer-glm53-compact-cache.patch; \
+    git -C /opt/vllm-runner/sources/flashinfer apply --check /opt/vllm-runner/patches/flashinfer-sparse-invalid-kv.patch; \
+    git -C /opt/vllm-runner/sources/flashinfer apply /opt/vllm-runner/patches/flashinfer-sparse-invalid-kv.patch; \
+    git init --quiet /opt/vllm-runner/sources/sparkinfer; \
+    git -C /opt/vllm-runner/sources/sparkinfer remote add origin https://github.com/local-inference-lab/b12x.git; \
+    git -C /opt/vllm-runner/sources/sparkinfer fetch --quiet --depth 1 origin "${SPARKINFER_COMMIT}"; \
+    git -C /opt/vllm-runner/sources/sparkinfer checkout --quiet --detach FETCH_HEAD; \
+    test "$(git -C /opt/vllm-runner/sources/sparkinfer rev-parse HEAD)" = "${SPARKINFER_COMMIT}"; \
+    git -C /opt/vllm-runner/sources/sparkinfer apply --check /opt/vllm-runner/patches/sparkinfer-cutlass-dsl.patch; \
+    git -C /opt/vllm-runner/sources/sparkinfer apply /opt/vllm-runner/patches/sparkinfer-cutlass-dsl.patch; \
+    git -C /opt/vllm-runner/sources/sparkinfer apply --check /opt/vllm-runner/patches/sparkinfer-trellis-swiglu-limit.patch; \
+    git -C /opt/vllm-runner/sources/sparkinfer apply /opt/vllm-runner/patches/sparkinfer-trellis-swiglu-limit.patch; \
+    git -C /opt/vllm-runner/sources/sparkinfer apply --check /opt/vllm-runner/patches/sparkinfer-trellis-barrier-order.patch; \
+    git -C /opt/vllm-runner/sources/sparkinfer apply /opt/vllm-runner/patches/sparkinfer-trellis-barrier-order.patch; \
+    git -C /opt/vllm-runner/sources/sparkinfer apply --check /opt/vllm-runner/patches/sparkinfer-small-prefix-histogram.patch; \
+    git -C /opt/vllm-runner/sources/sparkinfer apply /opt/vllm-runner/patches/sparkinfer-small-prefix-histogram.patch; \
+    git init --quiet /opt/vllm-runner/sources/exllamav3; \
+    git -C /opt/vllm-runner/sources/exllamav3 remote add origin https://github.com/turboderp-org/exllamav3.git; \
+    git -C /opt/vllm-runner/sources/exllamav3 fetch --quiet --depth 1 origin "${EXLLAMAV3_COMMIT}"; \
+    git -C /opt/vllm-runner/sources/exllamav3 checkout --quiet --detach FETCH_HEAD; \
+    test "$(git -C /opt/vllm-runner/sources/exllamav3 rev-parse HEAD)" = "${EXLLAMAV3_COMMIT}"; \
+    git -C /opt/vllm-runner/sources/exllamav3 apply --check /opt/vllm-runner/patches/exllamav3-aarch64.patch; \
+    git -C /opt/vllm-runner/sources/exllamav3 apply /opt/vllm-runner/patches/exllamav3-aarch64.patch; \
+    git -C /opt/vllm-runner/sources/exllamav3 apply --check /opt/vllm-runner/patches/exllamav3-startup-safety.patch; \
+    git -C /opt/vllm-runner/sources/exllamav3 apply /opt/vllm-runner/patches/exllamav3-startup-safety.patch; \
+    git -C /opt/vllm-runner/sources/exllamav3 apply --check /opt/vllm-runner/patches/exllamav3-compiler-memory.patch; \
+    git -C /opt/vllm-runner/sources/exllamav3 apply /opt/vllm-runner/patches/exllamav3-compiler-memory.patch; \
+    git init --quiet /opt/vllm-runner/sources/b12x; \
+    git -C /opt/vllm-runner/sources/b12x remote add origin https://github.com/local-inference-lab/b12x.git; \
+    git -C /opt/vllm-runner/sources/b12x fetch --quiet --depth 1 origin "${B12X_COMMIT}"; \
+    git -C /opt/vllm-runner/sources/b12x checkout --quiet --detach FETCH_HEAD; \
+    test "$(git -C /opt/vllm-runner/sources/b12x rev-parse HEAD)" = "${B12X_COMMIT}"; \
+    git -C /opt/vllm-runner/sources/b12x apply --check /opt/vllm-runner/patches/b12x-cutlass-dsl.patch; \
+    git -C /opt/vllm-runner/sources/b12x apply /opt/vllm-runner/patches/b12x-cutlass-dsl.patch; \
+    install -D /opt/vllm-runner/profiles/nvidia.gb10.48sm.json.gz /opt/vllm-runner/sources/b12x/b12x/policy/_profiles/data/nvidia.gb10.48sm.json.gz; \
+    test "$(git -C /opt/vllm-runner/sources/b12x rev-parse HEAD)" = "${B12X_COMMIT}"; \
+    python3 -m pip install --no-deps --no-build-isolation \
+      /opt/vllm-runner/sources/flashinfer /opt/vllm-runner/sources/sparkinfer \
+      /opt/vllm-runner/sources/exllamav3 /opt/vllm-runner/sources/b12x; \
+    export FLASHINFER_CUDA_ARCH_LIST=12.1a FLASHINFER_DISABLE_VERSION_CHECK=1 \
+      FLASHINFER_NVCC_THREADS="${NVCC_THREADS}"; \
+    /usr/local/cuda/bin/nvcc -std=c++17 -arch=sm_121a -I/opt/vllm-runner/sources/flashinfer/include -c /opt/vllm-runner/flashinfer_compact_cache_contract.cu -o /opt/vllm-runner/flashinfer_compact_cache_contract.o; \
+    python3 /opt/vllm-runner/build_flashinfer_topk.py /opt/vllm-runner/sources/flashinfer /tmp/topk; \
+    install -D -m 0755 /tmp/topk/flashinfer-topk-sm121.so \
+      "$(python3 -c 'import importlib.util,pathlib; print(pathlib.Path(importlib.util.find_spec("flashinfer").origin).parent / "data/aot/topk/topk.so")')"; \
+    rm -rf /cache/jit/flashinfer; \
+    python3 -m pip check; \
+    python3 /opt/vllm-runner/build_instanttensor.py --version 0.2.2 \
+      --work-dir /opt/vllm-runner/sources/instanttensor-build \
+      --wheel-dir /opt/vllm-runner/instanttensor-wheels; \
+    python3 -m pip install --no-deps --force-reinstall \
+      /opt/vllm-runner/instanttensor-wheels/instanttensor-0.2.2-1-*.whl; \
+    python3 /opt/vllm-runner/verify_runtime.py --build-only
+
+# Media decoding dependencies are additive: never resolve or replace Torch,
+# CUDA, NumPy, or the existing model-serving dependency stack.
+RUN python3 -m pip install --no-deps --require-hashes \
+      -r /opt/vllm-runner/media-requirements.txt && \
+    python3 -m pip check && \
+    python3 -c 'import av, scipy, soundfile, soxr, torchaudio; import torch; assert torch.__version__.split("+")[0] == "2.13.0"'
+
+WORKDIR /vllm-workspace
+
+LABEL org.opencontainers.image.revision="${VLLM_SOURCE_COMMIT}" \
+      org.opencontainers.image.base.name="${VLLM_BASE_IMAGE}" \
+      io.vllm-runner.vllm-base.id="${VLLM_BASE_IMAGE_ID}" \
+      io.vllm-runner.build-base="${BUILD_BASE_IMAGE}" \
+      io.vllm-runner.final-base="${FINAL_BASE_IMAGE}" \
+      io.vllm-runner.cuda-devel="${CUDA_DEVEL_IMAGE}" \
+      io.vllm-runner.cuda="${CUDA_VERSION}" \
+      io.vllm-runner.python="${PYTHON_VERSION}" \
+      io.vllm-runner.nccl="${NCCL_VERSION}" \
+      io.vllm-runner.flashinfer.revision="${FLASHINFER_COMMIT}" \
+      io.vllm-runner.cusparselt="${CUSPARSELT_VERSION}" \
+      io.vllm-runner.cusparselt.wheel-sha256="${CUSPARSELT_WHEEL_SHA256}" \
+      io.vllm-runner.flashinfer.cccl.revision="${FLASHINFER_CCCL_COMMIT}" \
+      io.vllm-runner.flashinfer.cutlass.revision="${FLASHINFER_CUTLASS_COMMIT}" \
+      io.vllm-runner.flashinfer.nixl.revision="${FLASHINFER_NIXL_COMMIT}" \
+      io.vllm-runner.flashinfer.spdlog.revision="${FLASHINFER_SPDLOG_COMMIT}" \
+      io.vllm-runner.sparkinfer.revision="${SPARKINFER_COMMIT}" \
+      io.vllm-runner.exllamav3.revision="${EXLLAMAV3_COMMIT}" \
+      io.vllm-runner.b12x.revision="${B12X_COMMIT}" \
+      io.vllm-runner.flashkda.revision="${FLASHKDA_COMMIT}" \
+      io.vllm-runner.flashkda.cutlass.revision="${FLASHKDA_CUTLASS_COMMIT}" \
+      io.vllm-runner.flashkda.origin="official_source_build" \
+      io.vllm-runner.vllm-cutlass.revision="${VLLM_CUTLASS_COMMIT}"

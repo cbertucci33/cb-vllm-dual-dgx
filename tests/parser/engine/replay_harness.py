@@ -34,6 +34,7 @@ class Sample:
     tools: list[dict] | None = None
     chat_template_kwargs: dict | None = None
     prompt_token_ids: list[int] | None = None
+    content_lstrip: str | None = None
 
 
 @dataclass
@@ -183,6 +184,7 @@ def replay_streaming(
 
     Returns:
         List of ``DeltaMessage`` results from each ``parse_delta()`` call.
+
     """
     if chunk_size is None:
         chunk_size = len(tokens)
@@ -424,3 +426,47 @@ def assert_no_terminal_leakage(
         assert terminal not in actual.content, (
             f"{terminal!r} leaked into content{suffix}"
         )
+
+
+def load_local_model_parser(profile: str):
+    """Load artifact tokenizers offline; never download or execute artifact code."""
+    import os
+
+    import pytest
+    from transformers import AutoTokenizer
+
+    from vllm.parser import ParserManager
+
+    path = os.environ.get(f"VLLM_TEST_{profile.upper()}_TOKENIZER")
+    if not path:
+        pytest.skip(f"local {profile} tokenizer fixture not configured")
+    tokenizer = AutoTokenizer.from_pretrained(
+        path, local_files_only=True, trust_remote_code=False
+    )
+    reason, tool = ("mimo", "mimo") if profile == "mimo" else ("glm45", "glm47")
+    parser_cls = ParserManager.get_parser(
+        reasoning_parser_name=reason, tool_parser_name=tool, enable_auto_tools=True
+    )
+    return tokenizer, parser_cls
+
+
+def replay_real_tokens(parser, tokenizer, token_ids, request, split):
+    """Replay two detokenized chunks, then an empty terminal flush."""
+    deltas = []
+    previous = ""
+    for start, end in ((0, split), (split, len(token_ids))):
+        decoded = tokenizer.decode(token_ids[:end]).rstrip("\ufffd")
+        assert decoded.startswith(previous)
+        delta = parser.parse_delta(
+            decoded[len(previous) :],
+            list(token_ids[start:end]),
+            request,
+            finished=False,
+        )
+        previous = decoded
+        if delta is not None:
+            deltas.append(delta)
+    delta = parser.parse_delta("", [], request, finished=True)
+    if delta is not None:
+        deltas.append(delta)
+    return deltas

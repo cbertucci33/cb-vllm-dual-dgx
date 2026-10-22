@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+from time import sleep
+
 import pytest
 import torch
 from PIL import Image
@@ -263,7 +267,6 @@ def test_group_and_batch_mm_items_split_by_shared_data():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 @pytest.mark.parametrize("num_items", [1, 3])
 def test_group_and_batch_mm_items_pinned_h2d(num_items):
-    """Staging through pinned memory must not change any batched value."""
     items = [
         MultiModalKwargsItem(
             {
@@ -285,9 +288,156 @@ def test_group_and_batch_mm_items_pinned_h2d(num_items):
         )
         for i in range(num_items)
     ]
+    [(_, staged)] = group_and_batch_mm_items(items, device="cuda", pin_memory=True)
+    [(_, direct)] = group_and_batch_mm_items(items, device="cuda")
+    assert staged.keys() == direct.keys()
+    for key, value in direct.items():
+        assert nested_tensors_equal(staged[key], value), key
 
-    [(_, pinned)] = group_and_batch_mm_items(items, device="cuda", pin_memory=True)
-    [(_, expected)] = group_and_batch_mm_items(items, device="cuda")
-    assert pinned.keys() == expected.keys()
-    for key, value in expected.items():
-        assert nested_tensors_equal(pinned[key], value), key
+
+def test_xpu_mm_transfer_keeps_generic_pinned_copy_path(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm.multimodal.inputs as mm_inputs
+
+    pin_requests = []
+    transfers = []
+    original_new_empty = torch.Tensor.new_empty
+
+    def fake_new_empty(tensor, *args, **kwargs):
+        pin_requests.append(kwargs.pop("pin_memory", False))
+        return original_new_empty(tensor, *args, **kwargs)
+
+    def fake_to(tensor, *args, **kwargs):
+        transfers.append((kwargs.get("device"), kwargs.get("non_blocking")))
+        return tensor
+
+    def unexpected_cuda_use(*args, **kwargs):
+        raise AssertionError("XPU staging must not use CUDA streams or events")
+
+    monkeypatch.setattr(torch.Tensor, "new_empty", fake_new_empty)
+    monkeypatch.setattr(torch.Tensor, "to", fake_to)
+    monkeypatch.setattr(torch.Tensor, "is_pinned", lambda tensor: True)
+    monkeypatch.setattr(torch.cuda, "current_stream", unexpected_cuda_use)
+    monkeypatch.setattr(torch.cuda, "stream", unexpected_cuda_use)
+    monkeypatch.setattr(torch, "Event", unexpected_cuda_use)
+    monkeypatch.setattr(mm_inputs, "_get_pinned_staging_buffer", unexpected_cuda_use)
+
+    items = [
+        MultiModalKwargsItem(
+            {
+                "pixel_values": MultiModalFieldElem(
+                    torch.full((2, 3), value), MultiModalBatchedField()
+                )
+            }
+        )
+        for value in (1, 2)
+    ]
+    [(_, grouped)] = group_and_batch_mm_items(
+        items, device=torch.device("xpu"), pin_memory=True
+    )
+
+    assert pin_requests == [True]
+    assert transfers == [(torch.device("xpu"), True)]
+    expected = torch.tensor([[[1, 1, 1], [1, 1, 1]], [[2, 2, 2], [2, 2, 2]]])
+    assert torch.equal(grouped["pixel_values"], expected)
+
+
+def test_mm_batching_releases_staging_lease_after_stack_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm.multimodal.inputs as mm_inputs
+    from vllm.utils import torch_utils
+    from vllm.utils.torch_utils import PinnedStagingBuffer
+
+    staging = PinnedStagingBuffer(4096)
+    monkeypatch.setattr(
+        torch_utils,
+        "_pinned_uint8_buffer",
+        lambda capacity: torch.empty(capacity, dtype=torch.uint8),
+    )
+    monkeypatch.setattr(mm_inputs, "_pinned_staging_buffer", staging)
+
+    def fail_stack(*args, **kwargs):
+        raise RuntimeError("stack failed")
+
+    monkeypatch.setattr(torch, "stack", fail_stack)
+    items = [
+        MultiModalFieldElem(torch.ones(2, 3), MultiModalBatchedField()),
+        MultiModalFieldElem(torch.zeros(2, 3), MultiModalBatchedField()),
+    ]
+
+    with pytest.raises(RuntimeError, match="stack failed"):
+        MultiModalBatchedField().reduce_data(
+            items, device=torch.device("cuda"), pin_memory=True
+        )
+
+    assert not staging._regions
+
+
+def test_mm_h2d_drains_stream_before_release_on_record_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm.multimodal.inputs as mm_inputs
+    from vllm.utils import torch_utils
+    from vllm.utils.torch_utils import PinnedStagingBuffer
+
+    class TrackingStream:
+        synchronized = False
+
+        def synchronize(self):
+            self.synchronized = True
+
+    stream = TrackingStream()
+    staging = PinnedStagingBuffer(4096)
+    monkeypatch.setattr(
+        torch_utils,
+        "_pinned_uint8_buffer",
+        lambda capacity: torch.empty(capacity, dtype=torch.uint8),
+    )
+    staged = staging.empty((2, 3), torch.float32)
+    assert staged is not None
+    monkeypatch.setattr(mm_inputs, "_pinned_staging_buffer", staging)
+    monkeypatch.setattr(torch.Tensor, "is_pinned", lambda tensor: True)
+    monkeypatch.setattr(torch.Tensor, "to", lambda tensor, **kwargs: tensor.clone())
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: stream)
+    monkeypatch.setattr(torch.cuda, "stream", lambda selected: nullcontext(selected))
+    monkeypatch.setattr(
+        staging,
+        "record",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("record failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="record failed"):
+        mm_inputs._nested_tensors_h2d(
+            staged, device=torch.device("cuda:1"), pin_memory=True
+        )
+
+    assert stream.synchronized
+    assert not staging._regions
+
+
+def test_mm_pinned_staging_singleton_is_thread_safe(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm.multimodal.inputs as mm_inputs
+    from vllm.utils import torch_utils
+
+    created = []
+
+    class FakeStagingBuffer:
+        def __init__(self, capacity):
+            sleep(0.01)
+            self.capacity = capacity
+            created.append(self)
+
+    monkeypatch.setattr(mm_inputs, "_pinned_staging_buffer", None)
+    monkeypatch.setattr(torch_utils, "PinnedStagingBuffer", FakeStagingBuffer)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        buffers = list(
+            pool.map(lambda _: mm_inputs._get_pinned_staging_buffer(), range(8))
+        )
+
+    assert len(created) == 1
+    assert all(buffer is created[0] for buffer in buffers)

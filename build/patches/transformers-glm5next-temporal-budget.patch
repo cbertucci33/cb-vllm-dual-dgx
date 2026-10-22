@@ -1,0 +1,36 @@
+--- a/models/glm5_next/image_processing_glm5_next.py
++++ b/models/glm5_next/image_processing_glm5_next.py
+@@ -101,7 +101,8 @@
+                 high = content_height - 1
+         return best_height, best_width
+ 
+-    aligned_frames = max(temporal_factor, round(num_frames / temporal_factor) * temporal_factor)
++    # patchify pads incomplete temporal groups; budget for those same frames.
++    aligned_frames = max(temporal_factor, -(-num_frames // temporal_factor) * temporal_factor)
+     aligned_height = align(height, factor)
+     aligned_width = align(width, factor)
+     aligned_pixel_budget = aligned_frames * aligned_height * aligned_width
+--- a/models/glm5_next/video_processing_glm5_next.py
++++ b/models/glm5_next/video_processing_glm5_next.py
+@@ -116,7 +116,8 @@
+                 high = content_height - 1
+         return best_height, best_width
+ 
+-    aligned_frames = max(temporal_factor, round(num_frames / temporal_factor) * temporal_factor)
++    # patchify pads incomplete temporal groups; budget for those same frames.
++    aligned_frames = max(temporal_factor, -(-num_frames // temporal_factor) * temporal_factor)
+     aligned_height = align(height, factor)
+     aligned_width = align(width, factor)
+     aligned_pixel_budget = aligned_frames * aligned_height * aligned_width
+--- a/models/glm5_next/modular_glm5_next.py
++++ b/models/glm5_next/modular_glm5_next.py
+@@ -1748,7 +1748,8 @@
+                 high = content_height - 1
+         return best_height, best_width
+ 
+-    aligned_frames = max(temporal_factor, round(num_frames / temporal_factor) * temporal_factor)
++    # patchify pads incomplete temporal groups; budget for those same frames.
++    aligned_frames = max(temporal_factor, -(-num_frames // temporal_factor) * temporal_factor)
+     aligned_height = align(height, factor)
+     aligned_width = align(width, factor)
+     aligned_pixel_budget = aligned_frames * aligned_height * aligned_width

@@ -1,0 +1,1764 @@
+diff --git a/tests/entrypoints/openai/responses/test_message_phases.py b/tests/entrypoints/openai/responses/test_message_phases.py
+index 7b458219f4..f9dcea9ed6 100644
+--- a/tests/entrypoints/openai/responses/test_message_phases.py
++++ b/tests/entrypoints/openai/responses/test_message_phases.py
+@@ -10,6 +10,8 @@ Run directly with unittest to avoid the model-server pytest fixtures.
+ import asyncio
+ import unittest
+ 
++import pytest
++
+ from vllm.entrypoints.generate.base.protocol import (
+     DeltaFunctionCall,
+     DeltaMessage,
+@@ -412,3 +414,161 @@ class TestMessagePhases(unittest.IsolatedAsyncioTestCase):
+ 
+ if __name__ == "__main__":
+     unittest.main(verbosity=2)
++
++
++@pytest.mark.parametrize(
++    "profile",
++    [
++        "mimo",
++        pytest.param(
++            "glm",
++            marks=pytest.mark.xfail(
++                strict=True,
++                reason="baseline GLM split-reentry Responses lifecycle deferred",
++            ),
++        ),
++    ],
++)
++@pytest.mark.parametrize("finish_reason", ["stop", "length"])
++def test_real_selected_parser_responses_lifecycle(profile, finish_reason):
++    import json
++
++    from tests.parser.engine.replay_harness import load_local_model_parser
++    from vllm.entrypoints.openai.responses.utils import construct_input_messages
++
++    tokenizer, parser_cls = load_local_model_parser(profile)
++    request = ResponsesRequest(
++        model="test",
++        input="hi",
++        store=False,
++        include_reasoning=True,
++        tools=[
++            {
++                "type": "function",
++                "name": "echo",
++                "parameters": {
++                    "type": "object",
++                    "properties": {"text": {"type": "string"}},
++                },
++            }
++        ],
++    )
++    value = "\n  quoted <think>value</think>\n"
++    if profile == "mimo":
++        call = (
++            "<tool_call><function=echo><parameter=text>"
++            + value
++            + "</parameter></function></tool_call>"
++        )
++    else:
++        call = (
++            "<tool_call>echo<arg_key>text</arg_key><arg_value>"
++            + value
++            + "</arg_value></tool_call>"
++        )
++    text = "<think>first</think>visible<think>second</think>" + call + call
++    ids = tokenizer.encode(text, add_special_tokens=False)
++
++    async def run(split):
++        server = serving()
++        server.tool_server = None
++        context = SimpleContext(response_parser=parser_cls(tokenizer, request.tools))
++
++        async def outputs():
++            previous = ""
++            for start, end in [(0, split), (split, len(ids)), (len(ids), len(ids))]:
++                decoded = tokenizer.decode(ids[:end]).rstrip("\ufffd")
++                finish = finish_reason if start == end == len(ids) else None
++                context.append_output(
++                    RequestOutput(
++                        request_id=request.request_id,
++                        prompt="hi",
++                        prompt_token_ids=tokenizer.encode(
++                            "<think>", add_special_tokens=False
++                        ),
++                        prompt_logprobs=None,
++                        outputs=[
++                            CompletionOutput(
++                                index=0,
++                                text=decoded[len(previous) :],
++                                token_ids=ids[start:end],
++                                cumulative_logprob=None,
++                                logprobs=None,
++                                finish_reason=finish,
++                            )
++                        ],
++                        finished=finish is not None,
++                    )
++                )
++                previous = decoded
++                yield context
++
++        return [
++            event
++            async for event in server.responses_stream_generator(
++                request,
++                SamplingParams(max_tokens=128),
++                outputs(),
++                context,
++                "test",
++                tokenizer,
++                RequestResponseMetadata(request_id=request.request_id),
++                created_time=1,
++            )
++        ]
++
++    for split in range(len(ids) + 1):
++        events = asyncio.run(run(split))
++        added = [e.item for e in events if e.type == "response.output_item.added"]
++        done = [e.item for e in events if e.type == "response.output_item.done"]
++        terminal = events[-1].response
++        assert [item.id for item in added] == [item.id for item in done]
++        assert len({item.id for item in done}) == len(done)
++        assert [item.model_dump() for item in terminal.output] == [
++            item.model_dump() for item in done
++        ]
++        assert [e.sequence_number for e in events] == list(range(len(events)))
++        assert terminal.status == (
++            "completed" if finish_reason == "stop" else "incomplete"
++        )
++        assert (
++            "".join(e.delta for e in events if e.type == "response.output_text.delta")
++            == "visible"
++        )
++        assert (
++            "".join(
++                e.delta for e in events if e.type == "response.reasoning_text.delta"
++            )
++            == "firstsecond"
++        )
++        calls = [item for item in terminal.output if item.type == "function_call"]
++        assert len(calls) == 2 and calls[0].call_id != calls[1].call_id
++        for call in calls:
++            opened = next(item for item in added if item.id == call.id)
++            assert opened.call_id == call.call_id
++            args = "".join(
++                e.delta
++                for e in events
++                if e.type == "response.function_call_arguments.delta"
++                and e.item_id == call.id
++            )
++            assert args == call.arguments
++            assert json.loads(args) == {"text": value}
++        messages = construct_input_messages(
++            request_input=[
++                {
++                    "type": "function_call_output",
++                    "call_id": call.call_id,
++                    "output": "ok",
++                }
++                for call in calls
++            ],
++            prev_response_output=terminal.output,
++        )
++        assistant = next(message for message in messages if "tool_calls" in message)
++        assert [call["id"] for call in assistant["tool_calls"]] == [
++            call.call_id for call in calls
++        ]
++        assert [
++            message["tool_call_id"] for message in messages if message["role"] == "tool"
++        ] == [call.call_id for call in calls]
+diff --git a/tests/entrypoints/openai/responses/test_parsable_context_unit.py b/tests/entrypoints/openai/responses/test_parsable_context_unit.py
+index 0398723184..d8cf96d490 100644
+--- a/tests/entrypoints/openai/responses/test_parsable_context_unit.py
++++ b/tests/entrypoints/openai/responses/test_parsable_context_unit.py
+@@ -383,3 +383,129 @@ def test_num_init_messages_offset():
+     items = ctx.make_response_output_items()
+     assert len(items) == 1
+     assert items[0].type == "message"
++
++
++@pytest.mark.parametrize("profile", ["mimo", "glm"])
++@pytest.mark.parametrize(
++    "tool_name,method",
++    [
++        ("code_interpreter", "call_python_tool"),
++        ("web_search_preview", "call_search_tool"),
++        ("container.exec", "call_container_tool"),
++    ],
++)
++def test_real_parser_builtin_tool_result_retains_call_id(profile, tool_name, method):
++    import asyncio
++    from types import SimpleNamespace
++    from unittest.mock import AsyncMock
++
++    from tests.parser.engine.replay_harness import load_local_model_parser
++    from vllm.entrypoints.openai.responses.utils import (
++        construct_chat_messages_with_tool_call,
++    )
++
++    tokenizer, cls = load_local_model_parser(profile)
++    request = ResponsesRequest(
++        model="test",
++        input="hi",
++        include_reasoning=True,
++        tools=[
++            {
++                "type": "function",
++                "name": tool_name,
++                "parameters": {
++                    "type": "object",
++                    "properties": {"code": {"type": "string"}},
++                },
++            }
++        ],
++    )
++    if profile == "mimo":
++        text = (
++            "<think>reason</think><tool_call><function="
++            + tool_name
++            + "><parameter=code>pass</parameter></function></tool_call>"
++        )
++    else:
++        text = (
++            "<think>reason</think><tool_call>"
++            + tool_name
++            + "<arg_key>code</arg_key><arg_value>pass</arg_value></tool_call>"
++        )
++    context = ParsableContext(
++        response_messages=[],
++        tokenizer=tokenizer,
++        parser_cls=cls,
++        request=request,
++        available_tools=[],
++        chat_template=None,
++        chat_template_content_format="auto",
++        enable_auto_tools=True,
++    )
++    context.append_output(
++        RequestOutput(
++            request_id="test",
++            prompt="hi",
++            prompt_token_ids=[1],
++            prompt_logprobs=None,
++            outputs=[
++                CompletionOutput(
++                    index=0,
++                    text=text,
++                    token_ids=tokenizer.encode(text, add_special_tokens=False),
++                    cumulative_logprob=None,
++                    logprobs=None,
++                    finish_reason="stop",
++                )
++            ],
++            finished=True,
++        )
++    )
++    call = context.response_messages[-1]
++    assert call.type == "function_call"
++    session = SimpleNamespace(
++        call_tool=AsyncMock(
++            return_value=SimpleNamespace(
++                content=[SimpleNamespace(text="recorded result")]
++            )
++        )
++    )
++    result = asyncio.run(getattr(context, method)(session, call))
++    assert result[0].call_id == call.call_id
++    messages = construct_chat_messages_with_tool_call([call, result[0]])
++    assert messages[0]["tool_calls"][0]["id"] == messages[1]["tool_call_id"]
++    assert messages[1]["content"] == "recorded result"
++
++
++@pytest.mark.parametrize("method", ["call_search_tool", "call_container_tool"])
++@pytest.mark.parametrize("retry", [False, True])
++def test_parsable_malformed_json_retry_returns_matching_response_item(
++    method, retry, monkeypatch
++):
++    import asyncio
++    import json
++    from types import SimpleNamespace
++    from unittest.mock import AsyncMock
++
++    from openai.types.responses import ResponseFunctionToolCall
++
++    monkeypatch.setenv("VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY", "1" if retry else "0")
++    context = object.__new__(ParsableContext)
++    context.called_tools = set()
++    call = ResponseFunctionToolCall(
++        id="fc_source",
++        call_id="call_source",
++        type="function_call",
++        name="web_search_preview" if method == "call_search_tool" else "container.exec",
++        arguments="{",
++    )
++    session = SimpleNamespace(call_tool=AsyncMock())
++    if not retry:
++        with pytest.raises(json.JSONDecodeError):
++            asyncio.run(getattr(context, method)(session, call))
++    else:
++        result = asyncio.run(getattr(context, method)(session, call))
++        assert result[0].type == "function_call_output"
++        assert result[0].call_id == "call_source"
++        assert "Error parsing tool arguments as JSON:" in result[0].output
++    session.call_tool.assert_not_called()
+diff --git a/tests/entrypoints/openai/responses/test_responses_utils.py b/tests/entrypoints/openai/responses/test_responses_utils.py
+index 967ddacda6..cc7a5b5a63 100644
+--- a/tests/entrypoints/openai/responses/test_responses_utils.py
++++ b/tests/entrypoints/openai/responses/test_responses_utils.py
+@@ -903,3 +903,79 @@ class TestConstructInputMessagesInstructionsLeak:
+         assert len(msgs) == 2
+         assert msgs[0] == {"role": "system", "content": "be helpful"}
+         assert msgs[1] == {"role": "user", "content": "hello"}
++
++
++def test_previous_response_preserves_parallel_calls_and_instruction_reset():
++    from vllm.entrypoints.generate.base.protocol import FunctionCall
++    from vllm.entrypoints.openai.responses.utils import build_response_output_items
++
++    outputs = build_response_output_items(
++        "private reasoning",
++        "Working.",
++        [
++            FunctionCall(id="source_a", name="echo", arguments='{"text":"one"}'),
++            FunctionCall(id="source_b", name="echo", arguments='{"text":"two"}'),
++        ],
++    )
++    outputs[1].content.append(
++        ResponseOutputText(type="output_text", text=" Still working.", annotations=[])
++    )
++    before = [item.model_dump() for item in outputs]
++    previous = [
++        {"role": "system", "content": "old instructions"},
++        {"role": "user", "content": "original"},
++    ]
++    import copy
++
++    previous_before = copy.deepcopy(previous)
++    messages = construct_input_messages(
++        request_instructions="new instructions",
++        request_input=[
++            {"type": "function_call_output", "call_id": "source_a", "output": "one"},
++            {"type": "function_call_output", "call_id": "source_b", "output": "two"},
++        ],
++        prev_msg=previous,
++        prev_response_output=outputs,
++    )
++    assert [message["role"] for message in messages] == [
++        "system",
++        "user",
++        "assistant",
++        "tool",
++        "tool",
++    ]
++    assert messages[0]["content"] == "new instructions"
++    assert messages[2]["content"] == "Working. Still working."
++    assert previous == previous_before
++    assert "reasoning" not in messages[2]
++    assert [call["id"] for call in messages[2]["tool_calls"]] == [
++        "source_a",
++        "source_b",
++    ]
++    assert [message["tool_call_id"] for message in messages[3:]] == [
++        "source_a",
++        "source_b",
++    ]
++    assert [item.model_dump() for item in outputs] == before
++
++
++@pytest.mark.parametrize(
++    "parts,expected",
++    [
++        ([], ""),
++        ([{"type": "refusal", "refusal": "Cannot do that."}], "Cannot do that."),
++    ],
++)
++def test_previous_response_empty_or_refusal_message(parts, expected):
++    output = ResponseOutputMessage(
++        id="msg_previous",
++        type="message",
++        role="assistant",
++        status="completed",
++        content=parts,
++    )
++    messages = construct_input_messages(
++        request_input="continue",
++        prev_response_output=[output],
++    )
++    assert messages[0] == {"role": "assistant", "content": expected}
+diff --git a/tests/parser/engine/replay_harness.py b/tests/parser/engine/replay_harness.py
+index a33121705d..feff8adce0 100644
+--- a/tests/parser/engine/replay_harness.py
++++ b/tests/parser/engine/replay_harness.py
+@@ -426,3 +426,47 @@ def assert_no_terminal_leakage(
+         assert terminal not in actual.content, (
+             f"{terminal!r} leaked into content{suffix}"
+         )
++
++
++def load_local_model_parser(profile: str):
++    """Load artifact tokenizers offline; never download or execute artifact code."""
++    import os
++
++    import pytest
++    from transformers import AutoTokenizer
++
++    from vllm.parser import ParserManager
++
++    path = os.environ.get(f"VLLM_TEST_{profile.upper()}_TOKENIZER")
++    if not path:
++        pytest.skip(f"local {profile} tokenizer fixture not configured")
++    tokenizer = AutoTokenizer.from_pretrained(
++        path, local_files_only=True, trust_remote_code=False
++    )
++    reason, tool = ("mimo", "mimo") if profile == "mimo" else ("glm45", "glm47")
++    parser_cls = ParserManager.get_parser(
++        reasoning_parser_name=reason, tool_parser_name=tool, enable_auto_tools=True
++    )
++    return tokenizer, parser_cls
++
++
++def replay_real_tokens(parser, tokenizer, token_ids, request, split):
++    """Replay two detokenized chunks, then an empty terminal flush."""
++    deltas = []
++    previous = ""
++    for start, end in ((0, split), (split, len(token_ids))):
++        decoded = tokenizer.decode(token_ids[:end]).rstrip("\ufffd")
++        assert decoded.startswith(previous)
++        delta = parser.parse_delta(
++            decoded[len(previous) :],
++            list(token_ids[start:end]),
++            request,
++            finished=False,
++        )
++        previous = decoded
++        if delta is not None:
++            deltas.append(delta)
++    delta = parser.parse_delta("", [], request, finished=True)
++    if delta is not None:
++        deltas.append(delta)
++    return deltas
+diff --git a/tests/parser/engine/test_qwen3.py b/tests/parser/engine/test_qwen3.py
+index b3a833fcf0..bbdde83e62 100644
+--- a/tests/parser/engine/test_qwen3.py
++++ b/tests/parser/engine/test_qwen3.py
+@@ -1330,3 +1330,572 @@ def test_mimo_preserves_verbatim_parameter_values(
+     )
+     assert collect_function_name(results) == "run"
+     assert json.loads(collect_tool_arguments(results)) == {"text": value}
++
++
++@pytest.mark.parametrize(
++    "profile,tools_enabled,closed",
++    [
++        ("mimo", False, False),
++        ("mimo", False, True),
++        ("mimo", True, False),
++        ("mimo", True, True),
++        pytest.param(
++            "glm",
++            True,
++            True,
++            marks=pytest.mark.xfail(
++                strict=True, reason="baseline GLM split-reentry lifecycle deferred"
++            ),
++        ),
++        pytest.param(
++            "glm",
++            True,
++            False,
++            marks=pytest.mark.xfail(
++                strict=True,
++                reason="baseline GLM incomplete split-reentry lifecycle deferred",
++            ),
++        ),
++        pytest.param(
++            "glm",
++            False,
++            False,
++            marks=pytest.mark.xfail(
++                strict=True, reason="baseline GLM reasoning-only delegation deferred"
++            ),
++        ),
++        pytest.param(
++            "glm",
++            False,
++            True,
++            marks=pytest.mark.xfail(
++                strict=True, reason="baseline GLM reasoning-only delegation deferred"
++            ),
++        ),
++    ],
++)
++def test_selected_real_parser_reasoning_reentry(profile, tools_enabled, closed):
++    from tests.parser.engine.replay_harness import (
++        load_local_model_parser,
++        replay_real_tokens,
++    )
++    from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
++    from vllm.parser import ParserManager
++    from vllm.parser.abstract_parser import DelegatingParser
++
++    tokenizer, selected_cls = load_local_model_parser(profile)
++    assert issubclass(selected_cls, DelegatingParser)
++    if profile == "glm":
++        assert selected_cls.__mro__[1] is DelegatingParser
++    reason, tool = ("mimo", "mimo") if profile == "mimo" else ("glm45", "glm47")
++    parser_cls = ParserManager.get_parser(
++        reasoning_parser_name=reason,
++        tool_parser_name=tool,
++        enable_auto_tools=tools_enabled,
++    )
++    request = ResponsesRequest(model="test", input="hi", include_reasoning=True)
++    text = "<think>first</think>visible<think>second"
++    if closed:
++        text += "</think>final"
++    ids = tokenizer.encode(text, add_special_tokens=False)
++    expected_content = "visiblefinal" if closed else "visible"
++    full_parser = parser_cls(tokenizer)
++    full = full_parser.parse(text, request, tools_enabled, ids)
++    full_reasoning_tokens = full_parser.count_reasoning_tokens(ids)
++    assert full_reasoning_tokens > 0
++    assert full[:2] == ("firstsecond", expected_content)
++    for split in range(len(ids) + 1):
++        parser = parser_cls(tokenizer)
++        deltas = replay_real_tokens(parser, tokenizer, ids, request, split)
++        assert "".join(d.reasoning or "" for d in deltas) == "firstsecond", split
++        assert "".join(d.content or "" for d in deltas) == expected_content, split
++        assert parser.count_reasoning_tokens(ids) == full_reasoning_tokens, split
++    # The same actual adapter used by structured output recognizes the latest
++    # genuine marker, rather than latching the first reasoning end in history.
++    adapter = parser_cls(tokenizer).reasoning_parser
++    assert adapter is not None
++    opener = tokenizer.encode("<think>", add_special_tokens=False)
++    ended = tokenizer.encode("<think>x</think>visible", add_special_tokens=False)
++    assert adapter.is_reasoning_end(ended)
++    assert not adapter.is_reasoning_end(ended + opener)
++    assert not adapter.is_reasoning_end_streaming(ended + opener, opener)
++    closer = tokenizer.encode("</think>", add_special_tokens=False)
++    assert adapter.is_reasoning_end_streaming(ended + opener + closer, closer)
++
++
++@pytest.mark.parametrize(
++    "profile",
++    [
++        "mimo",
++        pytest.param(
++            "glm",
++            marks=pytest.mark.xfail(
++                strict=True, reason="baseline GLM split-reentry tool lifecycle deferred"
++            ),
++        ),
++    ],
++)
++@pytest.mark.parametrize("choice", ["auto", "required", "named"])
++def test_selected_real_parser_tools_reentry_and_literal_bytes(profile, choice):
++    from tests.parser.engine.replay_harness import (
++        load_local_model_parser,
++        replay_real_tokens,
++    )
++    from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
++
++    tokenizer, parser_cls = load_local_model_parser(profile)
++    tools = [
++        {
++            "type": "function",
++            "name": "echo",
++            "parameters": {
++                "type": "object",
++                "properties": {"text": {"type": "string"}},
++            },
++        }
++    ]
++    request = ResponsesRequest(
++        model="test",
++        input="hi",
++        tools=tools,
++        tool_choice={"type": "function", "name": "echo"}
++        if choice == "named"
++        else choice,
++        include_reasoning=True,
++    )
++    value = '\n  "<think>quoted</think>"\n漢字\n'
++    if profile == "mimo":
++        call = (
++            "<tool_call><function=echo><parameter=text>"
++            + value
++            + "</parameter></function></tool_call>"
++        )
++    else:
++        call = (
++            "<tool_call>echo<arg_key>text</arg_key><arg_value>"
++            + value
++            + "</arg_value></tool_call>"
++        )
++    text = "<think>first</think>visible<think>second</think>" + call + call
++    ids = tokenizer.encode(text, add_special_tokens=False)
++    parser = parser_cls(tokenizer, request.tools)
++    # Keep adapter-based request/strict-tag selection in the selected path.
++    assert parser.reasoning_parser is not None and parser.tool_parser is not None
++    parser.adjust_request(request)
++    assert request.skip_special_tokens is False
++    full = parser.parse(text, request, True, ids)
++    assert full[:2] == ("firstsecond", "visible")
++    assert len(full[2]) == 2
++    assert [json.loads(call.arguments) for call in full[2]] == [{"text": value}] * 2
++    for split in range(len(ids) + 1):
++        parser = parser_cls(tokenizer, request.tools)
++        deltas = replay_real_tokens(parser, tokenizer, ids, request, split)
++        assert "".join(d.reasoning or "" for d in deltas) == "firstsecond", split
++        assert "".join(d.content or "" for d in deltas) == "visible"
++        calls = {}
++        for delta in deltas:
++            for call in delta.tool_calls or []:
++                if call.function:
++                    calls[call.index] = calls.get(call.index, "") + (
++                        call.function.arguments or ""
++                    )
++        assert [json.loads(calls[i]) for i in sorted(calls)] == [{"text": value}] * 2
++
++
++def test_mimo_literal_think_text_is_not_a_control_token():
++    from tests.parser.engine.replay_harness import (
++        load_local_model_parser,
++        replay_real_tokens,
++    )
++    from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
++
++    tokenizer, cls = load_local_model_parser("mimo")
++    request = ResponsesRequest(model="test", input="hi", include_reasoning=True)
++    prefix = tokenizer.encode("<think>first</think>", add_special_tokens=False)
++    literal = 'Use "<think>quoted</think>" exactly.'
++    # Encode each character through the real tokenizer so the quoted spelling
++    # contains ordinary text tokens, not the model control-token IDs.
++    ordinary = [
++        tid
++        for char in literal
++        for tid in tokenizer.encode(char, add_special_tokens=False)
++    ]
++    assert tokenizer.get_vocab()["<think>"] not in ordinary
++    ids = prefix + ordinary
++    full = cls(tokenizer).parse(tokenizer.decode(ids), request, True, ids)
++    assert full[:2] == ("first", literal)
++    for split in range(len(ids) + 1):
++        deltas = replay_real_tokens(cls(tokenizer), tokenizer, ids, request, split)
++        assert "".join(d.content or "" for d in deltas) == literal
++        assert "".join(d.reasoning or "" for d in deltas) == "first"
++
++
++@pytest.mark.parametrize("thinking", [False, True])
++def test_mimo_selected_parser_respects_prompt_reasoning_state(thinking):
++    from tests.parser.engine.replay_harness import load_local_model_parser
++    from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
++
++    tokenizer, cls = load_local_model_parser("mimo")
++    request = ResponsesRequest(model="test", input="hi", include_reasoning=True)
++    parser = cls(tokenizer, chat_template_kwargs={"enable_thinking": thinking})
++    prompt = tokenizer.encode(
++        "<|im_start|>assistant\n<think>already done</think>",
++        add_special_tokens=False,
++    )
++    ids = tokenizer.encode("visible", add_special_tokens=False)
++    delta = parser.parse_delta("visible", ids, request, prompt, finished=True)
++    assert delta.content == "visible"
++    assert delta.reasoning is None
++
++
++@pytest.mark.xfail(
++    strict=True, reason="baseline GLM literal control in arguments deferred"
++)
++def test_glm_deferred_literal_control_token_in_tool_argument():
++    from tests.parser.engine.replay_harness import load_local_model_parser
++    from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
++
++    tokenizer, cls = load_local_model_parser("glm")
++    value = "<think>quoted</think>"
++    text = (
++        "<think>reason</think><tool_call>echo<arg_key>text</arg_key>"
++        "<arg_value>" + value + "</arg_value></tool_call>"
++    )
++    request = ResponsesRequest(
++        model="test",
++        input="hi",
++        include_reasoning=True,
++        tools=[
++            {
++                "type": "function",
++                "name": "echo",
++                "parameters": {
++                    "type": "object",
++                    "properties": {"text": {"type": "string"}},
++                },
++            }
++        ],
++    )
++    result = cls(tokenizer).parse(
++        text, request, True, tokenizer.encode(text, add_special_tokens=False)
++    )
++    assert result[0] == "reason"
++    assert json.loads(result[2][0].arguments) == {"text": value}
++
++
++@pytest.mark.parametrize("choice", ["required", "named"])
++def test_mimo_selected_legacy_json_tool_contract(choice, monkeypatch):
++    from tests.parser.engine.replay_harness import (
++        load_local_model_parser,
++        replay_real_tokens,
++    )
++    from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
++
++    tokenizer, cls = load_local_model_parser("mimo")
++    parser = cls(tokenizer)
++    # This is the existing legacy capability flag selected when structural
++    # tags are disabled, not a replacement for parsing or tokenization.
++    import os
++
++    if os.environ.get("VLLM_ENFORCE_STRICT_TOOL_CALLING") == "0":
++        assert parser.tool_parser.supports_required_and_named is True
++    else:
++        monkeypatch.setattr(
++            type(parser.tool_parser), "supports_required_and_named", True
++        )
++    request = ResponsesRequest(
++        model="test",
++        input="hi",
++        include_reasoning=True,
++        tools=[
++            {
++                "type": "function",
++                "name": "echo",
++                "parameters": {
++                    "type": "object",
++                    "properties": {"text": {"type": "string"}},
++                },
++            }
++        ],
++        tool_choice={"type": "function", "name": "echo"}
++        if choice == "named"
++        else choice,
++    )
++    arguments = {"text": '  <think>quoted</think>\n"value"'}
++    body = (
++        json.dumps(arguments)
++        if choice == "named"
++        else json.dumps([{"name": "echo", "parameters": arguments}])
++    )
++    text = "<think>first</think><think>second</think>" + body
++    ids = tokenizer.encode(text, add_special_tokens=False)
++    result = parser.parse(text, request, True, ids)
++    assert result[0] == "firstsecond"
++    assert result[2][0].name == "echo"
++    assert json.loads(result[2][0].arguments) == arguments
++    full_reasoning_tokens = parser.count_reasoning_tokens(ids)
++    assert full_reasoning_tokens > 0
++    for split in range(len(ids) + 1):
++        stream_parser = cls(tokenizer)
++        deltas = replay_real_tokens(stream_parser, tokenizer, ids, request, split)
++        assert "".join(delta.reasoning or "" for delta in deltas) == "firstsecond"
++        streamed = "".join(
++            call.function.arguments or ""
++            for delta in deltas
++            for call in delta.tool_calls or []
++            if call.function
++        )
++        assert json.loads(streamed) == arguments
++        assert stream_parser.count_reasoning_tokens(ids) == full_reasoning_tokens, split
++
++
++def test_mimo_selected_hides_reasoning_without_changing_content():
++    from tests.entrypoints.openai.responses.test_message_phases import serving
++    from tests.parser.engine.replay_harness import (
++        load_local_model_parser,
++        replay_real_tokens,
++    )
++    from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
++    from vllm.outputs import CompletionOutput
++
++    tokenizer, cls = load_local_model_parser("mimo")
++    request = ResponsesRequest(model="test", input="hi", include_reasoning=False)
++    text = "<think>first</think>visible<think>second</think>final"
++    ids = tokenizer.encode(text, add_special_tokens=False)
++    for split in range(len(ids) + 1):
++        deltas = replay_real_tokens(cls(tokenizer), tokenizer, ids, request, split)
++        assert "".join(delta.content or "" for delta in deltas) == "visiblefinal"
++        assert not any(delta.reasoning for delta in deltas)
++    items = serving()._make_response_output_items(
++        request,
++        CompletionOutput(
++            index=0,
++            text=text,
++            token_ids=ids,
++            cumulative_logprob=None,
++            logprobs=None,
++            finish_reason="stop",
++        ),
++        tokenizer,
++        parser=cls(tokenizer),
++    )
++    assert [item.type for item in items] == ["message"]
++    assert items[0].content[0].text == "visiblefinal"
++
++
++@pytest.mark.parametrize("implicit", [False, True])
++def test_mimo_selected_tool_transition_and_duplicate_reasoning_end(implicit):
++    from tests.parser.engine.replay_harness import (
++        load_local_model_parser,
++        replay_real_tokens,
++    )
++    from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
++
++    tokenizer, cls = load_local_model_parser("mimo")
++    request = ResponsesRequest(
++        model="test",
++        input="hi",
++        include_reasoning=True,
++        tools=[
++            {
++                "type": "function",
++                "name": "echo",
++                "parameters": {
++                    "type": "object",
++                    "properties": {"text": {"type": "string"}},
++                },
++            }
++        ],
++    )
++    prefix = "<think>first"
++    if not implicit:
++        prefix += "</think></think><think>second</think>"
++    text = prefix + (
++        "<tool_call><function=echo><parameter=text>  value\n"
++        "</parameter></function></tool_call>"
++    )
++    ids = tokenizer.encode(text, add_special_tokens=False)
++    expected_reasoning = "first" if implicit else "firstsecond"
++    full = cls(tokenizer, request.tools).parse(text, request, True, ids)
++    assert full[0] == expected_reasoning
++    assert json.loads(full[2][0].arguments) == {"text": "  value\n"}
++    for split in range(len(ids) + 1):
++        deltas = replay_real_tokens(
++            cls(tokenizer, request.tools), tokenizer, ids, request, split
++        )
++        assert (
++            "".join(delta.reasoning or "" for delta in deltas) == expected_reasoning
++        ), split
++        arguments = "".join(
++            call.function.arguments or ""
++            for delta in deltas
++            for call in delta.tool_calls or []
++            if call.function
++        )
++        assert json.loads(arguments) == {"text": "  value\n"}, split
++
++
++def test_mimo_selected_tool_choice_none_does_not_emit_calls():
++    from tests.parser.engine.replay_harness import load_local_model_parser
++    from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
++
++    tokenizer, cls = load_local_model_parser("mimo")
++    request = ResponsesRequest(
++        model="test",
++        input="hi",
++        tool_choice="none",
++        tools=[
++            {
++                "type": "function",
++                "name": "echo",
++                "parameters": {"type": "object", "properties": {}},
++            }
++        ],
++    )
++    text = "<think>reason</think><tool_call><function=echo></function></tool_call>"
++    ids = tokenizer.encode(text, add_special_tokens=False)
++    full = cls(tokenizer, request.tools).parse(text, request, True, ids)
++    assert not full[2]
++    delta = cls(tokenizer, request.tools).parse_delta(text, ids, request, finished=True)
++    assert delta is None or not delta.tool_calls
++
++
++@pytest.mark.parametrize("replay", ["whole", "two_chunks", "single_token"])
++def test_mimo_required_json_parallel_chunk_invariance(replay):
++    import os
++
++    from tests.parser.engine.replay_harness import load_local_model_parser
++    from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
++
++    if os.environ.get("VLLM_ENFORCE_STRICT_TOOL_CALLING") != "0":
++        pytest.skip("fresh strict=0 process exercises actual legacy capability")
++    tokenizer, cls = load_local_model_parser("mimo")
++    first = {
++        "text": '中文 <think>literal</think>\n"quote"\\tail',
++        "nested": [None, True, False, 1.25, {"items": [1, "x"]}],
++    }
++    second = {"number": -2.5e8, "empty": {}, "list": ["}", "]", "\\", "\n"]}
++    arguments = [
++        json.dumps(first, ensure_ascii=False),
++        (
++            '{"number":-2.50e+8,"empty":{},"list":["}","]","\\\\","\\n"],'
++            '"escaped":"\\u4e2d\\ud83d\\ude00"}'
++        ),
++    ]
++    second["escaped"] = "中😀"
++    # Escaped property/name spellings and reversed field order must not
++    # confuse envelope/argument boundaries.
++    body = (
++        '[{"na\\u006de":"first","parameters":'
++        + arguments[0]
++        + '},{"parameters":'
++        + arguments[1]
++        + ',"name":"second"}]'
++    )
++    prefix = "<think>first</think><think>second</think>"
++    text = prefix + body
++    ids = tokenizer.encode(text, add_special_tokens=False)
++    request = ResponsesRequest(
++        model="test",
++        input="hi",
++        include_reasoning=True,
++        tool_choice="required",
++        tools=[
++            {"type": "function", "name": name, "parameters": {"type": "object"}}
++            for name in ("first", "second")
++        ],
++    )
++    full_parser = cls(tokenizer, request.tools)
++    assert full_parser.tool_parser.supports_required_and_named is True
++    full = full_parser.parse(text, request, True, ids)
++    assert full[0] == "firstsecond"
++    assert [call.name for call in full[2]] == ["first", "second"]
++    assert [json.loads(call.arguments) for call in full[2]] == [first, second]
++    expected_count = full_parser.count_reasoning_tokens(ids)
++    schedules = (
++        [[len(ids)]]
++        if replay == "whole"
++        else [[split, len(ids)] for split in range(len(ids) + 1)]
++        if replay == "two_chunks"
++        else [list(range(1, len(ids) + 1))]
++    )
++    for ends in schedules:
++        parser = cls(tokenizer, request.tools)
++        deltas = []
++        previous = ""
++        start = 0
++        first_call_emitted_at = None
++        for end in ends:
++            decoded = tokenizer.decode(ids[:end]).rstrip("\ufffd")
++            assert decoded.startswith(previous)
++            delta = parser.parse_delta(
++                decoded[len(previous) :], ids[start:end], request, finished=False
++            )
++            if delta is not None:
++                deltas.append(delta)
++                if first_call_emitted_at is None and any(
++                    c.id and c.index == 0 for c in delta.tool_calls or []
++                ):
++                    first_call_emitted_at = len(decoded)
++            previous, start = decoded, end
++        terminal = parser.parse_delta("", [], request, finished=True)
++        if terminal is not None:
++            deltas.append(terminal)
++        assert "".join(d.reasoning or "" for d in deltas) == "firstsecond", ends
++        assert not any(d.content for d in deltas), ends
++        by_index = {}
++        for delta in deltas:
++            for call in delta.tool_calls or []:
++                info = by_index.setdefault(
++                    call.index, {"ids": [], "name": "", "args": ""}
++                )
++                if call.id:
++                    info["ids"].append(call.id)
++                if call.function:
++                    info["name"] += call.function.name or ""
++                    info["args"] += call.function.arguments or ""
++        assert sorted(by_index) == [0, 1], (ends, by_index)
++        assert [by_index[i]["name"] for i in (0, 1)] == ["first", "second"], ends
++        assert [by_index[i]["args"] for i in (0, 1)] == arguments, ends
++        assert all(len(by_index[i]["ids"]) == 1 for i in (0, 1)), ends
++        assert by_index[0]["ids"][0] != by_index[1]["ids"][0], ends
++        assert parser.count_reasoning_tokens(ids) == expected_count, ends
++        if replay == "single_token":
++            assert first_call_emitted_at < text.index('},{"parameters"'), ends
++
++
++@pytest.mark.parametrize("tail", ['{"x":-2.50e+', '{"x":"\\u4e', '{"x":"value\\'])
++def test_mimo_required_json_final_flush_preserves_unfinished_argument(tail):
++    import os
++
++    from tests.parser.engine.replay_harness import (
++        load_local_model_parser,
++        replay_real_tokens,
++    )
++    from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
++
++    if os.environ.get("VLLM_ENFORCE_STRICT_TOOL_CALLING") != "0":
++        pytest.skip("fresh strict=0 process exercises actual legacy capability")
++    tokenizer, cls = load_local_model_parser("mimo")
++    request = ResponsesRequest(
++        model="test",
++        input="hi",
++        include_reasoning=True,
++        tool_choice="required",
++        tools=[{"type": "function", "name": "first", "parameters": {"type": "object"}}],
++    )
++    text = (
++        '<think>first</think><think>second</think>[{"name":"first","parameters":' + tail
++    )
++    ids = tokenizer.encode(text, add_special_tokens=False)
++    for split in range(len(ids) + 1):
++        parser = cls(tokenizer, request.tools)
++        assert parser.tool_parser.supports_required_and_named is True
++        deltas = replay_real_tokens(parser, tokenizer, ids, request, split)
++        assert "".join(delta.reasoning or "" for delta in deltas) == "firstsecond"
++        calls = [c for delta in deltas for c in delta.tool_calls or []]
++        assert {call.index for call in calls} == {0}, split
++        assert len([call.id for call in calls if call.id]) == 1, split
++        assert "".join(c.function.name or "" for c in calls if c.function) == "first"
++        assert "".join(c.function.arguments or "" for c in calls if c.function) == tail
++        assert not any(delta.content for delta in deltas), split
+diff --git a/tests/v1/spec_decode/test_dflash_model_policy.py b/tests/v1/spec_decode/test_dflash_model_policy.py
+index 3b9f4e65b7..85a5af6724 100644
+--- a/tests/v1/spec_decode/test_dflash_model_policy.py
++++ b/tests/v1/spec_decode/test_dflash_model_policy.py
+@@ -7,6 +7,7 @@ production Triton bodies, not compiled GPU kernels or CUDA graph replay.
+ """
+ 
+ import copy
++import os
+ from types import SimpleNamespace as NS
+ from unittest.mock import patch
+ 
+@@ -303,3 +304,137 @@ def test_capture_warms_all_group_slots_before_graph_manager():
+ 
+ def test_cpu_contracts_do_not_initialize_cuda():
+     assert not torch.cuda.is_initialized()
++
++
++@pytest.mark.parametrize(
++    "arch",
++    [
++        "MiMoV2ForCausalLM",
++        "MiMoV2FlashForCausalLM",
++        "MiMoV2OmniForCausalLM",
++    ],
++)
++def test_mimo_standard_dflash_padding_does_not_enable_mxfp8(arch):
++    cfg = config("mimo_v2", arch, "NONE")
++    cfg.speculative_config.draft_model_config.hf_config.architectures = [
++        "DFlashDraftModel"
++    ]
++    cfg.speculative_config.draft_model_config.hf_config.quantization_config = {}
++    before = copy.deepcopy(cfg)
++    policy = resolve_dflash_execution_policy(cfg)
++    assert policy.parallel_padding
++    assert not policy.fused_mxfp8_context_kv
++    assert cfg == before
++    assert policy is resolve_dflash_execution_policy(copy.deepcopy(cfg))
++    assert resolve_dflash_execution_policy(config()).fused_mxfp8_context_kv
++
++
++@pytest.mark.parametrize("k", range(1, 8))
++@pytest.mark.parametrize("private_ring", [False, True])
++@pytest.mark.parametrize("graph", [False, True])
++def test_mimo_padding_preserves_slots_across_batch_changes(k, private_ring, graph):
++    """Execute real Triton bodies on CPU, or native CUDA and graph replay.
++
++    GPU execution is separate acceptance; TRITON_INTERPRET never proves graph
++    replay. All layouts keep an anchor plus K sampled mask positions.
++    """
++    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
++        synthesize_draft_ring_block_tables,
++    )
++
++    interpreted = os.environ.get("TRITON_INTERPRET") == "1"
++    if interpreted and graph:
++        pytest.skip("CUDA graph replay requires separate native execution")
++    if not interpreted and not torch.cuda.is_available():
++        pytest.skip("native padding regression requires CUDA")
++    device = torch.device("cpu" if interpreted else "cuda")
++
++    def move(value):
++        if isinstance(value, torch.Tensor):
++            return value.to(device)
++        if isinstance(value, NS):
++            return NS(**{key: move(item) for key, item in vars(value).items()})
++        return value
++
++    outputs = None
++    for num_reqs in [3, 1, 4, 2]:
++        args = inputs(num_reqs)
++        args[4] = torch.full((4 * k,), -777, dtype=torch.int64)
++        args[5] = args[4].clone()
++        args[6] = torch.full((4 * k,), -777, dtype=torch.int32)
++        args[22], args[23] = k + 1, k
++        # Noncontiguous request owners plus mixed prefill/verification.
++        args[9].idx_mapping = torch.tensor([3, 1, 0, 2][:num_reqs], dtype=torch.int32)
++        args[10][0] = 0
++        args = [move(arg) for arg in args]
++        if outputs is not None:
++            args[:9] = outputs
++        for group in range(2):
++            table = args[16]
++            if private_ring:
++                lengths = []
++                for request in range(num_reqs):
++                    end = int(args[9].query_start_loc[request + 1])
++                    lengths.append(int(args[9].positions[end - 1]) + 1)
++                synthesize_draft_ring_block_tables(
++                    table,
++                    args[9].idx_mapping,
++                    torch.tensor(lengths, dtype=torch.int32, device=device),
++                    4,
++                    1 + group * 100,
++                    4,
++                    k + 1,
++                )
++            else:
++                table.copy_(
++                    torch.arange(
++                        1 + group * 100,
++                        65 + group * 100,
++                        dtype=torch.int32,
++                        device=device,
++                    ).view(4, 16)
++                )
++                # A null/evicted block must never become a writable cache slot.
++                table[0, 3] = 0
++            serial = copy.deepcopy(args)
++            prepare_dflash_inputs(*serial, parallel_padding=False)
++            prepare_dflash_inputs(*args, parallel_padding=True)
++            if graph:
++                captured = torch.cuda.CUDAGraph()
++                with torch.cuda.graph(captured):
++                    prepare_dflash_inputs(*args, parallel_padding=True)
++                captured.replay()
++            for left, right in zip(serial[:9], args[:9]):
++                if isinstance(left, torch.Tensor):
++                    assert torch.equal(left, right)
++                else:
++                    for name in vars(left):
++                        assert torch.equal(getattr(left, name), getattr(right, name))
++            assert torch.all(args[1][num_reqs * (k + 1) :] == -1)
++            assert torch.all(args[6][num_reqs * k :] == -1)
++            assert torch.all(args[4][num_reqs * k :] == 0)
++            assert torch.all(args[0].seq_lens[num_reqs:] == 0)
++            for request in range(num_reqs):
++                end = int(args[9].query_start_loc[request + 1])
++                valid = end - int(args[11][request])
++                last = int(args[9].positions[valid - 1])
++                owner = int(args[9].idx_mapping[request])
++                base = request * (k + 1)
++                assert args[0].input_ids[base].item() == (
++                    args[13][owner] if args[10][request] == 0 else args[12][owner]
++                )
++                assert args[0].input_ids[base + 1 : base + k + 1].tolist() == [99] * k
++                assert args[4][request * k : (request + 1) * k].tolist() == list(
++                    range(base + 1, base + k + 1)
++                )
++                assert args[5][request * k : (request + 1) * k].tolist() == list(
++                    range(last + 2, last + k + 2)
++                )
++                assert args[6][request * k : (request + 1) * k].tolist() == [owner] * k
++                for offset in range(k + 1):
++                    position = last + 1 + offset
++                    block_id = int(table[request, position // 4])
++                    expected = block_id * 4 + position % 4 if block_id else -1
++                    assert args[1][base + offset].item() == expected
++                assert torch.all(args[3][valid:end] == -1)
++        outputs = args[:9]
+diff --git a/vllm/entrypoints/openai/responses/context.py b/vllm/entrypoints/openai/responses/context.py
+index 0dfd0863ab..956f610464 100644
+--- a/vllm/entrypoints/openai/responses/context.py
++++ b/vllm/entrypoints/openai/responses/context.py
+@@ -24,7 +24,6 @@ from vllm import envs
+ from vllm.entrypoints.chat_utils import (
+     ChatTemplateContentFormatOption,
+ )
+-from vllm.entrypoints.generate.base.protocol import FunctionCall
+ from vllm.entrypoints.mcp.tool import Tool
+ from vllm.entrypoints.mcp.tool_server import ToolServer
+ from vllm.entrypoints.openai.parser.harmony_utils import render_for_completion
+@@ -166,6 +165,23 @@ def _create_json_parse_error_messages(
+     ]
+ 
+ 
++def _create_parsable_json_parse_error_messages(
++    last_msg: ResponseFunctionToolCall, error: json.JSONDecodeError
++) -> list[ResponseInputOutputItem]:
++    return [
++        ResponseFunctionToolCallOutputItem(
++            id=f"fco_{random_uuid()}",
++            type="function_call_output",
++            call_id=last_msg.call_id,
++            output=(
++                f"Error parsing tool arguments as JSON: {error}. "
++                "Please ensure the tool call arguments are valid JSON and try again."
++            ),
++            status="completed",
++        )
++    ]
++
++
+ class SimpleContext(ConversationContext):
+     """This is a context that cannot handle MCP tool calls."""
+ 
+@@ -438,7 +454,9 @@ class ParsableContext(ConversationContext):
+         return False
+ 
+     async def call_python_tool(
+-        self, tool_session: Union["ClientSession", Tool], last_msg: FunctionCall
++        self,
++        tool_session: Union["ClientSession", Tool],
++        last_msg: ResponseFunctionToolCall,
+     ) -> list[ResponseInputOutputItem]:
+         self.called_tools.add("python")
+         if isinstance(tool_session, Tool):
+@@ -453,7 +471,7 @@ class ParsableContext(ConversationContext):
+         message = ResponseFunctionToolCallOutputItem(
+             id=f"mcpo_{random_uuid()}",
+             type="function_call_output",
+-            call_id=f"call_{random_uuid()}",
++            call_id=last_msg.call_id,
+             output=result_str,
+             status="completed",
+         )
+@@ -461,7 +479,9 @@ class ParsableContext(ConversationContext):
+         return [message]
+ 
+     async def call_search_tool(
+-        self, tool_session: Union["ClientSession", Tool], last_msg: FunctionCall
++        self,
++        tool_session: Union["ClientSession", Tool],
++        last_msg: ResponseFunctionToolCall,
+     ) -> list[ResponseInputOutputItem]:
+         self.called_tools.add("browser")
+         if isinstance(tool_session, Tool):
+@@ -470,7 +490,7 @@ class ParsableContext(ConversationContext):
+             try:
+                 args = json.loads(last_msg.arguments)
+             except json.JSONDecodeError as e:
+-                return _create_json_parse_error_messages(last_msg, e)
++                return _create_parsable_json_parse_error_messages(last_msg, e)
+         else:
+             args = json.loads(last_msg.arguments)
+         result = await tool_session.call_tool("search", args)
+@@ -479,7 +499,7 @@ class ParsableContext(ConversationContext):
+         message = ResponseFunctionToolCallOutputItem(
+             id=f"fco_{random_uuid()}",
+             type="function_call_output",
+-            call_id=f"call_{random_uuid()}",
++            call_id=last_msg.call_id,
+             output=result_str,
+             status="completed",
+         )
+@@ -487,8 +507,10 @@ class ParsableContext(ConversationContext):
+         return [message]
+ 
+     async def call_container_tool(
+-        self, tool_session: Union["ClientSession", Tool], last_msg: Message
+-    ) -> list[Message]:
++        self,
++        tool_session: Union["ClientSession", Tool],
++        last_msg: ResponseFunctionToolCall,
++    ) -> list[ResponseInputOutputItem]:
+         """Call container tool. Expect this to be run in a stateful docker
+         with command line terminal.
+         The official container tool would at least
+@@ -512,7 +534,7 @@ class ParsableContext(ConversationContext):
+             try:
+                 args = json.loads(last_msg.arguments)
+             except json.JSONDecodeError as e:
+-                return _create_json_parse_error_messages(last_msg, e)
++                return _create_parsable_json_parse_error_messages(last_msg, e)
+         else:
+             args = json.loads(last_msg.arguments)
+         result = await tool_session.call_tool("exec", args)
+@@ -521,7 +543,7 @@ class ParsableContext(ConversationContext):
+         message = ResponseFunctionToolCallOutputItem(
+             id=f"fco_{random_uuid()}",
+             type="function_call_output",
+-            call_id=f"call_{random_uuid()}",
++            call_id=last_msg.call_id,
+             output=result_str,
+             status="completed",
+         )
+diff --git a/vllm/entrypoints/openai/responses/utils.py b/vllm/entrypoints/openai/responses/utils.py
+index a79e1fa00d..a29cd93a42 100644
+--- a/vllm/entrypoints/openai/responses/utils.py
++++ b/vllm/entrypoints/openai/responses/utils.py
+@@ -199,17 +199,19 @@ def construct_input_messages(
+         # The current request's instructions (if any) were already added above.
+         messages.extend(m for m in prev_msg if m.get("role") != "system")
+     if prev_response_output is not None:
+-        # Add the previous output.
+-        for output_item in prev_response_output:
+-            # NOTE: We skip the reasoning output.
+-            if isinstance(output_item, ResponseOutputMessage):
+-                for content in output_item.content:
+-                    messages.append(
+-                        {
+-                            "role": "assistant",
+-                            "content": content.text,
+-                        }
++        # Preserve calls and their IDs for tool-result continuation, while
++        # retaining the policy of not replaying previous reasoning.
++        messages.extend(
++            construct_chat_messages_with_tool_call(
++                [
++                    item
++                    for item in prev_response_output
++                    if isinstance(
++                        item, (ResponseOutputMessage, ResponseFunctionToolCall)
+                     )
++                ]
++            )
++        )
+ 
+     # Append the new input.
+     # Responses API supports simple text inputs without chat format.
+@@ -315,7 +317,10 @@ def _construct_message_from_response_item(
+             "reasoning": reasoning,
+         }
+     elif isinstance(item, ResponseOutputMessage):
+-        output_text = item.content[0].text
++        output_text = "".join(
++            part.text if part.type == "output_text" else part.refusal
++            for part in item.content
++        )
+         if prev_assistant_msg:
+             previous_content = prev_assistant_msg.get("content")
+             if previous_content is None:
+diff --git a/vllm/model_executor/models/dflash_policy.py b/vllm/model_executor/models/dflash_policy.py
+index 602debe63d..cc6df9fa28 100644
+--- a/vllm/model_executor/models/dflash_policy.py
++++ b/vllm/model_executor/models/dflash_policy.py
+@@ -12,6 +12,7 @@ class DFlashExecutionPolicy:
+ 
+ _DEFAULT_POLICY = DFlashExecutionPolicy()
+ _GLM_MXFP8_POLICY = DFlashExecutionPolicy(True, True)
++_MIMO_DFLASH_POLICY = DFlashExecutionPolicy(parallel_padding=True)
+ 
+ 
+ def resolve_dflash_execution_policy(vllm_config: Any) -> DFlashExecutionPolicy:
+@@ -32,4 +33,12 @@ def resolve_dflash_execution_policy(vllm_config: Any) -> DFlashExecutionPolicy:
+         and (quant.get("quantization") or {}).get("quant_algo") == "MXFP8"
+     ):
+         return _GLM_MXFP8_POLICY
++    if (
++        getattr(target, "model_type", None) == "mimo_v2"
++        and set(getattr(target, "architectures", None) or [])
++        & {"MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM", "MiMoV2OmniForCausalLM"}
++        and getattr(draft, "model_type", None) == "qwen3"
++        and "DFlashDraftModel" in (getattr(draft, "architectures", None) or [])
++    ):
++        return _MIMO_DFLASH_POLICY
+     return _DEFAULT_POLICY
+diff --git a/vllm/parser/mimo.py b/vllm/parser/mimo.py
+index 3704907efe..ef981e25e3 100644
+--- a/vllm/parser/mimo.py
++++ b/vllm/parser/mimo.py
+@@ -2,10 +2,27 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """MiMo's compact XML parameters contain verbatim string values."""
+ 
++from __future__ import annotations
++
+ import functools
+ import json
++from collections.abc import Sequence
+ from dataclasses import replace
++from typing import TYPE_CHECKING
+ 
++from vllm.entrypoints.chat_utils import make_tool_call_id
++from vllm.entrypoints.generate.base.protocol import (
++    DeltaFunctionCall,
++    DeltaMessage,
++    DeltaToolCall,
++)
++from vllm.parser.abstract_parser import DelegatingParser
++from vllm.parser.engine.events import EventType
++from vllm.parser.engine.parser_engine_config import (
++    ParserEngineConfig,
++    ParserState,
++    Transition,
++)
+ from vllm.parser.qwen3 import (
+     _PARAM_RE,
+     _PARTIAL_PARAM_RE,
+@@ -15,6 +32,13 @@ from vllm.parser.qwen3 import (
+     qwen3_config,
+ )
+ 
++if TYPE_CHECKING:
++    from vllm.entrypoints.generate.base.protocol import FunctionCall
++    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
++    from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
++    from vllm.tokenizers import TokenizerLike
++    from vllm.tool_parsers.abstract_tool_parser import Tool
++
+ 
+ def _mimo_arg_converter(raw_args: str, partial: bool) -> str:
+     params = {m.group(1): m.group(2) for m in _PARAM_RE.finditer(raw_args)}
+@@ -30,14 +54,21 @@ class MiMoParser(Qwen3Parser):
+         thinking = (kwargs.get("chat_template_kwargs") or {}).get(
+             "enable_thinking", True
+         )
++        config = qwen3_config(
++            thinking=thinking,
++            name="mimo",
++            turn_boundary_tokens=CHATML_TURN_BOUNDARIES,
++        )
++        transitions = dict(config.transitions)
++        if thinking:
++            transitions[ParserState.CONTENT, "THINK_START"] = Transition(
++                ParserState.REASONING, (EventType.REASONING_START,)
++            )
+         kwargs.setdefault(
+             "parser_engine_config",
+             replace(
+-                qwen3_config(
+-                    thinking=thinking,
+-                    name="mimo",
+-                    turn_boundary_tokens=CHATML_TURN_BOUNDARIES,
+-                ),
++                config,
++                transitions=transitions,
+                 arg_converter=_mimo_arg_converter,
+                 arg_value_extender=functools.partial(
+                     _param_value_extender, trim_newlines=False
+@@ -45,3 +76,308 @@ class MiMoParser(Qwen3Parser):
+             ),
+         )
+         super().__init__(tokenizer, tools, **kwargs)
++
++    def adjust_initial_state_from_prompt(self, prompt_token_ids: Sequence[int]) -> None:
++        state = (
++            ParserState.CONTENT
++            if self.is_reasoning_end(list(prompt_token_ids))
++            else self.parser_engine_config.initial_state
++        )
++        self.initialize_streaming(initial_state=state)
++
++
++def _json_tool_config(config: ParserEngineConfig) -> ParserEngineConfig:
++    transitions = {
++        key: transition
++        for key, transition in config.transitions.items()
++        if key[0] in (ParserState.REASONING, ParserState.CONTENT)
++        and transition.next_state in (ParserState.REASONING, ParserState.CONTENT)
++    }
++    for terminal in ("JSON_OBJECT_START", "JSON_ARRAY_START"):
++        transitions[ParserState.CONTENT, terminal] = Transition(
++            ParserState.TOOL_BETWEEN, (EventType.TEXT_CHUNK,)
++        )
++    # Once a required/named JSON body starts, all its bytes are arguments,
++    # including quoted spellings (or token IDs) of reasoning delimiters.
++    return replace(
++        config,
++        terminals={
++            "THINK_START": config.terminals["THINK_START"],
++            "THINK_END": config.terminals["THINK_END"],
++            "JSON_OBJECT_START": "{",
++            "JSON_ARRAY_START": "[",
++        },
++        token_id_terminals={
++            key: value
++            for key, value in config.token_id_terminals.items()
++            if key in ("THINK_START", "THINK_END")
++        },
++        transitions=transitions,
++        content_events={
++            ParserState.REASONING: EventType.REASONING_CHUNK,
++            ParserState.CONTENT: EventType.TEXT_CHUNK,
++            ParserState.TOOL_BETWEEN: EventType.TEXT_CHUNK,
++        },
++        arg_converter=None,
++        arg_value_extender=None,
++    )
++
++
++def _json_value_end(text: str, start: int) -> tuple[int, bool]:
++    """Locate raw value bytes without inventing missing JSON suffixes."""
++    opening = text[start]
++    if opening not in '{["':
++        end = start
++        while end < len(text) and text[end] not in " \t\r\n,}]":
++            end += 1
++        return end, end < len(text)
++    stack = []
++    in_string = False
++    escaped = False
++    for index in range(start, len(text)):
++        char = text[index]
++        if escaped:
++            escaped = False
++        elif in_string:
++            if char == "\\":
++                escaped = True
++            elif char == '"':
++                in_string = False
++                if opening == '"' and not stack:
++                    return index + 1, True
++        elif char == '"':
++            in_string = True
++        elif char in "{[":
++            stack.append(char)
++        elif char in "}]":
++            if not stack or stack.pop() != ("{" if char == "}" else "["):
++                return index, False
++            if not stack:
++                return index + 1, True
++    return len(text), False
++
++
++def _required_json_calls(text: str) -> list[tuple[str | None, str | None]]:
++    """Find each envelope's name and raw (possibly unfinished) arguments."""
++    decoder = json.JSONDecoder()
++    calls: list[tuple[str | None, str | None]] = []
++
++    def skip_space(index: int) -> int:
++        while index < len(text) and text[index] in " \t\r\n":
++            index += 1
++        return index
++
++    cursor = skip_space(0)
++    if cursor == len(text) or text[cursor] != "[":
++        return calls
++    cursor += 1
++    while True:
++        cursor = skip_space(cursor)
++        if cursor == len(text) or text[cursor] != "{":
++            return calls
++        cursor += 1
++        name = arguments = None
++        calls.append((name, arguments))
++        while True:
++            cursor = skip_space(cursor)
++            if cursor == len(text):
++                return calls
++            if text[cursor] == "}":
++                cursor += 1
++                break
++            try:
++                key, cursor = decoder.raw_decode(text, cursor)
++            except json.JSONDecodeError:
++                return calls
++            if not isinstance(key, str):
++                return calls
++            cursor = skip_space(cursor)
++            if cursor == len(text) or text[cursor] != ":":
++                return calls
++            start = skip_space(cursor + 1)
++            if start == len(text):
++                return calls
++            end, complete = _json_value_end(text, start)
++            if key == "parameters":
++                arguments = text[start:end]
++            elif key == "name" and complete:
++                try:
++                    value = decoder.raw_decode(text, start)[0]
++                except json.JSONDecodeError:
++                    return calls
++                if isinstance(value, str):
++                    name = value
++            calls[-1] = (name, arguments)
++            if not complete:
++                return calls
++            cursor = skip_space(end)
++            if cursor == len(text):
++                return calls
++            if text[cursor] == "}":
++                cursor += 1
++                break
++            if text[cursor] != ",":
++                return calls
++            cursor += 1
++        cursor = skip_space(cursor)
++        if cursor == len(text) or text[cursor] != ",":
++            return calls
++        cursor += 1
++
++
++class MiMoServingParser(DelegatingParser):
++    """Retain adapter request contracts, but parse MiMo in one state machine."""
++
++    def __init__(
++        self, tokenizer: TokenizerLike, tools: list[Tool] | None = None, **kwargs
++    ) -> None:
++        super().__init__(tokenizer, tools, **kwargs)
++        # The adapter still owns metadata/structured-output hooks. Its exact
++        # engine also owns generation parsing; there is no separate token pass.
++        from vllm.parser.engine.adapters import ParserEngineReasoningAdapter
++
++        assert isinstance(self._reasoning_parser, ParserEngineReasoningAdapter)
++        engine = self._reasoning_parser._parser_engine
++        assert isinstance(engine, MiMoParser)
++        self._mimo_parser = engine
++        self._mimo_parser._tools = tools
++        self._json_parser: MiMoParser | None = None
++        self._legacy_json_tools = False
++        self._required_json_arguments: dict[int, str] = {}
++
++    def _uses_json_tools(
++        self, request: ChatCompletionRequest | ResponsesRequest
++    ) -> bool:
++        return (
++            self._tool_parser is not None
++            and self._tool_parser.supports_required_and_named
++            and request.tool_choice not in (None, "auto", "none")
++        )
++
++    def _generation_parser(
++        self, request: ChatCompletionRequest | ResponsesRequest
++    ) -> MiMoParser:
++        self._legacy_json_tools = self._uses_json_tools(request)
++        if not self._legacy_json_tools:
++            self._mimo_parser._suppress_tool_calls = request.tool_choice == "none"
++            return self._mimo_parser
++        if self._json_parser is None:
++            self._json_parser = MiMoParser(
++                self.model_tokenizer,
++                self._mimo_parser._tools,
++                parser_engine_config=_json_tool_config(
++                    self._mimo_parser.parser_engine_config
++                ),
++            )
++        return self._json_parser
++
++    def parse(
++        self,
++        model_output: str,
++        request: ChatCompletionRequest | ResponsesRequest,
++        enable_auto_tools: bool = False,
++        model_output_token_ids: Sequence[int] = (),
++    ) -> tuple[str | None, str | None, list[FunctionCall] | None]:
++        self._initialize_history_tool_call_cnt(request)
++        parser = self._generation_parser(request)
++        parser.skip_tool_parsing = not self._legacy_json_tools and (
++            self._tool_parser is None or not enable_auto_tools
++        )
++        reasoning, content, calls = parser.parse(
++            model_output, request, enable_auto_tools, model_output_token_ids
++        )
++        if self._legacy_json_tools:
++            calls, content = self._extract_tool_calls(
++                content, request, enable_auto_tools
++            )
++        return reasoning, content, calls
++
++    def parse_delta(
++        self,
++        delta_text: str,
++        delta_token_ids: list[int],
++        request: ChatCompletionRequest | ResponsesRequest,
++        prompt_token_ids: list[int] | None = None,
++        *,
++        finished: bool,
++    ) -> DeltaMessage | None:
++        parser = self._generation_parser(request)
++        parser.skip_tool_parsing = (
++            not self._legacy_json_tools and self._tool_parser is None
++        )
++        delta = parser.parse_delta(
++            delta_text, delta_token_ids, request, prompt_token_ids, finished=finished
++        )
++        if not self._legacy_json_tools or delta is None:
++            return delta
++        self._initialize_history_tool_call_cnt(request)
++        state = self._stream_state
++        tool_delta = None
++        if delta.content:
++            previous = state.previous_text
++            current = previous + delta.content
++            if request.tool_choice == "required":
++                tool_delta = self._required_json_delta(current)
++            else:
++                tool_delta, state.function_name_returned = (
++                    self._extract_tool_calls_streaming(
++                        previous,
++                        current,
++                        delta.content,
++                        [],
++                        [],
++                        [],
++                        request,
++                        tool_call_idx=state.history_tool_call_cnt,
++                        tool_call_id_type=state.tool_call_id_type,
++                        function_name_returned=state.function_name_returned,
++                    )
++                )
++            state.previous_text = current
++            state.history_tool_call_cnt += (
++                sum(call.id is not None for call in (tool_delta.tool_calls or []))
++                if tool_delta is not None
++                else 0
++            )
++        if delta.reasoning:
++            if tool_delta is None:
++                return DeltaMessage(reasoning=delta.reasoning)
++            tool_delta.reasoning = delta.reasoning
++        return tool_delta
++
++    def _required_json_delta(self, text: str) -> DeltaMessage | None:
++        calls = []
++        state = self._stream_state
++        ids_created = 0
++        for index, (name, arguments) in enumerate(_required_json_calls(text)):
++            if name is None or arguments is None:
++                continue
++            previous = self._required_json_arguments.get(index)
++            if previous is None:
++                call = DeltaToolCall(
++                    index=index,
++                    id=make_tool_call_id(
++                        id_type=state.tool_call_id_type,
++                        func_name=name,
++                        idx=state.history_tool_call_cnt + ids_created,
++                    ),
++                    type="function",
++                    function=DeltaFunctionCall(name=name, arguments=arguments),
++                )
++                ids_created += 1
++            else:
++                suffix = arguments[len(previous) :]
++                if not suffix:
++                    continue
++                call = DeltaToolCall(
++                    index=index,
++                    function=DeltaFunctionCall(arguments=suffix),
++                )
++            self._required_json_arguments[index] = arguments
++            calls.append(call)
++        return DeltaMessage(tool_calls=calls) if calls else None
++
++    def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:
++        parser = self._json_parser if self._legacy_json_tools else self._mimo_parser
++        assert parser is not None
++        return parser.count_reasoning_tokens(token_ids)
+diff --git a/vllm/parser/parser_manager.py b/vllm/parser/parser_manager.py
+index 41b27967a6..5e10f8880a 100644
+--- a/vllm/parser/parser_manager.py
++++ b/vllm/parser/parser_manager.py
+@@ -153,6 +153,18 @@ class ParserManager:
+         r_cls = reasoning_parser_cls
+         t_cls = tool_parser_cls
+ 
++        if reasoning_parser_name == "mimo" and (
++            tool_parser_cls is None or tool_parser_name == "mimo"
++        ):
++            from vllm.parser.mimo import MiMoServingParser
++
++            class _MiMoParser(MiMoServingParser):
++                reasoning_parser_cls = r_cls
++                tool_parser_cls = t_cls
++                tool_strict_level = strict_level
++
++            return _MiMoParser
++
+         class _Parser(DelegatingParser):
+             reasoning_parser_cls = r_cls
+             tool_parser_cls = t_cls

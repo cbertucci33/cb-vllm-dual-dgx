@@ -1,0 +1,24 @@
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 329bc5bdbe..a91de8a855 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -47,6 +47,7 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
+     initialize_mamba_ssu_backend,
+ )
+ from vllm.model_executor.model_loader import get_model_loader
++from vllm.model_executor.model_loader.derived_weights import refresh_derived_weights
+ from vllm.model_executor.model_loader.reload.inplace import reload_weights
+ from vllm.model_executor.models.interfaces import requires_raw_input_tokens
+ from vllm.model_executor.offloader import (
+@@ -583,6 +584,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         reload_weights(
+             vllm_config, model, weights_iterator, weights_path, is_checkpoint_format
+         )
++        if not is_checkpoint_format:
++            refresh_derived_weights(model)
++        draft_model = self.get_draft_model()
++        if draft_model is not None:
++            refresh_derived_weights(draft_model)
+         self.reset_lora_state()
+         self.reset_encoder_cache()
+         self.reset_mm_cache()

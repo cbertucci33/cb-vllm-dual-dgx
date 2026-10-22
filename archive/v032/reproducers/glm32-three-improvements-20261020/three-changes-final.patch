@@ -1,0 +1,596 @@
+diff --git a/build/Dockerfile.runner b/build/Dockerfile.runner
+index 9e1f97c249..83bfc8f300 100644
+--- a/build/Dockerfile.runner
++++ b/build/Dockerfile.runner
+@@ -114,6 +114,8 @@ RUN set -eux; \
+     git -C /opt/vllm-runner/sources/sparkinfer apply /opt/vllm-runner/patches/sparkinfer-trellis-swiglu-limit.patch; \
+     git -C /opt/vllm-runner/sources/sparkinfer apply --check /opt/vllm-runner/patches/sparkinfer-trellis-barrier-order.patch; \
+     git -C /opt/vllm-runner/sources/sparkinfer apply /opt/vllm-runner/patches/sparkinfer-trellis-barrier-order.patch; \
++    git -C /opt/vllm-runner/sources/sparkinfer apply --check /opt/vllm-runner/patches/sparkinfer-small-prefix-histogram.patch; \
++    git -C /opt/vllm-runner/sources/sparkinfer apply /opt/vllm-runner/patches/sparkinfer-small-prefix-histogram.patch; \
+     git init --quiet /opt/vllm-runner/sources/exllamav3; \
+     git -C /opt/vllm-runner/sources/exllamav3 remote add origin https://github.com/turboderp-org/exllamav3.git; \
+     git -C /opt/vllm-runner/sources/exllamav3 fetch --quiet --depth 1 origin "${EXLLAMAV3_COMMIT}"; \
+diff --git a/build/patches/sparkinfer-small-prefix-histogram.patch b/build/patches/sparkinfer-small-prefix-histogram.patch
+new file mode 100644
+index 0000000000..a8a09d6158
+--- /dev/null
++++ b/build/patches/sparkinfer-small-prefix-histogram.patch
+@@ -0,0 +1,17 @@
++--- a/sparkinfer/moe/_shared/kernels/w4a16/route_pack.py
+++++ b/sparkinfer/moe/_shared/kernels/w4a16/route_pack.py
++@@ -180,10 +180,10 @@
++             ids = tl.load(expert_map + safe_ids, mask=valid, other=-1).to(tl.int32)
++             valid = valid & (ids >= 0) & (ids < NUM_EXPERTS)
++ 
++-        matches = (
++-            (experts[:, None] == ids[None, :]) & expert_mask[:, None] & valid[None, :]
++-        )
++-        counts += tl.sum(matches.to(tl.int32), axis=1)
+++        # Histogram only validated local expert IDs. Masked lanes use an
+++        # in-range value so no invalid ID reaches the histogram lowering.
+++        histogram_ids = tl.where(valid, ids, 0)
+++        counts += tl.histogram(histogram_ids, BLOCK_E, mask=valid)
++ 
++     padded = ((counts + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
++     padded = tl.where(expert_mask, padded, 0)
+diff --git a/build/provenance.py b/build/provenance.py
+index 0fca2886ad..6813a34919 100644
+--- a/build/provenance.py
++++ b/build/provenance.py
+@@ -74,6 +74,7 @@ def main() -> None:
+         repo / "build/patches/sparkinfer-cutlass-dsl.patch",
+         repo / "build/patches/sparkinfer-trellis-swiglu-limit.patch",
+         repo / "build/patches/sparkinfer-trellis-barrier-order.patch",
++        repo / "build/patches/sparkinfer-small-prefix-histogram.patch",
+         repo / "build/patches/flashinfer-sm120-memory-order.patch",
+         repo / "build/patches/transformers-glm5next-temporal-budget.patch",
+         repo / "build/patches/b12x-cutlass-dsl.patch",
+diff --git a/build/verify_runtime.py b/build/verify_runtime.py
+index 04d163d2dc..0dd1563550 100644
+--- a/build/verify_runtime.py
++++ b/build/verify_runtime.py
+@@ -53,6 +53,7 @@ def verify_native_patch_inputs(provenance: dict, runtime_root: Path) -> None:
+         "build/patches/exllamav3-startup-safety.patch",
+         "build/patches/sparkinfer-trellis-swiglu-limit.patch",
+         "build/patches/sparkinfer-trellis-barrier-order.patch",
++        "build/patches/sparkinfer-small-prefix-histogram.patch",
+         "build/patches/flashinfer-sm120-memory-order.patch",
+         "build/patches/transformers-glm5next-temporal-budget.patch",
+     ):
+@@ -286,6 +287,25 @@ def verify_flashinfer_cache_root(cache_root: Path) -> None:
+         )
+ 
+ 
++def verify_sparkinfer_route_sources(
++    package_root: Path, source_root: Path, patch: Path
++) -> None:
++    """Require the pinned histogram patch in both source and installed package."""
++    subprocess.run(
++        ["git", "-C", str(source_root), "apply", "--reverse", "--check", str(patch)],
++        check=True,
++        capture_output=True,
++        text=True,
++    )
++    relative = Path("moe/_shared/kernels/w4a16/route_pack.py")
++    if (package_root / relative).read_bytes() != (
++        source_root / "sparkinfer" / relative
++    ).read_bytes():
++        raise RuntimeError(
++            f"Sparkinfer packaged source differs from patched source: {relative}"
++        )
++
++
+ def verify_sparkinfer_barrier_sources(
+     package_root: Path, source_root: Path, patch: Path
+ ) -> None:
+@@ -1181,6 +1201,11 @@ def main() -> None:
+         Path("/opt/vllm-runner/sources/sparkinfer"),
+         Path("/opt/vllm-runner/patches/sparkinfer-trellis-barrier-order.patch"),
+     )
++    verify_sparkinfer_route_sources(
++        Path(importlib.util.find_spec("sparkinfer").origin).parent,
++        Path("/opt/vllm-runner/sources/sparkinfer"),
++        Path("/opt/vllm-runner/patches/sparkinfer-small-prefix-histogram.patch"),
++    )
+     trellis = importlib.import_module("sparkinfer.moe").trellis_moe
+     require_keyword_contract(
+         trellis.prepare_weights,
+diff --git a/tests/kernels/moe/test_sparkinfer_route_histogram.py b/tests/kernels/moe/test_sparkinfer_route_histogram.py
+new file mode 100644
+index 0000000000..c9988d359b
+--- /dev/null
++++ b/tests/kernels/moe/test_sparkinfer_route_histogram.py
+@@ -0,0 +1,124 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Execute the actual small-prefix body with Triton's CPU interpreter.
++
++Run with TRITON_INTERPRET=1 and SPARKINFER_REVIEW_ROOT set to patched source.
++This verifies integer routing semantics, not GPU lowering or performance.
++"""
++
++import ast
++import os
++from pathlib import Path
++
++import pytest
++import torch
++import triton
++import triton.language as tl
++
++
++@pytest.mark.parametrize("num_experts", [1, 7, 256, 288])
++@pytest.mark.parametrize("mapped", [False, True])
++@pytest.mark.parametrize("num_routes", [1, 257])
++def test_small_prefix_histogram(num_experts, mapped, num_routes):
++    if os.environ.get("TRITON_INTERPRET") != "1":
++        pytest.skip("requires explicit CPU interpreter mode")
++    root = Path(
++        os.environ.get("SPARKINFER_REVIEW_ROOT", "/opt/vllm-runner/sources/sparkinfer")
++    )
++    source = root / "sparkinfer/moe/_shared/kernels/w4a16/route_pack.py"
++    node = next(
++        n
++        for n in ast.parse(source.read_text()).body
++        if isinstance(n, ast.FunctionDef)
++        and n.name == "_pack_topk_routes_small_prefix_kernel"
++    )
++    namespace = {"triton": triton, "tl": tl}
++    exec(
++        compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"),
++        namespace,
++    )
++    kernel = namespace[node.name]
++    # Include duplicates, invalid raw IDs and a partially filled count block.
++    ids = torch.arange(num_routes, dtype=torch.int32) % (num_experts + 2) - 1
++    expert_map = torch.arange(num_experts, dtype=torch.int32).flip(0)
++    expert_map[::3] = -1
++    if num_experts > 1:
++        expert_map[1] = num_experts  # Invalid mapped ID must not enter a bin.
++    valid = (ids >= 0) & (ids < num_experts)
++    resolved = ids.clone()
++    if mapped:
++        resolved[valid] = expert_map[ids[valid].long()]
++        valid &= (resolved >= 0) & (resolved < num_experts)
++    counts = torch.bincount(resolved[valid].long(), minlength=num_experts)
++    block_size = 32
++    padded = ((counts + block_size - 1) // block_size) * block_size
++    inclusive = padded.cumsum(0)
++    prefix = inclusive - padded
++    # Capacity bounds the concrete fixture, including padding per expert.
++    max_routes = num_routes + num_experts * (block_size - 1)
++    max_blocks = triton.cdiv(max_routes, block_size)
++    packed = torch.full((max_routes,), -99, dtype=torch.int32)
++    experts = torch.full((max_blocks,), -99, dtype=torch.int32)
++    total = torch.empty(1, dtype=torch.int32)
++    offsets = torch.empty(num_experts + 1, dtype=torch.int32)
++    kernel[(1,)](
++        ids,
++        expert_map,
++        packed,
++        experts,
++        total,
++        offsets,
++        num_routes,
++        NUMEL_CAPACITY=triton.cdiv(num_routes, 256) * 256,
++        BLOCK_SIZE=block_size,
++        NUM_EXPERTS=num_experts,
++        MAX_PACKED_ROUTES=max_routes,
++        MAX_ROUTE_BLOCKS=max_blocks,
++        HAS_EXPERT_MAP=mapped,
++        BLOCK_E=triton.next_power_of_2(num_experts),
++        BLOCK_T=256,
++        BLOCK_ROUTE_INIT=triton.next_power_of_2(max_routes),
++        BLOCK_M=triton.next_power_of_2(max_blocks),
++        num_warps=8,
++    )
++    torch.testing.assert_close(offsets[:-1].long(), prefix)
++    assert offsets[-1].item() == total.item() == padded.sum().item()
++    assert torch.all(packed == num_routes)
++    expected_experts = torch.full_like(experts, -1)
++    for expert in range(num_experts):
++        expected_experts[
++            prefix[expert] // block_size : inclusive[expert] // block_size
++        ] = expert
++    torch.testing.assert_close(experts, expected_experts)
++
++
++def test_histogram_patch_packaging(tmp_path):
++    import importlib.util
++    import subprocess
++
++    repo = Path(__file__).resolve().parents[3]
++    spec = importlib.util.spec_from_file_location(
++        "route_verifier", repo / "build/verify_runtime.py"
++    )
++    verifier = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(verifier)
++    source = Path(
++        os.environ.get("SPARKINFER_REVIEW_ROOT", "/opt/vllm-runner/sources/sparkinfer")
++    )
++    patch = repo / "build/patches/sparkinfer-small-prefix-histogram.patch"
++    relative = Path("moe/_shared/kernels/w4a16/route_pack.py")
++    # A bind-mounted worktree has a host-only .git pointer. Copy the exact
++    # source file, without Git metadata, to exercise the packaging verifier.
++    isolated = tmp_path / "source"
++    copied = isolated / "sparkinfer" / relative
++    copied.parent.mkdir(parents=True)
++    copied.write_bytes((source / "sparkinfer" / relative).read_bytes())
++    source = isolated
++    verifier.verify_sparkinfer_route_sources(source / "sparkinfer", source, patch)
++    stale = tmp_path / relative
++    stale.parent.mkdir(parents=True)
++    stale.write_text("# stale installed package\n")
++    with pytest.raises(RuntimeError, match="packaged source differs"):
++        verifier.verify_sparkinfer_route_sources(tmp_path, source, patch)
++    with pytest.raises(subprocess.CalledProcessError):
++        verifier.verify_sparkinfer_route_sources(tmp_path, tmp_path, patch)
+diff --git a/tests/v1/spec_decode/test_candidate_pair_exchange.py b/tests/v1/spec_decode/test_candidate_pair_exchange.py
+new file mode 100644
+index 0000000000..f35b49e4e4
+--- /dev/null
++++ b/tests/v1/spec_decode/test_candidate_pair_exchange.py
+@@ -0,0 +1,224 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CPU contracts for the compact tensor-parallel candidate exchange."""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.model_executor.layers import logits_processor
++
++
++def _processor():
++    processor = object.__new__(logits_processor.LogitsProcessor)
++    torch.nn.Module.__init__(processor)
++    processor.scale = 1.0
++    processor.soft_cap = None
++    return processor
++
++
++@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
++@pytest.mark.parametrize("ties", [False, True])
++def test_pair_exchange_matches_two_gather_order(monkeypatch, dtype, ties):
++    shards = [
++        torch.tensor([[1, 5, 4, 100], [2, 7, 1, 100]], dtype=dtype),
++        torch.tensor([[6, 3, 2, 100], [8, 5, 4, 100]], dtype=dtype),
++    ]
++    if ties:
++        shards[1][0, 0] = 5
++        shards[1][1, 0] = 7
++    k = 2
++    topks = []
++    for rank, shard in enumerate(shards):
++        masked = shard.clone()
++        masked[:, -1] = -torch.inf
++        values, ids = masked.topk(k, dim=-1)
++        topks.append((values, ids + rank * 3))
++    all_scores = torch.cat([item[0] for item in topks], dim=-1)
++    all_ids = torch.cat([item[1] for item in topks], dim=-1)
++    expected_values, positions = all_scores.topk(k, dim=-1)
++    expected_ids = all_ids.gather(-1, positions)
++    packed = [
++        torch.stack((scores.float(), ids.float()), dim=-1).flatten(-2)
++        for scores, ids in topks
++    ]
++
++    for rank in range(2):
++        calls = []
++
++        def gather(value, dim=-1, *, rank=rank, calls=calls):
++            assert dim == -1
++            torch.testing.assert_close(value, packed[rank])
++            calls.append(value)
++            return torch.cat(packed, dim=-1)
++
++        monkeypatch.setattr(
++            logits_processor, "tensor_model_parallel_all_gather", gather
++        )
++        head = SimpleNamespace(
++            tp_size=2,
++            num_embeddings_padded=8,
++            shard_indices=SimpleNamespace(
++                num_org_vocab_padding=1, org_vocab_start_index=rank * 3
++            ),
++        )
++        def checked_topk(scores, count):
++            assert scores.dtype == dtype
++            assert scores.is_contiguous()
++            return torch.topk(scores, count, dim=-1)
++
++        monkeypatch.setattr(logits_processor, "_topk", checked_topk)
++        ids, values = _processor().get_top_k_tokens(
++            head, torch.empty(2, 0), k, local_logits=shards[rank].clone()
++        )
++        assert len(calls) == 1
++        assert ids.dtype == torch.int64 and values.dtype == torch.float32
++        torch.testing.assert_close(ids, expected_ids)
++        torch.testing.assert_close(values, expected_values.float())
++
++
++@pytest.mark.parametrize(
++    "dtype,padded_size",
++    [(torch.float64, 8), (torch.float32, 2**24 + 2)],
++)
++def test_nonrepresentable_domain_keeps_two_gathers(
++    monkeypatch, dtype, padded_size
++):
++    local = torch.tensor([[1.25, 4.5, 2.75]], dtype=dtype)
++    remote = torch.tensor([[5.5, 3.5]], dtype=dtype)
++    expected_local_values, expected_local_ids = local.topk(2)
++    remote_ids = torch.tensor([[2**24 + 1, 2**24]], dtype=torch.int64)
++    gathered = (
++        torch.cat((expected_local_values, remote), -1),
++        torch.cat((expected_local_ids, remote_ids), -1),
++    )
++    calls = []
++
++    def gather(value, dim=-1):
++        assert dim == -1
++        expected = (expected_local_values, expected_local_ids)[len(calls)]
++        torch.testing.assert_close(value, expected)
++        calls.append(value)
++        return gathered[len(calls) - 1]
++
++    monkeypatch.setattr(logits_processor, "tensor_model_parallel_all_gather", gather)
++    head = SimpleNamespace(
++        tp_size=2,
++        num_embeddings_padded=padded_size,
++        shard_indices=SimpleNamespace(
++            num_org_vocab_padding=0, org_vocab_start_index=0
++        ),
++    )
++    ids, values = _processor().get_top_k_tokens(
++        head, torch.empty(1, 0), 2, local_logits=local.clone()
++    )
++    assert len(calls) == 2
++    assert ids.tolist() == [[2**24 + 1, 1]]
++    assert values.dtype == torch.float32
++    torch.testing.assert_close(values, torch.tensor([[5.5, 4.5]]))
++
++
++def test_single_rank_has_no_candidate_collective(monkeypatch):
++    monkeypatch.setattr(
++        logits_processor,
++        "tensor_model_parallel_all_gather",
++        lambda *args, **kwargs: pytest.fail("TP1 must not gather"),
++    )
++    head = SimpleNamespace(
++        tp_size=1,
++        num_embeddings_padded=4,
++        shard_indices=SimpleNamespace(
++            num_org_vocab_padding=1, org_vocab_start_index=0
++        ),
++    )
++    ids, values = _processor().get_top_k_tokens(
++        head,
++        torch.empty(1, 0),
++        2,
++        local_logits=torch.tensor([[1.0, 3.0, 2.0, 100.0]]),
++    )
++    assert ids.tolist() == [[1, 2]]
++    assert values.tolist() == [[3.0, 2.0]]
++
++
++def test_logprob_consumer_keeps_partition_and_one_candidate_exchange(monkeypatch):
++    shards = (
++        torch.tensor([[1.0, 3.0, 2.0, 100.0]]),
++        torch.tensor([[6.0, 5.0, 0.0, 100.0]]),
++    )
++    valid = [shard[:, :3] for shard in shards]
++    local_topk = [shard.topk(2) for shard in valid]
++    pairs = [
++        torch.stack(
++            (topk.values, (topk.indices + rank * 3).float()), dim=-1
++        ).flatten(-2)
++        for rank, topk in enumerate(local_topk)
++    ]
++    partition = torch.cat(
++        [shard.logsumexp(-1, keepdim=True) for shard in valid], -1
++    )
++    expected = torch.cat(valid, -1).log_softmax(-1).topk(2)
++
++    for rank in range(2):
++        calls = []
++
++        def gather(value, dim=-1, *, rank=rank, calls=calls):
++            assert dim == -1
++            if not calls:
++                torch.testing.assert_close(
++                    value, valid[rank].logsumexp(-1, keepdim=True)
++                )
++                result = partition
++            else:
++                torch.testing.assert_close(value, pairs[rank])
++                result = torch.cat(pairs, -1)
++            calls.append(value)
++            return result
++
++        monkeypatch.setattr(
++            logits_processor, "tensor_model_parallel_all_gather", gather
++        )
++        head = SimpleNamespace(
++            tp_size=2,
++            num_embeddings_padded=8,
++            shard_indices=SimpleNamespace(
++                num_org_vocab_padding=1, org_vocab_start_index=rank * 3
++            ),
++        )
++        ids, values = _processor().get_top_k_tokens(
++            head,
++            torch.empty(1, 0),
++            2,
++            local_logits=shards[rank].clone(),
++            return_log_probs=True,
++        )
++        assert len(calls) == 2
++        torch.testing.assert_close(ids, expected.indices)
++        torch.testing.assert_close(values, expected.values)
++
++
++def test_largest_exact_fp32_token_id_uses_one_exchange(monkeypatch):
++    local = torch.tensor([[1.0, 2.0]])
++    remote = torch.tensor([[3.0, float(2**24)]])
++    calls = []
++
++    def gather(value, dim=-1):
++        assert dim == -1
++        calls.append(value)
++        return torch.cat((value, remote), dim=-1)
++
++    monkeypatch.setattr(logits_processor, "tensor_model_parallel_all_gather", gather)
++    head = SimpleNamespace(
++        tp_size=2,
++        num_embeddings_padded=2**24 + 1,
++        shard_indices=SimpleNamespace(
++            num_org_vocab_padding=0, org_vocab_start_index=0
++        ),
++    )
++    ids, values = _processor().get_top_k_tokens(
++        head, torch.empty(1, 0), 1, local_logits=local
++    )
++    assert len(calls) == 1
++    assert ids.tolist() == [[2**24]]
++    assert values.tolist() == [[3.0]]
+diff --git a/tests/v1/spec_decode/test_dflash2.py b/tests/v1/spec_decode/test_dflash2.py
+index bf6dee0cb7..2093b37c9a 100644
+--- a/tests/v1/spec_decode/test_dflash2.py
++++ b/tests/v1/spec_decode/test_dflash2.py
+@@ -617,7 +617,8 @@ def test_fp8_draft_head_logits_track_bf16_reference():
+     actual = fp8_draft_head_logits(hidden, quantize_draft_head(weight))
+     expected = hidden @ weight.t()
+ 
+-    torch.testing.assert_close(actual, expected, atol=1.0, rtol=0.08)
++    assert actual.dtype == torch.float32
++    torch.testing.assert_close(actual, expected.float(), atol=1.0, rtol=0.08)
+ 
+ 
+ def test_exact_dflash2_cpu_grouped_conv_geometry_matches_reference():
+diff --git a/tests/v1/spec_decode/test_fp8_draft_head_precision.py b/tests/v1/spec_decode/test_fp8_draft_head_precision.py
+new file mode 100644
+index 0000000000..3ec9fe824d
+--- /dev/null
++++ b/tests/v1/spec_decode/test_fp8_draft_head_precision.py
+@@ -0,0 +1,43 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CPU scale/dispatch regression; GPU numerical candidate coverage is separate."""
++
++import importlib.util
++from pathlib import Path
++
++import torch
++
++
++def test_fp32_scales_and_gemm_output_contract(monkeypatch):
++    path = (
++        Path(__file__).resolve().parents[3]
++        / "vllm/model_executor/layers/fp8_draft_head.py"
++    )
++    spec = importlib.util.spec_from_file_location("head_precision", path)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    weight = torch.tensor([[1.125, -0.75], [0.375, 1.75]], dtype=torch.bfloat16)
++    hidden = torch.tensor([[0.625, -1.125]], dtype=torch.bfloat16)
++    head = module.quantize_draft_head(weight)
++    expected_scale = weight.float().abs().amax(1).reshape(1, -1) / 448.0
++    torch.testing.assert_close(head.row_scale, expected_scale, rtol=0, atol=0)
++    assert head.row_scale.dtype == head.unit_scale.dtype == torch.float32
++    calls = []
++
++    def scaled_mm(a, b, *, scale_a, scale_b, out_dtype):
++        calls.append(out_dtype)
++        assert a.dtype == b.dtype == torch.float8_e4m3fn
++        assert scale_a.dtype == scale_b.dtype == torch.float32
++        assert out_dtype == torch.float32
++        return a.float() @ b.float()
++
++    monkeypatch.setattr(torch, "_scaled_mm", scaled_mm)
++    actual = module.fp8_draft_head_logits(hidden, head)
++    h = hidden.float()
++    act_max = h.abs().amax(-1, keepdim=True).clamp(min=1e-6)
++    quantized_h = (h * (448.0 / act_max)).to(torch.float8_e4m3fn).float()
++    expected = (quantized_h @ head.weight_fp8.float().t()) * expected_scale
++    expected = expected * (act_max / 448.0)
++    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
++    assert calls == [torch.float32]
++    assert actual.dtype == torch.float32
+diff --git a/vllm/model_executor/layers/fp8_draft_head.py b/vllm/model_executor/layers/fp8_draft_head.py
+index 2d400bfe49..8a0b67bdd4 100644
+--- a/vllm/model_executor/layers/fp8_draft_head.py
++++ b/vllm/model_executor/layers/fp8_draft_head.py
+@@ -31,7 +31,7 @@ def quantize_draft_head(weight: torch.Tensor) -> Fp8DraftHead:
+         w = weight.detach()
+         row_max = w.abs().amax(dim=1, keepdim=True).float().clamp(min=1e-6)
+         weight_fp8 = (w.float() * (_FP8_MAX / row_max)).to(torch.float8_e4m3fn)
+-        row_scale = (row_max / _FP8_MAX).to(w.dtype).reshape(1, -1)
++        row_scale = (row_max / _FP8_MAX).reshape(1, -1)
+         unit_scale = torch.ones(1, dtype=torch.float32, device=w.device)
+     return Fp8DraftHead(weight_fp8, row_scale, unit_scale)
+ 
+@@ -41,15 +41,18 @@ def fp8_draft_head_logits(
+     head: Fp8DraftHead,
+ ) -> torch.Tensor:
+     """Compute local draft logits with dynamic-activation rowwise FP8 GEMM."""
+-    act_max = hidden_states.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
+-    act_fp8 = (hidden_states * (_FP8_MAX / act_max)).to(torch.float8_e4m3fn)
++    # Keep activation quantization and dequantization scales in FP32. Casting
++    # a BF16 GEMM result afterward cannot recover logits rounded before top-k.
++    hidden_float = hidden_states.float()
++    act_max = hidden_float.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
++    act_fp8 = (hidden_float * (_FP8_MAX / act_max)).to(torch.float8_e4m3fn)
+     logits = torch._scaled_mm(
+         act_fp8,
+         head.weight_fp8.t(),
+         scale_a=head.unit_scale,
+         scale_b=head.unit_scale,
+-        out_dtype=hidden_states.dtype,
++        out_dtype=torch.float32,
+     )
+     logits = logits * head.row_scale
+-    logits = logits * (act_max / _FP8_MAX).to(hidden_states.dtype)
++    logits = logits * (act_max / _FP8_MAX)
+     return logits
+diff --git a/vllm/model_executor/layers/logits_processor.py b/vllm/model_executor/layers/logits_processor.py
+index 8560edc950..b92f5bfbbe 100644
+--- a/vllm/model_executor/layers/logits_processor.py
++++ b/vllm/model_executor/layers/logits_processor.py
+@@ -307,10 +307,30 @@ class LogitsProcessor(PluggableLayer):
+         ids = ids.to(torch.int64) + lm_head.shard_indices.org_vocab_start_index
+ 
+         if lm_head.tp_size > 1:
+-            values = tensor_model_parallel_all_gather(values, dim=-1)
+-            ids = tensor_model_parallel_all_gather(ids, dim=-1)
+-            values, selected = _topk(values, k)
+-            ids = ids.gather(-1, selected)
++            # FP32 represents these score dtypes and every padded vocabulary ID
++            # exactly. Keep one rank-major (score, ID) exchange in that domain.
++            # The padded bound also covers IDs selected when a shard has < k
++            # real tokens. Other dtypes or larger vocabularies retain the
++            # original two-collective path without score/ID precision loss.
++            padded_vocab_size = getattr(lm_head, "num_embeddings_padded", None)
++            if (
++                values.dtype in (torch.float16, torch.bfloat16, torch.float32)
++                and padded_vocab_size is not None
++                and 0 < padded_vocab_size <= 2**24 + 1
++            ):
++                pairs = torch.stack((values.float(), ids.float()), dim=-1)
++                gathered = tensor_model_parallel_all_gather(
++                    pairs.flatten(start_dim=-2), dim=-1
++                ).unflatten(-1, (lm_head.tp_size * k, 2))
++                # Restore the original top-k dtype and contiguous score layout.
++                scores = gathered[..., 0].to(values.dtype).contiguous()
++                values, selected = _topk(scores, k)
++                ids = gathered[..., 1].gather(-1, selected).to(torch.int64)
++            else:
++                values = tensor_model_parallel_all_gather(values, dim=-1)
++                ids = tensor_model_parallel_all_gather(ids, dim=-1)
++                values, selected = _topk(values, k)
++                ids = ids.gather(-1, selected)
+ 
+         values = values.float()
+         if return_log_probs:

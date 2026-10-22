@@ -38,6 +38,30 @@ vllm/vllm-rs
 # Distribution / packaging
 .Python
 build/
+!build/
+build/*
+!build/README.md
+!build/versions.env
+!build/fetch_sources.sh
+!build/verify_runtime.py
+!build/provenance.py
+!build/Dockerfile.runner
+!build/assets/
+!build/assets/glm53/
+!build/assets/glm53/chat_template.jinja
+!build/build_image.sh
+!build/build_flashinfer_topk.py
+!build/patches/
+build/patches/*
+!build/patches/exllamav3-aarch64.patch
+!build/patches/sparkinfer-cutlass-dsl.patch
+!build/patches/sparkinfer-trellis-swiglu-limit.patch
+!build/patches/sparkinfer-trellis-barrier-order.patch
+!build/patches/flashinfer-sm120-memory-order.patch
+!build/patches/transformers-glm5next-temporal-budget.patch
+!build/patches/b12x-cutlass-dsl.patch
+!build/profiles/
+!build/profiles/*
 !requirements/build/
 cmake-build-*/
 CMakeUserPresets.json
@@ -237,9 +261,6 @@ benchmarks/**/*.json
 actionlint
 shellcheck*/
 
-# Ignore moe/marlin_moe gen code
-csrc/libtorch_stable/moe/marlin_moe_wna16/kernel_*
-
 # Ignore ep_kernels_workspace folder
 ep_kernels_workspace/
 
@@ -254,3 +275,6 @@ vllm/grpc/vllm_engine_pb2.pyi
 
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
+
+# Standalone Docker contexts for linked release worktrees.
+/.build-contexts/

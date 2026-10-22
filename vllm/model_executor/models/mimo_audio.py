@@ -21,10 +21,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from transformers.activations import ACT2FN
-from transformers.configuration_utils import PretrainedConfig
+from transformers.configuration_utils import PreTrainedConfig
 from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Model
+
+from vllm.utils.mem_utils import check_startup_memory, record_startup_memory_peak
 
 logger = logging.getLogger(__name__)
 
@@ -278,6 +280,17 @@ class EuclideanCodebook(nn.Module):
         return x
 
     def quantize(self, x):
+        rows, channels = x.shape
+        bins = self.embed.shape[0]
+        check_startup_memory(
+            device_bytes=(
+                rows * channels + channels * bins + rows * bins * 3 + rows + bins
+            )
+            * x.element_size()
+            + rows * torch.long.itemsize,
+            label="MiMo audio FP32 vector-quantizer distances and indices",
+            device=x.device,
+        )
         embed = self.embed.t()
         dist_val = -(
             x.pow(2).sum(1, keepdim=True)
@@ -518,7 +531,7 @@ class ResidualVectorQuantizer(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class MiMoAudioTokenizerConfig(PretrainedConfig):
+class MiMoAudioTokenizerConfig(PreTrainedConfig):
     model_type = "mimo_audio_tokenizer"
 
     def __init__(
@@ -629,11 +642,17 @@ class MiMoAudioTokenizerConfig(PretrainedConfig):
 
 
 def get_sequence_mask(inputs, inputs_length):
-    if inputs.dim() == 3:
+    device = inputs.device if inputs is not None else inputs_length.device
+    if inputs is not None and inputs.dim() == 3:
         bsz, tgt_len, _ = inputs.size()
     else:
         bsz, tgt_len = inputs_length.shape[0], torch.max(inputs_length)
-    sequence_mask = torch.arange(0, tgt_len).to(inputs.device)
+    check_startup_memory(
+        device_bytes=int(bsz) * int(tgt_len) * (1 + 8 + 8 + 8) + int(tgt_len) * 8,
+        label="MiMo audio mask, cumulative indices and offsets",
+        device=device,
+    )
+    sequence_mask = torch.arange(0, tgt_len).to(device)
     sequence_mask = torch.lt(sequence_mask, inputs_length.reshape(bsz, 1)).view(
         bsz, tgt_len, 1
     )
@@ -647,6 +666,15 @@ def unpack_hidden_states(
     bsz = lengths.shape[0]
     if sequence_mask is None or unpacking_index is None:
         sequence_mask, unpacking_index = get_sequence_mask(hidden_states, lengths)
+    check_startup_memory(
+        device_bytes=int(bsz)
+        * int(torch.max(lengths))
+        * hidden_states.shape[-1]
+        * hidden_states.element_size()
+        * 2,
+        label="MiMo audio padded index-select and masked output",
+        device=hidden_states.device,
+    )
     hidden_states = torch.index_select(hidden_states, 0, unpacking_index).view(
         bsz, torch.max(lengths), hidden_states.shape[-1]
     )
@@ -655,6 +683,11 @@ def unpack_hidden_states(
 
 def get_position_ids(lengths):
     total_len = lengths.sum()
+    check_startup_memory(
+        device_bytes=int(total_len) * 8 * 3 + lengths.numel() * 8 * 2,
+        label="MiMo audio position repeat, range and difference",
+        device=lengths.device,
+    )
     offset = torch.cat([torch.zeros(1).to(lengths), lengths[:-1].cumsum(dim=0)])
     offset = torch.repeat_interleave(offset, lengths)
     return torch.arange(0, total_len).to(offset) - offset
@@ -693,6 +726,14 @@ class AudioEncoderAttention(nn.Module):
         from vllm.vllm_flash_attn import flash_attn_varlen_func
 
         bsz, _ = hidden_states.size()
+        check_startup_memory(
+            device_bytes=bsz
+            * self.embed_dim
+            * hidden_states.element_size()
+            * (3 + 4 + 1 + 1),
+            label="MiMo audio tokenizer QKV, rotary, context and output",
+            device=hidden_states.device,
+        )
 
         query_states = self.q_proj(hidden_states).view(
             bsz, self.num_heads, self.head_dim
@@ -755,6 +796,14 @@ class AudioEncoderTransformerLayer(nn.Module):
         max_seqlen: int,
         rope_position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
+        rows = hidden_states.shape[0]
+        check_startup_memory(
+            device_bytes=rows
+            * hidden_states.element_size()
+            * (self.embed_dim * 3 + self.fc1.out_features * 2),
+            label="MiMo audio tokenizer norms, residuals and feed-forward",
+            device=hidden_states.device,
+        )
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
         hidden_states = self.self_attn(
@@ -865,6 +914,27 @@ class AudioEncoder(nn.Module):
             self.quantizer = None
 
     def get_features(self, input_features, output_length):
+        batch, _, frames = input_features.shape
+
+        def conv_frames(conv, length):
+            return (
+                length
+                + 2 * conv.padding[0]
+                - conv.dilation[0] * (conv.kernel_size[0] - 1)
+                - 1
+            ) // conv.stride[0] + 1
+
+        first_frames = conv_frames(self.conv1, frames)
+        second_frames = conv_frames(self.conv2, first_frames)
+        check_startup_memory(
+            device_bytes=input_features.numel() * self.conv1.weight.element_size()
+            + batch
+            * self.config.d_model
+            * self.conv1.weight.element_size()
+            * (first_frames * 2 + second_frames * 2),
+            label="MiMo audio convolution/GELU intermediates",
+            device=self.conv1.weight.device,
+        )
         input_features = input_features.to(self.conv1.weight)
         inputs_embeds = nn.functional.gelu(self.conv1(input_features))
         inputs_embeds = nn.functional.gelu(self.conv2(inputs_embeds))
@@ -954,6 +1024,16 @@ class AudioEncoder(nn.Module):
     ):
         if output_length is None:
             output_length = self.get_output_length(input_lens)
+        batch = input_lens.numel()
+        padded_frames = int(input_lens.max().item())
+        check_startup_memory(
+            device_bytes=batch
+            * padded_frames
+            * input_features.shape[-1]
+            * input_features.element_size(),
+            label="MiMo audio packed-to-padded mel materialization",
+            device=input_features.device,
+        )
         input_features = unpack_hidden_states(input_features, input_lens)
         hidden_states, output_length, attention_mask, unpacking_index, tgt_len, bsz = (
             self.get_features(
@@ -964,6 +1044,16 @@ class AudioEncoder(nn.Module):
 
         dtype = hidden_states.dtype
         if use_quantizer and self.quantizer is not None:
+            float_weights = sum(
+                tensor.numel() * 4
+                for tensor in (*self.quantizer.parameters(), *self.quantizer.buffers())
+                if tensor.is_floating_point() and tensor.element_size() != 4
+            )
+            check_startup_memory(
+                device_bytes=float_weights + hidden_states.numel() * 4,
+                label="MiMo audio FP32 codebooks and quantizer input",
+                device=hidden_states.device,
+            )
             self.quantizer.float()
             codes = self.quantizer.encode(hidden_states.float(), n_q=n_q)
             if return_codes_only:
@@ -1089,6 +1179,12 @@ def tokenize_audio_batch(mels, audio_tokenizer_encoder, segment_size=6000, devic
         device = next(audio_tokenizer_encoder.parameters()).device
     input_len_seg_per_mel = [_segment_lengths_for_mel(m, segment_size) for m in mels]
     input_lens_flat = [s for segs in input_len_seg_per_mel for s in segs]
+    check_startup_memory(
+        device_bytes=sum(m.nbytes for m in mels)
+        + sum(m.nbytes for m in mels if m.device != torch.device(device)),
+        label="MiMo mel device staging and concatenation",
+        device=device,
+    )
     input_features = torch.cat([m.to(device) for m in mels], dim=0)
     input_lens_t = torch.tensor(input_lens_flat, dtype=torch.long, device=device)
     codes_packed = encode_batch(
@@ -1166,7 +1262,21 @@ class AudioProjection(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.mlp(x)
+        rows = x.numel() // x.shape[-1]
+        check_startup_memory(
+            device_bytes=rows
+            * x.element_size()
+            * (
+                self.mlp[0].out_features
+                + self.mlp[0].out_features
+                + self.mlp[2].out_features
+            ),
+            label="MiMo audio projection linear, GELU and output",
+            device=x.device,
+        )
+        output = self.mlp(x)
+        record_startup_memory_peak(device=x.device)
+        return output
 
 
 # ---------------------------------------------------------------------------
@@ -1200,7 +1310,11 @@ class MimoAudioEncoder(nn.Module):
             config.speech_zeroemb_idx, config.audio_channels
         )
 
+        # This encoder consumes speech embeddings, never token IDs or past KV.
         input_local_config = Qwen2Config(
+            vocab_size=0,
+            pad_token_id=None,
+            use_cache=False,
             hidden_size=config.input_local_dim,
             num_hidden_layers=config.input_local_layers,
             num_attention_heads=config.input_local_attn_heads,
@@ -1289,15 +1403,50 @@ class MimoAudioEncoder(nn.Module):
         return [int(value)] * length
 
     def apply_input_local_transformer(self, speech_embeddings: torch.Tensor):
+        groups, positions, hidden = speech_embeddings.shape
+        rows = groups * positions
+        itemsize = speech_embeddings.element_size()
+        intermediate = self.config.input_local_intermediate_size
+        heads = self.config.input_local_attn_heads
+        # Bound explicit per-layer producers; no hidden-state/attention capture.
+        rmsnorm = rows * hidden * (4 + 4 + itemsize) + rows * 4 * 2
+        projections = rows * hidden * itemsize * 3
+        rotary = rows * hidden * itemsize * 4
+        attention_output = rows * hidden * itemsize * 2
+        dense_attention = groups * heads * positions * positions * (4 + 4)
+        mlp = rows * intermediate * itemsize * 4
+        layer_output = rows * hidden * itemsize * 2
+        check_startup_memory(
+            device_bytes=rmsnorm
+            + max(
+                projections + rotary + attention_output + dense_attention,
+                mlp + layer_output,
+            ),
+            label="MiMo audio local-transformer explicit layer intermediates",
+            device=speech_embeddings.device,
+        )
         output = self.input_local_transformer(
             inputs_embeds=speech_embeddings,
+            use_cache=False,
+            output_hidden_states=False,
+            output_attentions=False,
             return_dict=True,
             is_causal=not self.config.input_full_attention,
         )
+        record_startup_memory_peak(device=speech_embeddings.device)
         return output.last_hidden_state
 
     def apply_speech_embeddings(self, audio_codes: torch.Tensor) -> torch.Tensor:
         num_segments = audio_codes.shape[0]
+        check_startup_memory(
+            device_bytes=2
+            * num_segments
+            * self.config.group_size
+            * self.config.input_local_dim
+            * next(self.speech_embeddings[0].parameters()).element_size(),
+            label="MiMo speech embedding accumulator and lookup",
+            device=audio_codes.device,
+        )
         _audio_embeddings = torch.zeros(
             (num_segments, self.config.group_size, self.config.input_local_dim),
             dtype=next(self.speech_embeddings[0].parameters()).dtype,
@@ -1315,6 +1464,7 @@ class MimoAudioEncoder(nn.Module):
 
         Returns:
             [T//group_size, group_size, audio_channels]
+
         """
         T = audio.shape[0]
         audio = audio[:, : self.audio_channels]
@@ -1322,6 +1472,15 @@ class MimoAudioEncoder(nn.Module):
             (T + self.audio_group_size - 1)
             // self.audio_group_size
             * self.audio_group_size
+        )
+        padded_dtype = torch.promote_types(torch.int32, audio.dtype)
+        check_startup_memory(
+            device_bytes=padded_T * self.audio_channels * padded_dtype.itemsize
+            + (padded_T - T)
+            * self.audio_channels
+            * (torch.int32.itemsize + padded_dtype.itemsize),
+            label="MiMo audio grouped-code padding and concatenation",
+            device=audio.device,
         )
         padded_audio = torch.cat(
             [
@@ -1343,6 +1502,44 @@ class MimoAudioEncoder(nn.Module):
         )
         return padded_audio
 
+    def get_audio_feature_from_codes(
+        self, grouped_codes: list[torch.Tensor]
+    ) -> tuple[torch.Tensor, list[int]]:
+        token_lengths = []
+        integer_dtypes = {torch.int16, torch.int32, torch.int64, torch.uint8}
+        for codes in grouped_codes:
+            if (
+                codes.ndim != 3
+                or tuple(codes.shape[1:])
+                != (self.audio_group_size, self.audio_channels)
+                or codes.dtype not in integer_dtypes
+                or (codes < 0).any()
+                or (codes >= int(self.config.speech_vocab_size)).any()
+            ):
+                raise ValueError("Invalid MiMo grouped audio codec IDs")
+            token_lengths.append(codes.shape[0])
+        device = next(self.projection.parameters()).device
+        concat_dtype = grouped_codes[0].dtype
+        for codes in grouped_codes[1:]:
+            concat_dtype = torch.promote_types(concat_dtype, codes.dtype)
+        source_bytes = (
+            sum(codes.numel() for codes in grouped_codes) * concat_dtype.itemsize
+        )
+        check_startup_memory(
+            device_bytes=sum(codes.numel() for codes in grouped_codes)
+            * torch.long.itemsize
+            + (0 if grouped_codes[0].is_cpu else source_bytes),
+            host_bytes=source_bytes if grouped_codes[0].is_cpu else 0,
+            label="MiMo grouped codec concatenation and device conversion",
+            device=device,
+        )
+        codes = torch.cat(grouped_codes).to(device=device, dtype=torch.long)
+        embeddings = self.apply_speech_embeddings(codes)
+        embeddings = self.apply_input_local_transformer(embeddings)
+        return self.projection(
+            embeddings.reshape(embeddings.shape[0], -1)
+        ), token_lengths
+
     def get_audio_feature(
         self, mel_specs: list[torch.Tensor]
     ) -> tuple[torch.Tensor, list[int]]:
@@ -1355,7 +1552,13 @@ class MimoAudioEncoder(nn.Module):
             Tuple of:
             - audio_embeds: [total_tokens, out_hidden_size] concatenated embeddings
             - item_token_lens: list of int, number of tokens per input item
+
         """
+        if mel_specs and all(spec.ndim == 3 for spec in mel_specs):
+            return self.get_audio_feature_from_codes(mel_specs)
+        if any(spec.ndim != 2 for spec in mel_specs):
+            raise ValueError("MiMo audio must be mel features or grouped codec IDs")
+
         if self.audio_tokenizer is None:
             raise RuntimeError(
                 "audio_tokenizer is not loaded. "
@@ -1385,6 +1588,11 @@ class MimoAudioEncoder(nn.Module):
             codecs_to_concat.append(padded_codes)
             item_token_lens.append(padded_codes.shape[0])
 
+        check_startup_memory(
+            device_bytes=sum(codes.nbytes for codes in codecs_to_concat),
+            label="MiMo audio codec batch concatenation",
+            device=codecs_to_concat[0].device,
+        )
         audio_codes = torch.cat(
             codecs_to_concat, dim=0
         )  # [total_T//group_size, group_size, audio_channels]

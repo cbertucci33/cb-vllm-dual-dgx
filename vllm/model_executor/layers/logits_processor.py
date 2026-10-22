@@ -53,34 +53,6 @@ def _topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     return impl(scores, k, sorted=True, deterministic=True)
 
 
-def _mask_vocab_padding(logits: torch.Tensor, shard_indices) -> None:
-    """Mask both per-shard padding regions ([org | org_pad | added | added_pad])."""
-    if shard_indices.num_org_vocab_padding > 0:
-        logits[
-            ...,
-            shard_indices.num_org_elements : shard_indices.num_org_elements_padded,
-        ] = -float("inf")
-    if shard_indices.num_added_vocab_padding > 0:
-        added_pad_start = (
-            shard_indices.num_org_elements_padded + shard_indices.num_added_elements
-        )
-        added_pad_end = (
-            shard_indices.num_org_elements_padded
-            + shard_indices.num_added_elements_padded
-        )
-        logits[..., added_pad_start:added_pad_end] = -float("inf")
-
-
-def _globalize_token_ids(ids: torch.Tensor, shard_indices) -> torch.Tensor:
-    """Convert shard-local indices to global IDs, including added vocabulary."""
-    added_vocab_local_start = shard_indices.num_org_elements_padded
-    return torch.where(
-        ids >= added_vocab_local_start,
-        ids - added_vocab_local_start + shard_indices.added_vocab_start_index,
-        ids + shard_indices.org_vocab_start_index,
-    )
-
-
 # --8<-- [start:logits_processor]
 @PluggableLayer.register("logits_processor")
 class LogitsProcessor(PluggableLayer):
@@ -102,9 +74,9 @@ class LogitsProcessor(PluggableLayer):
         logits_as_input: bool = False,
         soft_cap: float | None = None,
     ) -> None:
-        """
-        Args:
-            scale: A scaling factor to apply to the logits.
+        """Args:
+        scale: A scaling factor to apply to the logits.
+
         """
         super().__init__()
         self.scale = scale
@@ -284,6 +256,8 @@ class LogitsProcessor(PluggableLayer):
         hidden_states: torch.Tensor,
         k: int,
         embedding_bias: torch.Tensor | None = None,
+        *,
+        return_log_probs: bool = False,
         local_logits: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Vocab-parallel top-k without all-gathering full logits.
@@ -292,13 +266,11 @@ class LogitsProcessor(PluggableLayer):
         the values as well as the global ids. Communication is
         O(batch * 2k * tp_size) rather than O(batch * vocab_size).
 
-        Scale and soft cap are applied to the k selected values rather than
+        With return_log_probs, values use the full-vocabulary log-partition.
+
+        Otherwise scale and soft cap are applied to the k selected values rather than
         the whole vocabulary; both are monotonic, so the selection is the same
         and only k entries are touched.
-
-        `local_logits` supplies this rank's shard logits when the caller has
-        already projected them, such as through DFlash's quantized draft head.
-        Padding, top-k selection, and cross-rank merging are unchanged.
         """
         if self.scale <= 0.0 and self.scale != 1.0:
             raise ValueError(
@@ -310,19 +282,61 @@ class LogitsProcessor(PluggableLayer):
             logits = self._apply_head(lm_head, hidden_states, embedding_bias)
         else:
             logits = local_logits
+        if return_log_probs:
+            if self.soft_cap is not None:
+                logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
+            if self.scale != 1.0:
+                logits = logits * self.scale
 
-        _mask_vocab_padding(logits, lm_head.shard_indices)
+        # Mask out padding entries beyond org_vocab_size on this shard.
+        num_pad = lm_head.shard_indices.num_org_vocab_padding
+        if num_pad > 0:
+            logits[..., -num_pad:] = -float("inf")
+
+        if return_log_probs:
+            log_partition = torch.logsumexp(logits.float(), dim=-1, keepdim=True)
+            if lm_head.tp_size > 1:
+                log_partition = torch.logsumexp(
+                    tensor_model_parallel_all_gather(log_partition, dim=-1),
+                    dim=-1,
+                    keepdim=True,
+                )
 
         values, ids = _topk(logits, k)
-        ids = _globalize_token_ids(ids.to(torch.int64), lm_head.shard_indices)
-        values = values.float()
+        # Convert shard-local indices to global vocab indices.
+        ids = ids.to(torch.int64) + lm_head.shard_indices.org_vocab_start_index
 
         if lm_head.tp_size > 1:
-            values = tensor_model_parallel_all_gather(values, dim=-1)
-            ids = tensor_model_parallel_all_gather(ids, dim=-1)
-            values, selected = _topk(values, k)
-            ids = ids.gather(-1, selected)
+            # FP32 represents these score dtypes and every padded vocabulary ID
+            # exactly. Keep one rank-major (score, ID) exchange in that domain.
+            # The padded bound also covers IDs selected when a shard has < k
+            # real tokens. Other dtypes or larger vocabularies retain the
+            # original two-collective path without score/ID precision loss.
+            padded_vocab_size = getattr(lm_head, "num_embeddings_padded", None)
+            if (
+                values.dtype in (torch.float16, torch.bfloat16, torch.float32)
+                and padded_vocab_size is not None
+                and 0 < padded_vocab_size <= 2**24 + 1
+            ):
+                pairs = torch.stack((values.float(), ids.float()), dim=-1)
+                gathered = tensor_model_parallel_all_gather(
+                    pairs.flatten(start_dim=-2), dim=-1
+                ).unflatten(-1, (lm_head.tp_size * k, 2))
+                # Restore the original top-k dtype and contiguous score layout.
+                scores = gathered[..., 0].to(values.dtype).contiguous()
+                values, selected = _topk(scores, k)
+                ids = gathered[..., 1].gather(-1, selected).to(torch.int64)
+            else:
+                values = tensor_model_parallel_all_gather(values, dim=-1)
+                ids = tensor_model_parallel_all_gather(ids, dim=-1)
+                values, selected = _topk(values, k)
+                ids = ids.gather(-1, selected)
 
+        values = values.float()
+        if return_log_probs:
+            return ids, values - log_partition
+        # Match forward() and the full-vocabulary log-probability branch:
+        # soft-cap first, then scale. These operations do not commute.
         if self.soft_cap is not None:
             values = torch.tanh(values / self.soft_cap) * self.soft_cap
         if self.scale != 1.0:

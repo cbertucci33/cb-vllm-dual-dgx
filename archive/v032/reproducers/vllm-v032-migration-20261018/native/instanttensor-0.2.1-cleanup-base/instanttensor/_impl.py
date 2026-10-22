@@ -1,0 +1,1080 @@
+import os
+import sys
+import time
+import json
+import warnings
+import math
+import torch # must before instanttensor._C
+import torch.distributed as dist
+import instanttensor._C as _C
+from instanttensor._cpu_count import cpu_count
+from enum import Enum
+from typing import Union, Generator, Optional
+import threading
+import atexit
+from collections import defaultdict
+from dataclasses import dataclass
+
+
+def env_debug():
+    return os.environ.get("INSTANTTENSOR_DEBUG", "0") == "1"
+
+
+def debug_log(message, *args):
+    if env_debug():
+        if args:
+            message = message % args
+        print(f"[InstantTensor][DEBUG] {message}", file=sys.stderr, flush=True)
+
+
+try:
+    atexit.register(_C.cleanup)
+except AttributeError:
+    # _C module is mocked (e.g., during Sphinx documentation build)
+    debug_log("instanttensor._C is mocked, skipping cleanup registration")
+
+
+# How to choose a backend:
+#   Direct I/O:
+#     Use Direct I/O when a model is expected to be loaded only once over a long
+#     period. It avoids first-read slowdowns from page cache misses and prevents
+#     page cache pollution. Prefer URING > AIO > CUFILE: URING delivers the best
+#     performance on newer platforms, AIO has the broadest compatibility, and
+#     CUFILE requires GDS support and should be chosen carefully because its high
+#     throughput can be offset by cuFile initialization overhead.
+#   Buffered I/O:
+#     Use buffered I/O when the same model is expected to be loaded repeatedly
+#     within a short period. It improves later reads, although the first read is
+#     usually slower than Direct I/O. Prefer URING_BUFFERED > AIO_BUFFERED > MMAP:
+#     URING_BUFFERED is faster but less compatible than AIO_BUFFERED, while MMAP
+#     is usable in this scenario but not recommended.
+#   Memory I/O:
+#     When storing models on an in-memory filesystem such as tmpfs to accelerate
+#     loading, prefer MMAP > URING_BUFFERED > AIO_BUFFERED. MMAP provides the
+#     best performance and compatibility; the other two backends work but are not
+#     recommended for this case.
+# Default backend:
+#   InstantTensor uses MMAP by default for in-memory filesystems. In other cases,
+#   it tries URING first and falls back to AIO to balance performance and broad
+#   compatibility.
+_backend_values = _C.backend_values()
+
+
+class Backend(Enum):
+    AIO = _backend_values["AIO"]
+    AIO_BUFFERED = _backend_values["AIO_BUFFERED"]
+    URING = _backend_values["URING"]
+    URING_BUFFERED = _backend_values["URING_BUFFERED"]
+    CUFILE = _backend_values["CUFILE"]
+    MMAP = _backend_values["MMAP"]
+
+
+del _backend_values
+
+
+class BackendPolicy(Enum):
+    BUFFERED = "BUFFERED"
+
+
+default_backend = [Backend.URING, Backend.AIO]
+default_buffered_io_backend = [Backend.URING_BUFFERED, Backend.MMAP]
+default_in_memory_backend = [Backend.MMAP]
+available_in_memory_backends = [Backend.MMAP, Backend.URING_BUFFERED, Backend.AIO_BUFFERED]
+MAX_IO_DEPTH = _C.MAX_IO_DEPTH
+MAX_CHUNK_SIZE = _C.MAX_CHUNK_SIZE
+
+
+BackendCandidate = Union[Backend, BackendPolicy]
+BackendCandidates = Optional[Union[BackendCandidate, list[BackendCandidate]]]
+_emitted_backend_warnings = set()
+
+
+@dataclass(frozen=True)
+class _OpenConfig:
+    buffer_size: Optional[int]
+    chunk_size: Optional[int]
+    concurrency: Optional[int]
+    io_depth: Optional[int]
+    max_free_mem_usage: Optional[float]
+    backend: BackendCandidates
+
+
+def parse_backend(name: str) -> BackendCandidate:
+    str_to_backend = {backend.name: backend for backend in Backend}
+    str_to_backend.update({policy.name: policy for policy in BackendPolicy})
+    name = name.strip()
+    if name not in str_to_backend:
+        raise ValueError(f"backend={name} is invalid. Available backends: {str_to_backend.keys()}")
+    return str_to_backend[name]
+
+
+def expand_backend_candidate(backend: BackendCandidate) -> list[Backend]:
+    if isinstance(backend, Backend):
+        return [backend]
+    if backend == BackendPolicy.BUFFERED:
+        return list(default_buffered_io_backend)
+    raise TypeError("backend must be a `Backend`, `BackendPolicy`, or list of them")
+
+
+def parse_backend_candidates(backends: BackendCandidates) -> Optional[list[Backend]]:
+    if backends is None:
+        return None
+
+    backend_list = backends if isinstance(backends, list) else [backends]
+    if len(backend_list) == 0:
+        raise ValueError("backend cannot be an empty list; use None to select the default backend candidates")
+
+    candidates = []
+    for backend in backend_list:
+        if not isinstance(backend, (Backend, BackendPolicy)):
+            raise TypeError("backend must be a `Backend`, `BackendPolicy`, or list of them")
+        candidates.extend(expand_backend_candidate(backend))
+    return candidates
+
+
+def backend_names(backends: list[Backend]) -> list[str]:
+    return [backend.name for backend in backends]
+
+
+def _emit_backend_warning(message: str) -> None:
+    if not message or message in _emitted_backend_warnings:
+        return
+
+    warnings.warn(
+        message,
+        RuntimeWarning,
+        stacklevel=3,
+    )
+    _emitted_backend_warnings.add(message)
+
+
+def select_backend(candidates: list[Backend], supported_backends: Optional[list[Backend]] = None) -> Backend:
+    rejected = []
+    for backend in candidates:
+        if supported_backends is not None and backend not in supported_backends:
+            rejected.append(f"{backend.name} is not supported for this filesystem.")
+            continue
+        available, reason, warning = _C.backend_status(backend.value)
+        if not available:
+            rejected.append(
+                reason or f"{backend.name} is not available on this system."
+            )
+            continue
+        _emit_backend_warning(warning)
+        debug_log("Using backend %s", backend.name)
+        return backend
+
+    candidates_str = ", ".join(backend_names(candidates))
+    rejected_str = " ".join(rejected)
+    raise RuntimeError(
+        f"No available backend was found among candidates [{candidates_str}]. "
+        f"{rejected_str}"
+    )
+
+
+
+
+def env_backend():
+    ret = os.environ.get("INSTANTTENSOR_BACKEND")
+    if ret is None:
+        return None
+    candidates = [parse_backend(name) for name in ret.split(",") if name.strip()]
+    if not candidates:
+        raise ValueError("INSTANTTENSOR_BACKEND cannot be empty")
+    return candidates
+
+def env_chunk_size():
+    ret = os.environ.get("INSTANTTENSOR_CHUNK_SIZE")
+    return int(ret) if ret is not None else None
+
+def env_concurrency():
+    ret = os.environ.get("INSTANTTENSOR_CONCURRENCY")
+    return int(ret) if ret is not None else None
+
+def env_io_depth():
+    ret = os.environ.get("INSTANTTENSOR_IO_DEPTH")
+    return int(ret) if ret is not None else None
+
+def env_max_free_mem_usage():
+    ret = os.environ.get("INSTANTTENSOR_MAX_FREE_MEM_USAGE")
+    return float(ret) if ret is not None else None
+
+def env_buffer_size():
+    ret = os.environ.get("INSTANTTENSOR_BUFFER_SIZE")
+    return int(ret) if ret is not None else None
+
+
+def _host_available_bytes():
+    with open("/proc/meminfo", encoding="ascii") as meminfo:
+        for line in meminfo:
+            if line.startswith("MemAvailable:"):
+                _, available_kb, _ = line.split()
+                return int(available_kb) * 1024
+    raise ValueError("Missing MemAvailable in /proc/meminfo")
+
+
+def _resolve_open_config(
+    buffer_size: Optional[int],
+    chunk_size: Optional[int],
+    concurrency: Optional[int],
+    io_depth: Optional[int],
+    max_free_mem_usage: Optional[float],
+    backend: BackendCandidates,
+) -> _OpenConfig:
+    return _OpenConfig(
+        buffer_size=buffer_size if buffer_size is not None else env_buffer_size(),
+        chunk_size=chunk_size if chunk_size is not None else env_chunk_size(),
+        concurrency=concurrency if concurrency is not None else env_concurrency(),
+        io_depth=io_depth if io_depth is not None else env_io_depth(),
+        max_free_mem_usage=(
+            max_free_mem_usage
+            if max_free_mem_usage is not None
+            else env_max_free_mem_usage()
+        ),
+        backend=backend if backend is not None else env_backend(),
+    )
+
+# runai reference: https://github.com/run-ai/runai-model-streamer/blob/0.15.6/py/runai_model_streamer/runai_model_streamer/safetensors_streamer/safetensors_pytorch.py
+# safetensors reference: https://github.com/safetensors/safetensors/blob/main/bindings/python/py_src/safetensors/torch.py
+
+def get_safetensors_dtype_map() -> dict:
+    safetensors_to_torch_dtype = {
+        "F64": torch.float64,
+        "F32": torch.float32,
+        "F16": torch.float16,
+        "BF16": torch.bfloat16,
+        "I64": torch.int64,
+        "I32": torch.int32,
+        "I16": torch.int16,
+        "I8":  torch.int8,
+        "U8":  torch.uint8,
+        "BOOL": torch.bool,
+        "C64": torch.complex64,
+    }
+
+    # Add unsigned types if available (PyTorch >= 2.3.0)
+    for st_name, torch_name in [("U64", "uint64"), ("U32", "uint32"), ("U16", "uint16")]:
+        if hasattr(torch, torch_name):
+            safetensors_to_torch_dtype[st_name] = getattr(torch, torch_name)
+
+    # Experimental types with their PyTorch attribute names
+    # Note: If a type is listed here but not available in the current PyTorch version,
+    # it won't be added to the type map. If a file contains such a dtype (e.g., "F4"),
+    # get_torch_dtype() will raise a clear ValueError: "Unsupported dtype 'F4'".
+    # This is correct forward-compatible behavior - fail fast with a clear error message.
+    _EXPERIMENTAL_ALIASES = {
+        "F8_E4M3": ["float8_e4m3fn"],
+        "F8_E4M3FNUZ": ["float8_e4m3fnuz"],
+        "F8_E5M2": ["float8_e5m2"],
+        "F8_E5M2FNUZ": ["float8_e5m2fnuz"],
+        "F8_E8M0": ["float8_e8m0fnu", "float8_e8m0fnuz"],
+        "F4":      ["float4_e2m1fn_x2"],  # Not yet in PyTorch (as of 2.5.1)
+        # FP6 is not supported by PyTorch yet
+    }
+
+    for st_type, torch_aliases in _EXPERIMENTAL_ALIASES.items():
+        for alias in torch_aliases:
+            if hasattr(torch, alias):
+                safetensors_to_torch_dtype[st_type] = getattr(torch, alias)
+                break
+
+    return safetensors_to_torch_dtype
+
+safetensors_to_torch_dtype = get_safetensors_dtype_map()
+
+
+
+def read_safetensors_metadata(filename: str) -> tuple:
+    """Read the safetensors metadata from a file.
+    
+    This function reads the header metadata from a safetensors file, which
+    contains information about the tensors stored in the file.
+    
+    Args:
+        filename: Path to the safetensors file to read.
+    
+    Returns:
+        A tuple containing:
+            - file_metadata (``dict`` or ``None``): File-level metadata if present
+            - tensor_metadata (``dict``): Dictionary mapping tensor names to their
+              metadata (shape, dtype, offsets, etc.)
+            - header_size (``int``): Size of the metadata header in bytes (including the 8 bytes of metadata size)
+    
+    Raises:
+        FileNotFoundError: If the specified file does not exist.
+        ValueError: If the file format is invalid.
+    
+    Example:
+        >>> file_meta, tensor_meta, header_size = read_safetensors_metadata("model.safetensors")
+        >>> print(f"Found {len(tensor_meta)} tensors")
+        >>> print(f"Header size: {header_size} bytes")
+    """
+    with open(filename, "rb") as f:
+        file_size = os.fstat(f.fileno()).st_size
+        if file_size < 8:
+            raise ValueError(
+                f"Invalid safetensors file {filename!r}: file size {file_size} B "
+                "is smaller than the 8-byte metadata length field"
+            )
+
+        metadata_size_bytes = f.read(8)
+        metadata_size = int.from_bytes(metadata_size_bytes, "little")
+        header_size = 8 + metadata_size
+        if file_size < header_size:
+            raise ValueError(
+                f"Invalid safetensors file {filename!r}: file size {file_size} B "
+                f"is smaller than the metadata header size {header_size} B"
+            )
+
+        metadata_str = f.read(metadata_size).decode("utf-8")
+        tensor_metadata = json.loads(metadata_str)
+        file_metadata = tensor_metadata.pop("__metadata__", None)
+
+        if not tensor_metadata:
+            raise ValueError(
+                f"Invalid safetensors file {filename!r}: no tensor metadata found"
+            )
+
+        last_tensor_name, last_tensor = next(reversed(tensor_metadata.items()))
+        data_offsets = last_tensor.get("data_offsets")
+        if (
+            not isinstance(data_offsets, list)
+            or len(data_offsets) != 2
+            or not all(isinstance(offset, int) and offset >= 0 for offset in data_offsets)
+            or data_offsets[1] < data_offsets[0]
+        ):
+            raise ValueError(
+                f"Invalid safetensors file {filename!r}: invalid data_offsets for "
+                f"tensor {last_tensor_name!r}"
+            )
+
+        payload_end = header_size + data_offsets[1]
+        if file_size < payload_end:
+            raise ValueError(
+                f"Invalid safetensors file {filename!r}: file size {file_size} B "
+                f"is smaller than the last tensor payload end {payload_end} B"
+            )
+
+        return file_metadata, tensor_metadata, header_size
+
+def file_in_memory(filename: str) -> bool:
+    """Check if a file is located in an in-memory filesystem.
+    
+    This helper function determines whether a file is stored in a tmpfs or
+    ramfs filesystem, which affects the I/O strategy used by InstantTensor.
+    
+    Args:
+        filename: Path to the file to check.
+    
+    Returns:
+        ``True`` if the file is in an in-memory filesystem (tmpfs/ramfs),
+        ``False`` otherwise.
+    
+    Example:
+        >>> if file_in_memory("model.safetensors"):
+        ...     print("File is in memory, using optimized path")
+        ... else:
+        ...     print("File is on disk, using standard I/O")
+    """
+    return _C.file_in_memory(filename)
+
+def get_tensor_size(shape: list[int], dtype: torch.dtype) -> int:
+    ret = torch.tensor([], dtype=dtype).element_size()
+    for s in shape:
+        ret *= s
+    return ret
+
+
+def required_buffer_size_for_io(
+    chunk_size: int, io_depth: int, world_size: int,
+) -> int:
+    return _C.required_buffer_size_for_io(
+        chunk_size, io_depth, world_size,
+    )
+
+
+def recommended_buffer_size_for_tensors(tensor_sizes: list[int], overlap_factor: float = 0.9) -> int:
+    """
+    Compute the recommended buffer size for the given tensor sizes.
+
+    Args:
+        tensor_sizes: The sizes of the tensors.
+        overlap_factor: How much tensor loading (in size) can be overlapped 
+            with user processing if the user processes tensor at the same speed
+            as we load.
+    
+    Returns:
+        The recommended buffer size.
+    """
+    if len(tensor_sizes) == 0:
+        return 4096
+    
+    max_tensor_size = max(tensor_sizes)
+    overlapped_size_of_buffer_size = defaultdict(int)
+    overlapped_size_of_buffer_size[tensor_sizes[0]] = tensor_sizes[0]
+
+    for i in range(len(tensor_sizes)-1):
+        tensor_size = tensor_sizes[i+1]
+        expected_buffer_size = tensor_sizes[i] + 2 * tensor_sizes[i+1]
+        overlapped_size_of_buffer_size[expected_buffer_size] += tensor_size
+    
+    buffer_sizes = sorted(overlapped_size_of_buffer_size.keys())
+    total_tensor_size = sum(overlapped_size_of_buffer_size.values())
+    total_overlapped_size = 0
+    for buffer_size in buffer_sizes:
+        total_overlapped_size += overlapped_size_of_buffer_size[buffer_size]
+        if total_overlapped_size >= total_tensor_size * overlap_factor:
+            return max(buffer_size, max_tensor_size)
+    
+    raise RuntimeError("Failed to determine a recommended buffer size")
+
+
+
+group_communicator_cache = {}
+
+class safe_open:
+    """Context manager for lazily loading safetensors files with high performance.
+    
+    This class provides an ultra-fast, distributed safetensors loader that
+    maximizes I/O throughput when moving model weights from safetensors files
+    to GPU memory. It supports multiple I/O backends including GPUDirect
+    Storage, legacy storage, and memory-based storage.
+    
+    Args:
+        filename: The filename(s) to open. Can be a single file path (``str``) or
+            a list of file paths (``list[str]``) for multi-file loading. When
+            multiple files are provided, they are automatically sorted. Providing
+            all files in a single list has better performance than calling 
+            ``safe_open`` multiple times.
+        framework: The framework you want tensors in. Currently only ``"pt"``
+            (PyTorch) is supported.
+        device: The device on which you want the tensors. Must be a CUDA device.
+            Can be specified as an ``int`` (device ID), ``str`` (e.g., ``"cuda:0"``), or
+            ``torch.device`` object.
+        process_group: Process group from ``torch.distributed`` for distributed
+            loading, or ``None`` for single-process usage. When provided, InstantTensor
+            uses NCCL to coordinate loading across processes for higher throughput.
+        buffer_size: The size of the GPU buffer used for tensors in bytes.
+            If ``None`` (default), uses ``INSTANTTENSOR_BUFFER_SIZE`` when set;
+            otherwise automatically determined based on tensor sizes and I/O
+            settings for optimal performance. Larger values improve throughput
+            but use more GPU memory. When set without ``io_depth``, the default
+            I/O depth is reduced as needed to fit this buffer. If both values
+            are set, the buffer must be large enough for the requested depth.
+        chunk_size: The size of each file I/O operation in bytes. If ``None``
+            (default), uses ``INSTANTTENSOR_CHUNK_SIZE`` when set; otherwise
+            automatically determined based on storage type. Increasing this
+            value can improve throughput, but values that are too large may
+            conversely reduce throughput.
+        concurrency: The number of worker threads used by the synchronous
+            ``MMAP`` and ``CUFILE`` backends. Other backends ignore it. It does
+            not affect the I/O layout. If ``None`` (default), uses
+            ``INSTANTTENSOR_CONCURRENCY`` when set; otherwise automatically
+            determined for the selected backend.
+        io_depth: The maximum number of rank-local I/O operations in flight. If ``None`` (default),
+            uses ``INSTANTTENSOR_IO_DEPTH`` when set; otherwise automatically
+            determined based on storage type and system capabilities.
+        max_free_mem_usage: Maximum fraction of available memory allowed for the
+            logical GPU buffer. If ``None`` (default), uses
+            ``INSTANTTENSOR_MAX_FREE_MEM_USAGE`` when set; otherwise defaults
+            to 0.5. The internal allocation also includes a small alignment
+            guard.
+        load_now: Whether to load tensors immediately. If ``True`` (default), starts
+            loading immediately. If ``False``, only reads file metadata initially;
+            tensors will be loaded when the context manager is entered. Useful
+            for testing and debugging.
+        copy: If ``True`` (default), yielded tensors are clones that own their
+            memory and outlive the context. If ``False``, they are zero-copy
+            views into an internal ring buffer reused during iteration and
+            freed on ``__exit__`` — consume each tensor before the next yield
+            and do not store references past the ``with`` block.
+        backend: I/O backend candidate(s) to use. This can be a single
+            ``Backend``/``BackendPolicy`` value or a list of them. Supported
+            backends are ``Backend.AIO``, ``Backend.AIO_BUFFERED``,
+            ``Backend.URING``, ``Backend.URING_BUFFERED``, ``Backend.CUFILE``,
+            and ``Backend.MMAP``. Supported policies are
+            ``BackendPolicy.BUFFERED``, which expands to
+            ``[Backend.URING_BUFFERED, Backend.AIO_BUFFERED, Backend.MMAP]``.
+            If ``None`` (default), uses ``INSTANTTENSOR_BACKEND`` when set; the
+            environment variable accepts comma-separated backend/policy names
+            such as ``URING,AIO`` or ``BUFFERED``. Otherwise tries
+            ``[Backend.URING, Backend.AIO]`` for disk files and ``[Backend.MMAP]``
+            for tmpfs/ramfs files. InstantTensor uses the first candidate that
+            is supported by the filesystem and available on the current system.
+
+    Returns:
+        A context manager that yields a file-like object with tensor access
+        methods.
+
+    Example:
+        Basic single-file usage:
+
+        >>> from instanttensor import safe_open
+        >>> tensors = {}
+        >>> with safe_open("model.safetensors", framework="pt", device=0) as f:
+        ...     for name, tensor in f.tensors():
+        ...         tensors[name] = tensor
+
+        Multi-file loading (recommended for better performance):
+
+        >>> files = ["model-00001-of-00002.safetensors",
+        ...          "model-00002-of-00002.safetensors"]
+        >>> with safe_open(files, framework="pt", device=0) as f:
+        ...     for name, tensor in f.tensors():
+        ...         tensors[name] = tensor
+
+        Zero-copy mode (consume each tensor inline):
+
+        >>> with safe_open("model.safetensors", framework="pt", device=0,
+        ...                copy=False) as f:
+        ...     for name, tensor in f.tensors():
+        ...         model_param[name].copy_(tensor)
+
+        Distributed loading:
+
+        >>> import torch
+        >>> import torch.distributed as dist
+        >>> dist.init_process_group(backend="nccl")
+        >>> process_group = dist.GroupMember.WORLD
+        >>> with safe_open(files, framework="pt",
+        ...                device=torch.cuda.current_device(),
+        ...                process_group=process_group) as f:
+        ...     for name, tensor in f.tensors():
+        ...         tensors[name] = tensor
+    """
+    def __init__(self, filename: Union[str, list[str]], framework: str,
+            device: Union[int, str, torch.device], process_group=None, *,
+            buffer_size: Optional[int]=None, chunk_size: Optional[int]=None, concurrency: Optional[int]=None, io_depth: Optional[int]=None,
+            max_free_mem_usage: Optional[float]=None, load_now: bool = True, copy: bool = True, backend: BackendCandidates = None):
+        """Initialize the safe_open context manager.
+        
+        See class docstring for detailed parameter descriptions.
+        """ 
+        self.init_time = time.perf_counter()
+
+        if isinstance(filename, str):
+            filename = [filename]
+
+        filename.sort()
+
+        device = torch.device(device)
+        if device.type != "cuda":
+            raise ValueError("InstantTensor only supports CUDA devices for now")
+        if framework != "pt":
+            raise ValueError("InstantTensor only supports pytorch for now")
+
+        self.world_size = 1 if process_group is None else dist.get_world_size(process_group)
+        self.rank = 0 if process_group is None else dist.get_rank(process_group)
+
+        self.filename = filename
+        self.framework = framework
+        self.device = device
+        self.device_idx = device.index
+        self.process_group = process_group
+        self.loader_handle = None
+        self.distributed_metadata_read = False
+
+        self.ordered_tensor_metadatas = []
+        self.tensor_offsets = []
+        self.iterated = False
+        self.tmp_generator = None
+        self.copy = copy
+        self._invalidated = False
+
+        config = _resolve_open_config(
+            buffer_size, chunk_size, concurrency, io_depth,
+            max_free_mem_usage, backend,
+        )
+        self._determine_io_params(config)
+
+        self.meta_read_time = time.perf_counter()
+
+        meta_read_results = self._read_metadata()
+
+        self.file_metadata = None
+        for f_idx, f in enumerate(self.filename):
+            file_metadata, tensor_metadata, tensor_offset = meta_read_results[f_idx]
+            if file_metadata is not None:
+                self.file_metadata = file_metadata
+            if file_metadata is not None and file_metadata.get("format", "pt") != "pt":
+                raise ValueError("InstantTensor only supports pytorch format for now")
+            # A typical entry: "model.layers.20.post_attention_layernorm.weight":{"dtype":"BF16","shape":[2880],"data_offsets":[0,5760]}
+            ordered_tensor_metadatas = sorted(tensor_metadata.items(), key=lambda kv: kv[1]["data_offsets"][0])
+            if not all(ordered_tensor_metadatas[i][1]["data_offsets"][1] == ordered_tensor_metadatas[i+1][1]["data_offsets"][0] for i in range(len(ordered_tensor_metadatas) - 1)):
+                raise ValueError("Safetensors data offsets must be contiguous")
+            
+            self.tensor_offsets.extend([(f_idx, v["data_offsets"][0] + tensor_offset) for k, v in ordered_tensor_metadatas] + [(f_idx, ordered_tensor_metadatas[-1][1]["data_offsets"][1] + tensor_offset)])
+            self.ordered_tensor_metadatas.extend(ordered_tensor_metadatas)
+        
+
+        self.tensor_name_to_index = {k: i for i, (k, v) in enumerate(self.ordered_tensor_metadatas)}
+
+        # adjust buffer size    
+        self.tensor_sizes = [v["data_offsets"][1] - v["data_offsets"][0] for k, v in self.ordered_tensor_metadatas]
+        self.total_tensor_size = sum(self.tensor_sizes)
+
+        self._finalize_buffer_size(config.buffer_size)
+
+        if not self.copy and self.buffer_size < self.total_tensor_size:
+            warnings.warn(
+                f"copy=False with buffer_size ({self.buffer_size} B) < "
+                f"total_tensor_size ({self.total_tensor_size} B): earlier "
+                f"tensors may be overwritten during iteration. This warning "
+                f"can be ignored if tensors are consumed inline; otherwise, "
+                f"use copy=True.",
+                stacklevel=2,
+            )
+
+        if load_now:
+            self._open()
+
+    def _determine_io_params(self, config: _OpenConfig):
+        buffer_size = config.buffer_size
+        chunk_size = config.chunk_size
+        concurrency = config.concurrency
+        io_depth = config.io_depth
+        max_free_mem_usage = config.max_free_mem_usage
+        backend = config.backend
+        io_depth_is_explicit = io_depth is not None
+        backend_candidates = parse_backend_candidates(backend)
+
+        in_memory = len(self.filename) > 0 and file_in_memory(self.filename[0])
+        for filename in self.filename[1:]:
+            if file_in_memory(filename) != in_memory:
+                raise ValueError(f"All files must be in the same filesystem. {self.filename[0]} is in memory, but {filename} is not.")
+
+        if backend_candidates is None:
+            backend_candidates = default_in_memory_backend if in_memory else default_backend
+        elif in_memory:
+            backend_candidates = [
+                candidate for candidate in backend_candidates
+                if candidate in available_in_memory_backends
+            ]
+        backend = select_backend(backend_candidates)
+
+        if concurrency is not None:
+            if concurrency < 0:
+                raise ValueError("concurrency must not be negative")
+            if backend in (Backend.MMAP, Backend.CUFILE):
+                if concurrency == 0:
+                    raise ValueError(
+                        f"concurrency must be greater than zero for backend {backend.name}"
+                    )
+            elif concurrency > 0:
+                warnings.warn(
+                    f"Backend {backend.name} does not support concurrency; overriding "
+                    f"concurrency={concurrency} to 0.",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+                concurrency = 0
+
+        default_concurrency = max(min(32, cpu_count()) // self.world_size - 4, 1)
+        if backend == Backend.MMAP:
+            if chunk_size is None:
+                chunk_size = 2 * 1024 * 1024
+            if concurrency is None:
+                concurrency = default_concurrency
+            if io_depth is None:
+                io_depth = 3 * concurrency
+        elif backend in (Backend.URING_BUFFERED, Backend.AIO_BUFFERED):
+            if chunk_size is None:
+                chunk_size = 8 * 1024 * 1024
+            if concurrency is None:
+                concurrency = 0
+            if io_depth is None:
+                io_depth = default_concurrency
+        elif backend in (Backend.URING, Backend.AIO):
+            if chunk_size is None:
+                chunk_size = 8 * 1024 * 1024
+            if concurrency is None:
+                concurrency = 0
+            if io_depth is None:
+                io_depth = max(512 // self.world_size, 3)
+        elif backend == Backend.CUFILE:
+            if chunk_size is None:
+                chunk_size = 8 * 1024 * 1024
+            if concurrency is None:
+                concurrency = max(32 // self.world_size, 1)
+            if io_depth is None:
+                io_depth = 2 * concurrency
+
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be greater than zero")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        aligned_chunk_size = ((chunk_size + page_size - 1) // page_size) * page_size
+        if aligned_chunk_size > MAX_CHUNK_SIZE:
+            raise ValueError(
+                f"chunk_size must be no greater than {MAX_CHUNK_SIZE} B after page alignment"
+            )
+        if io_depth <= 0:
+            raise ValueError("io_depth must be greater than zero")
+        if io_depth > MAX_IO_DEPTH:
+            raise ValueError(f"io_depth must not exceed {MAX_IO_DEPTH}")
+
+        if buffer_size is not None:
+            if buffer_size <= 0:
+                raise ValueError("buffer_size must be greater than zero")
+
+            buffer_size_per_io_depth = required_buffer_size_for_io(
+                chunk_size, 1, self.world_size,
+            )
+            max_io_depth_for_buffer = buffer_size // buffer_size_per_io_depth
+            required_buffer_size = buffer_size_per_io_depth * io_depth
+
+            if io_depth_is_explicit and required_buffer_size > buffer_size:
+                raise ValueError(
+                    f"buffer_size ({buffer_size} B) is too small for io_depth={io_depth}; "
+                    f"at least {required_buffer_size} B is required for "
+                    f"chunk_size={chunk_size} and world_size={self.world_size}"
+                )
+
+            if not io_depth_is_explicit:
+                if max_io_depth_for_buffer < 1:
+                    raise ValueError(
+                        f"buffer_size ({buffer_size} B) is too small for one I/O operation; "
+                        f"at least {buffer_size_per_io_depth} B is required for "
+                        f"chunk_size={chunk_size} and world_size={self.world_size}"
+                    )
+                if io_depth > max_io_depth_for_buffer:
+                    warnings.warn(
+                        f"Shrink io_depth from {io_depth} to {max_io_depth_for_buffer} "
+                        f"to fit buffer_size={buffer_size}.",
+                        RuntimeWarning,
+                        stacklevel=3,
+                    )
+                    io_depth = max_io_depth_for_buffer
+        
+        if max_free_mem_usage is None:
+            max_free_mem_usage = 0.5
+        
+        budget_error = None
+        try:
+            if not math.isfinite(max_free_mem_usage) or not 0 < max_free_mem_usage <= 1:
+                raise ValueError("max_free_mem_usage must be finite and satisfy 0 < value <= 1")
+            # Managed-memory support alone does not imply shared physical memory.
+            if sys.platform == "linux" and torch.cuda.get_device_properties(self.device).is_integrated:
+                avail_bytes = _host_available_bytes()
+                debug_log("MemAvailable: %d bytes", avail_bytes)
+            else:
+                avail_bytes = torch.cuda.mem_get_info(self.device)[0]
+                debug_log("CUDA free memory: %d bytes", avail_bytes)
+            avail_bytes = int(avail_bytes * max_free_mem_usage)
+        except (OSError, ValueError, AttributeError) as error:
+            # Participate in the existing MIN collective before rejecting, so
+            # invalid budget input on one rank cannot strand another rank there.
+            budget_error = error
+            avail_bytes = 0
+        debug_log("Local memory budget: %d bytes (fraction=%s)", avail_bytes, max_free_mem_usage)
+
+        self.sync_time = time.perf_counter()
+        if self.process_group is not None:
+            # Warm up nccl to ensure ncclComm_t is initialized
+            # Even set async_op=True, the first call may still block to initialize ncclComm_t
+            # Most of the time is spent on NCCL initialization rather than on the all_reduce itself.
+            avail_bytes_tensor = torch.tensor([avail_bytes], device=self.device)
+            dist.all_reduce(avail_bytes_tensor, op=torch.distributed.ReduceOp.MIN, group=self.process_group) 
+            avail_bytes = avail_bytes_tensor.item()
+            # print("ncclComm_t:", self.process_group._get_backend(self.device)._comm_ptr())
+
+        self._device_memory_budget = avail_bytes
+        debug_log("Device memory budget: %d bytes", avail_bytes)
+        if budget_error is not None:
+            raise RuntimeError("Cannot select memory budget: " + str(budget_error)) from budget_error
+        buffer_size_per_io_depth = required_buffer_size_for_io(
+            chunk_size, 1, self.world_size,
+        )
+        max_io_depth_for_memory = avail_bytes // buffer_size_per_io_depth
+        if max_io_depth_for_memory < 1:
+            raise RuntimeError(
+                f"Device memory budget ({avail_bytes} B) is too small for one "
+                f"I/O operation; at least {buffer_size_per_io_depth} B is required"
+            )
+        if io_depth > max_io_depth_for_memory:
+            warnings.warn(
+                f"Shrink io_depth from {io_depth} to {max_io_depth_for_memory} "
+                f"due to memory limit.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            io_depth = max_io_depth_for_memory
+
+        self.chunk_size = chunk_size
+        self.concurrency = concurrency
+        self.io_depth = io_depth
+        self.backend = backend
+
+    def _finalize_buffer_size(self, buffer_size):
+        if buffer_size is None:
+            # make sure any two contiguous tensors will not be overlapped with each other in the buffer
+            buffer_size_for_tensors = recommended_buffer_size_for_tensors(self.tensor_sizes)
+            buffer_size_for_io = required_buffer_size_for_io(
+                self.chunk_size, self.io_depth, self.world_size,
+            )
+            self.buffer_size = max(buffer_size_for_tensors, buffer_size_for_io)
+        else:
+            self.buffer_size = buffer_size
+            min_buffer_size = max(self.tensor_sizes)
+            if self.buffer_size < min_buffer_size:
+                warnings.warn(
+                    f"Enlarge buffer size from {self.buffer_size} to {min_buffer_size} to match the largest tensor size.",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+                self.buffer_size = min_buffer_size
+
+            max_buffer_size = max(
+                self.total_tensor_size,
+                required_buffer_size_for_io(
+                    self.chunk_size, self.io_depth, self.world_size,
+                ),
+            )
+            if self.buffer_size > max_buffer_size:
+                warnings.warn(
+                    f"Shrink buffer size from {self.buffer_size} to {max_buffer_size} to avoid memory waste.",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+                self.buffer_size = max_buffer_size
+
+        if self.buffer_size > self._device_memory_budget:
+            raise RuntimeError(
+                f"buffer_size ({self.buffer_size} B) exceeds device memory "
+                f"budget ({self._device_memory_budget} B)"
+            )
+
+    def _read_metadata(self):
+        meta_read_threads = []
+        meta_read_results = [None] * len(self.filename)
+
+        if self.distributed_metadata_read: # slower due to all_gather
+            debug_log("world_size = %d, rank = %d", self.world_size, self.rank)
+            meta_read_start = len(self.filename) // self.world_size * self.rank + min(self.rank, len(self.filename) % self.world_size)
+            meta_read_cnt = len(self.filename) // self.world_size + int(self.rank < len(self.filename) % self.world_size)
+            meta_read_end = meta_read_start + meta_read_cnt
+            debug_log("meta_read = %d-%d", meta_read_start, meta_read_end)
+        else:
+            meta_read_start = 0 
+            meta_read_end = len(self.filename)
+        
+        for f_idx, f in list(enumerate(self.filename))[meta_read_start:meta_read_end]:
+            def read_safetensors_metadata_wrapper(f, result_idx):
+                meta_read_results[result_idx] = read_safetensors_metadata(f)
+            
+            t = threading.Thread(target=read_safetensors_metadata_wrapper, args=(f, f_idx))
+            t.start()
+            meta_read_threads.append(t)
+
+        for t in meta_read_threads:
+            t.join()
+
+        
+        if self.distributed_metadata_read and self.world_size > 1:
+            tmp = [None for _ in range(self.world_size)]
+            # import pickle
+            # print(len(pickle.dumps(meta_read_results[meta_read_start:meta_read_end])))
+            t0 = time.perf_counter()
+            dist.all_gather_object(tmp, meta_read_results[meta_read_start:meta_read_end], self.process_group)
+            t1 = time.perf_counter()
+            meta_read_results = [item for sublist in tmp for item in sublist]
+            debug_log("Time: all_gather = %.2fs", t1 - t0)
+
+        return meta_read_results
+
+    def _open(self):
+        self.open_time = time.perf_counter()
+        nccl_communicator = self.process_group._get_backend(self.device)._comm_ptr() if self.process_group is not None else 0
+        self.loader_handle = _C.open(
+            self.filename, self.device_idx, nccl_communicator, self.buffer_size, 
+            self.chunk_size, self.concurrency, self.io_depth, self.backend.value, self.tensor_offsets)
+
+    def __enter__(self) -> 'safe_open':
+        if self.loader_handle is None:
+            self._open()
+        self.enter_time = time.perf_counter()
+        return self
+
+    def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
+        if self._invalidated:
+            return
+        error = _exc_value if not isinstance(_exc_value, GeneratorExit) else None
+        try:
+            stream = torch.cuda.current_stream()
+            stream.synchronize()
+        except BaseException as sync_error:
+            if error is None:
+                error = sync_error
+            else:
+                error.add_note(f"InstantTensor synchronization failed: {sync_error!r}")
+        self.exit_time = time.perf_counter()
+        self._invalidated = True
+        try:
+            _C.close(self.loader_handle)
+        except BaseException as close_error:
+            if error is None:
+                error = close_error
+            else:
+                error.add_note(f"InstantTensor native cleanup failed: {close_error!r}")
+        finally:
+            self.loader_handle = None
+            self.close_time = time.perf_counter()
+        if error is not None:
+            if error is not _exc_value:
+                raise error
+            return
+        total_time = self.close_time - self.init_time
+        init_time = self.sync_time - self.init_time
+        sync_time = self.meta_read_time - self.sync_time
+        meta_read_time = self.open_time - self.meta_read_time
+        open_time = self.enter_time - self.open_time
+        load_time = self.exit_time - self.enter_time
+        close_time = self.close_time - self.exit_time
+        if env_debug():
+            debug_log(
+                "Time: total=%.2fs, init=%.2fs, sync=%.2fs, meta_read=%.2fs, open=%.2fs, load=%.2fs, close=%.2fs",
+                total_time,
+                init_time,
+                sync_time,
+                meta_read_time,
+                open_time,
+                load_time,
+                close_time,
+            )
+            debug_log(
+                "Throughput: total=%.2fGB/s, load=%.2fGB/s",
+                self.total_tensor_size * 1e-9 / total_time,
+                self.total_tensor_size * 1e-9 / load_time,
+            )
+
+    def tensors(self) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Iterate over all tensors in the safetensors file(s).
+
+        Yields ``(name, tensor)`` pairs. With ``copy=True`` (default) tensors
+        own their memory; with ``copy=False`` they are zero-copy views into
+        the ring buffer (see ``safe_open``).
+
+        Note:
+            Synchronizes the current CUDA stream to ensure data transfer
+            completion.
+        """
+        if self._invalidated:
+            raise RuntimeError("tensors() called after safe_open context exited")
+        if self.iterated:
+            raise RuntimeError("tensors() can only be called once")
+        self.iterated = True
+        for tensor_index, (name, metadata) in enumerate(self.ordered_tensor_metadatas):
+            stream = torch.cuda.current_stream()
+            stream.synchronize()
+            shape = metadata["shape"]
+            safetensors_dtype = metadata["dtype"]
+            torch_dtype = safetensors_to_torch_dtype.get(safetensors_dtype, None)
+            if torch_dtype is None:
+                raise ValueError(f"Unsupported safetensors dtype: {safetensors_dtype}")
+
+            tensor_size = get_tensor_size(shape, torch_dtype)
+            dl_tensor = _C.get_dl_tensor(self.loader_handle, tensor_index, tensor_size) # always returns int8 tensor
+            tensor_int8 = torch.from_dlpack(dl_tensor)
+
+            required_alignment = torch.empty((), dtype=torch_dtype).element_size()
+            is_aligned = tensor_int8.data_ptr() % required_alignment == 0
+            if self.copy or not is_aligned:
+                if not self.copy:
+                    warnings.warn(
+                        f"Tensor {name} address {tensor_int8.data_ptr():#x} is not aligned "
+                        f"to dtype {torch_dtype} size {required_alignment}B; falling back "
+                        "to copy=True for this tensor",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                tensor_int8 = tensor_int8.clone()
+                # PyTorch's CUDA allocator is expected to return 512-byte-aligned
+                # storage. This is an implementation detail; 512 is divisible by
+                # every supported element size, and the check below remains authoritative.
+            
+            tensor = tensor_int8.view(torch_dtype).view(torch.Size(shape))
+
+            if tensor.data_ptr() % tensor.element_size() != 0:
+                raise ValueError(f"Tensor {name} address {tensor.data_ptr():#x} is not aligned to dtype {torch_dtype} size {tensor.element_size()}B")
+            yield name, tensor
+
+    def keys(self) -> list[str]:
+        """Safetensors-compatible API: get the names of all tensors in the safetensors file(s).
+        
+        This is an alias for ``offset_keys()`` that returns tensor names in the
+        order they appear in the file (by offset).
+        
+        Returns:
+            A list of tensor names (keys) in the order they appear in the file.
+        
+        Example:
+            >>> with safe_open("model.safetensors", framework="pt", device=0) as f:
+            ...     tensor_names = f.keys()
+            ...     print(f"Found {len(tensor_names)} tensors")
+            ...     for name in tensor_names:
+            ...         tensor = f.get_tensor(name)
+        """
+        return self.offset_keys()
+
+    def metadata(self) -> dict:
+        """Safetensors-compatible API: get the file-level metadata from the safetensors file(s).
+        
+        This method returns the special non-tensor information stored in the
+        safetensors file header (under the ``"__metadata__"`` key).
+        
+        Returns:
+            A dictionary containing file-level metadata, or ``None`` if no
+            metadata is present in the file.
+        
+        Example:
+            >>> with safe_open("model.safetensors", framework="pt", device=0) as f:
+            ...     meta = f.metadata()
+            ...     if meta:
+            ...         print(f"File format: {meta.get('format', 'pt')}")
+        """
+        return dict(self.file_metadata)
+
+    def offset_keys(self) -> list[str]:
+        """Safetensors-compatible API: get the names of all tensors, ordered by their offset in the file.
+        
+        This method returns tensor names in the order they appear in the
+        safetensors file(s), sorted by their data offset. This is the order
+        in which tensors should be retrieved using ``get_tensor()`` for optimal
+        performance.
+        
+        Returns:
+            A list of tensor names (keys) ordered by their data offset in
+            the file(s).
+        
+        Example:
+            >>> with safe_open("model.safetensors", framework="pt", device=0) as f:
+            ...     # Get keys in offset order
+            ...     keys = f.offset_keys()
+            ...     for key in keys:
+            ...         tensor = f.get_tensor(key)  # Must be in this order
+        """
+        return [key for key, _ in self.ordered_tensor_metadatas]
+
+    def get_tensor_metadata(self, name: str) -> tuple[torch.dtype, torch.Size]:
+        """Get the metadata (dtype and shape) of a specific tensor by name from the safetensors file(s).
+        
+        This method provides compatibility with the safetensors library API.
+        It retrieves the metadata of a single tensor by its name.
+        
+        Args:
+            name: The name/key of the tensor to retrieve metadata for.
+        
+        Returns:
+            A tuple containing the dtype and shape of the tensor.
+
+        Example:
+            >>> with safe_open("model.safetensors", framework="pt", device=0) as f:
+            ...     tensor_names = f.keys()
+            ...     for name in tensor_names:
+            ...         dtype, shape = f.get_tensor_metadata(name)
+            ...         print(f"Tensor {name} has dtype {dtype} and shape {shape}")
+        """
+        tensor_metadata = self.ordered_tensor_metadatas[self.tensor_name_to_index[name]][1]
+        torch_dtype = safetensors_to_torch_dtype.get(tensor_metadata["dtype"], None)
+        if torch_dtype is None:
+            raise ValueError(f"Unsupported safetensors dtype: {tensor_metadata['dtype']}")
+        return torch_dtype, torch.Size(tensor_metadata["shape"])

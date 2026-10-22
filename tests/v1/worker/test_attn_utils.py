@@ -8,12 +8,19 @@ never addressed by the logical view.
 """
 
 from types import SimpleNamespace
+from typing import Any
 
+import numpy as np
 import pytest
 import torch
 
 import vllm.v1.hisparse.binding as attn_utils_module
-from tests.v1.attention.utils import dense_kv_cache_views
+from tests.v1.attention.utils import (
+    BatchSpec,
+    create_common_attn_metadata,
+    dense_kv_cache_views,
+)
+from vllm.config.compilation import CompilationConfig, CUDAGraphMode
 from vllm.v1.attention.backend import AttentionBackend, AttentionCGSupport, MultipleOf
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.hisparse.binding import allocate_hisparse_kv_caches
@@ -24,20 +31,23 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheLayout,
     KVCacheTensor,
-    MambaSpec,
     MLAAttentionSpec,
     SparseCacheRole,
     compute_layout_strides,
 )
 from vllm.v1.worker.gpu import attn_utils
 from vllm.v1.worker.gpu.attn_utils import (
+    FastPrefillHelper,
     get_attn_cg_support,
     get_query_lens_mismatch_unsupported_backend,
 )
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.utils import (
     AttentionGroup,
     allocate_kv_cache,
     copy_kv_cache_blocks_inplace,
+    customize_attention_spec,
+    map_kv_caches_to_kernel_blocks,
 )
 
 
@@ -73,14 +83,19 @@ def test_get_kv_cache_spec_resolves_hisparse_block_size(
     layers = {}
     for name, sizes in zip(specs, [main_sizes, indexer_sizes, [block_size]]):
         backend = SimpleNamespace(
+            get_name=lambda name=name: name,
             customize_spec=AttentionBackend.customize_spec,
-            get_supported_kernel_block_sizes=lambda sizes=sizes: sizes,
+            get_supported_kernel_block_sizes=lambda _=None, sizes=sizes: sizes,
         )
         layers[name] = SimpleNamespace(
             get_kv_cache_spec=lambda _, spec=specs[name]: spec,
             get_attn_backend=lambda backend=backend: backend,
+            is_draft_layer=False,
         )
     monkeypatch.setattr(attn_utils, "get_layers_from_vllm_config", lambda *_: layers)
+    monkeypatch.setattr(
+        attn_utils_module, "get_hisparse_kv_cache_groups", lambda *_: []
+    )
     config = SimpleNamespace(
         attention_config=SimpleNamespace(hisparse_config=object() if enabled else None)
     )
@@ -91,16 +106,44 @@ def test_get_kv_cache_spec_resolves_hisparse_block_size(
 
     resolved = attn_utils.get_kv_cache_spec(config)
     assert resolved["main"].block_size == resolved["indexer"].block_size == expected
-    assert resolved["dense"] is specs["dense"]
+    dense_backend = layers["dense"].get_attn_backend()
+    assert resolved["dense"] == customize_attention_spec(dense_backend, specs["dense"])
     assert all(spec.block_size == block_size for spec in specs.values())
 
 
+def test_get_kv_cache_spec_tags_draft_layers(monkeypatch):
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    backend = SimpleNamespace(
+        customize_spec=AttentionBackend.customize_spec,
+        get_supported_kernel_block_sizes=lambda _=None: [16],
+    )
+    layers = {
+        name: SimpleNamespace(
+            get_kv_cache_spec=lambda _: spec,
+            get_attn_backend=lambda: backend,
+            is_draft_layer=name == "draft",
+        )
+        for name in ("target", "draft")
+    }
+    monkeypatch.setattr(attn_utils, "get_layers_from_vllm_config", lambda *_: layers)
+    config = SimpleNamespace(attention_config=SimpleNamespace(hisparse_config=None))
+
+    specs = attn_utils.get_kv_cache_spec(config)
+    assert specs["draft"].is_draft and not specs["target"].is_draft
+
+
 class _FakeMetadataBuilder:
-    def __init__(self, support: AttentionCGSupport):
+    def __init__(self, support: AttentionCGSupport, varlen_bound: int | None = None):
         self.support = support
+        self.varlen_bound = varlen_bound
 
     def get_cudagraph_support(self, *_args):
         return self.support
+
+    def get_varlen_cudagraph_max_query_len(self, *_args):
+        return self.varlen_bound
 
 
 class _TargetBackend:
@@ -126,7 +169,7 @@ def test_attention_checks_preserve_global_and_target_scoped_support():
         _TargetBackend,
         ["target"],
         spec,
-        0,  # type: ignore[arg-type]
+        0,
     )
     target_group.metadata_builders = [
         _FakeMetadataBuilder(AttentionCGSupport.ALWAYS)  # type: ignore[list-item]
@@ -135,7 +178,7 @@ def test_attention_checks_preserve_global_and_target_scoped_support():
         _DraftBackend,
         ["draft"],
         spec,
-        0,  # type: ignore[arg-type]
+        0,
     )
     draft_group.metadata_builders = [
         _FakeMetadataBuilder(AttentionCGSupport.UNIFORM_BATCH)  # type: ignore[list-item]
@@ -143,14 +186,14 @@ def test_attention_checks_preserve_global_and_target_scoped_support():
     groups = [[target_group, draft_group]]
 
     # The runner-wide execution mode must still honor the drafter's limit.
-    unfiltered = get_attn_cg_support(groups, None)  # type: ignore[arg-type]
+    unfiltered = get_attn_cg_support(groups, None)
     assert unfiltered.min_cg_support == AttentionCGSupport.UNIFORM_BATCH
     assert unfiltered.min_cg_attn_backend == "_DraftBackend"
 
     # Adaptive verification validates only the target's varlen graphs.
     target_only = get_attn_cg_support(
         groups,
-        None,  # type: ignore[arg-type]
+        None,
         checked_layer_names={"target"},
     )
     assert target_only.min_cg_support == AttentionCGSupport.ALWAYS
@@ -167,7 +210,7 @@ def test_attention_checks_preserve_global_and_target_scoped_support():
     draft_group.layer_names.append("target")
     target_with_shared_group = get_attn_cg_support(
         groups,
-        None,  # type: ignore[arg-type]
+        None,
         checked_layer_names={"target"},
     )
     assert target_with_shared_group.min_cg_support == AttentionCGSupport.UNIFORM_BATCH
@@ -180,98 +223,81 @@ def test_attention_checks_preserve_global_and_target_scoped_support():
     )
 
 
-def test_build_attn_metadata_reuses_mamba_and_propagates_token_map():
-    """Same-spec Mamba groups reuse metadata and all groups share the token map."""
-
-    class ReusingBuilder:
-        supports_update_block_table = True
-
-        def __init__(self, result):
-            self.result = result
-            self.build_calls = 0
-            self.update_calls = []
-
-        def build(self, *, common_prefix_len, common_attn_metadata, **kwargs):
-            assert common_prefix_len == 0
-            assert not kwargs
-            self.build_calls += 1
-            common_attn_metadata._token_to_req_indices_cache = token_map
-            return self.result
-
-        def update_block_table(self, metadata, block_table, slot_mapping):
-            self.update_calls.append((metadata, block_table, slot_mapping))
-            return self.result
-
-    class ObservingBuilder:
-        supports_update_block_table = False
-
-        def __init__(self):
-            self.seen_token_map = None
-
-        def build(self, *, common_prefix_len, common_attn_metadata, **kwargs):
-            assert common_prefix_len == 0
-            assert not kwargs
-            self.seen_token_map = common_attn_metadata._token_to_req_indices_cache
-            return "observed"
-
-    mamba_spec = MambaSpec(
-        block_size=16,
-        shapes=((16, 64),),
-        dtypes=(torch.float16,),
-        mamba_cache_mode="none",
-    )
-    dense_spec = FullAttentionSpec(
+def test_varlen_cudagraph_unsupported_backend_checks_scoped_bounds():
+    """ALWAYS passes without a bound, other builders need one at least as wide as
+    the requested length, and NEVER fails whatever bound a builder reports."""
+    config: Any = SimpleNamespace()
+    spec = FullAttentionSpec(
         block_size=16,
         num_kv_heads=1,
         head_size=128,
-        dtype=torch.float16,
-    )
-    first_builder = ReusingBuilder("first")
-    second_builder = ReusingBuilder("second")
-    observer = ObservingBuilder()
-
-    def group(name, spec, builder):
-        return SimpleNamespace(
-            layer_names=[name],
-            kv_cache_spec=spec,
-            get_metadata_builder=lambda _index: builder,
-        )
-
-    attn_groups = [
-        [group("mamba.0", mamba_spec, first_builder)],
-        [group("mamba.1", mamba_spec, second_builder)],
-        [group("dense", dense_spec, observer)],
-    ]
-    block_tables = [
-        torch.tensor([[group_index]], dtype=torch.int32) for group_index in range(3)
-    ]
-    slot_mappings = torch.tensor([[10], [11], [12]], dtype=torch.int64)
-    token_map = torch.tensor([0], dtype=torch.int32)
-    kv_cache_config = SimpleNamespace(kv_cache_groups=[object(), object(), object()])
-
-    metadata = attn_utils.build_attn_metadata(
-        attn_groups=attn_groups,  # type: ignore[arg-type]
-        num_reqs=1,
-        num_tokens=1,
-        query_start_loc_gpu=torch.tensor([0, 1], dtype=torch.int32),
-        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
-        max_query_len=1,
-        seq_lens=torch.tensor([1], dtype=torch.int32),
-        max_seq_len=1,
-        block_tables=block_tables,
-        slot_mappings=slot_mappings,
-        kv_cache_config=kv_cache_config,  # type: ignore[arg-type]
+        dtype=torch.bfloat16,
     )
 
-    assert first_builder.build_calls == 1
-    assert second_builder.build_calls == 0
-    assert len(second_builder.update_calls) == 1
-    source, updated_block_table, updated_slot_mapping = second_builder.update_calls[0]
-    assert source == "first"
-    assert updated_block_table is block_tables[1]
-    torch.testing.assert_close(updated_slot_mapping, slot_mappings[1])
-    assert observer.seen_token_map is token_map
-    assert metadata == {"mamba.0": "first", "mamba.1": "second", "dense": "observed"}
+    def group(
+        backend: Any,
+        layer_name: str,
+        support: AttentionCGSupport,
+        bound: int | None = None,
+    ):
+        builder: Any = _FakeMetadataBuilder(support, bound)
+        attn_group = AttentionGroup(backend, [layer_name], spec, 0)
+        attn_group.metadata_builders = [builder]
+        return attn_group
+
+    target = group(_TargetBackend, "target", AttentionCGSupport.ALWAYS)
+    draft = group(_DraftBackend, "draft", AttentionCGSupport.UNIFORM_BATCH, 8)
+    never = group(_DraftBackend, "never", AttentionCGSupport.NEVER, 8)
+
+    unsupported = attn_utils.get_varlen_cudagraph_unsupported_backend
+    assert unsupported([[target, draft]], config, 8) is None
+    assert unsupported([[target, draft]], config, 9) == ("_DraftBackend", 8)
+    assert (
+        unsupported([[target, draft]], config, 9, checked_layer_names={"target"})
+        is None
+    )
+    assert unsupported([[target, never]], config, 1) == ("_DraftBackend", None)
+
+
+@pytest.mark.parametrize("num_speculative_tokens", [0, 7])
+def test_flashinfer_sparse_full_graphs_exclude_prefill_keep_varlen_decode(
+    num_speculative_tokens,
+):
+    """Prefill must fall back without disabling adaptive verification graphs."""
+    from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
+        FlashInferMLASparseTRTLLMBackend,
+    )
+
+    backend = FlashInferMLASparseTRTLLMBackend
+    config: Any = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            num_speculative_tokens=num_speculative_tokens, parallel_drafting=False
+        ),
+        use_v2_model_runner=True,
+    )
+    spec = MLAAttentionSpec(
+        block_size=64, num_kv_heads=1, head_size=576, dtype=torch.bfloat16
+    )
+    group = AttentionGroup(backend, ["target"], spec, 0)
+    group.metadata_builders = [object.__new__(backend.get_builder_cls())]
+    groups = [[group]]
+    support = get_attn_cg_support(groups, config)
+    compilation = CompilationConfig(cudagraph_mode=CUDAGraphMode.FULL)
+    mode = compilation.resolve_cudagraph_mode_and_sizes(
+        support.min_cg_support,
+        support.min_cg_attn_backend,
+        uniform_decode_query_len=1 + num_speculative_tokens,
+        use_v2_model_runner=True,
+    )
+    assert mode.mixed_mode() != CUDAGraphMode.FULL
+    assert mode.decode_mode() == CUDAGraphMode.FULL
+    assert get_query_lens_mismatch_unsupported_backend(groups) is None
+    unsupported = attn_utils.get_varlen_cudagraph_unsupported_backend
+    assert unsupported(groups, config, 1 + num_speculative_tokens) is None
+    assert unsupported(groups, config, 2 + num_speculative_tokens) == (
+        backend.__name__,
+        1 + num_speculative_tokens,
+    )
 
 
 def test_get_kv_sharing_fast_prefill_eligible_layers(monkeypatch: pytest.MonkeyPatch):
@@ -335,6 +361,63 @@ def test_get_kv_sharing_fast_prefill_eligible_layers(monkeypatch: pytest.MonkeyP
     assert attn_utils.get_kv_sharing_fast_prefill_eligible_layers(vllm_config) == set()
 
 
+@pytest.mark.parametrize(
+    "num_tokens", [1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128]
+)
+@pytest.mark.parametrize("num_active_loras", [1, 2, 4])
+def test_fast_prefill_dispatch_preserves_active_lora_count(
+    num_tokens: int, num_active_loras: int
+):
+    """Fast-prefill padding must match the main dispatch's LoRA variant."""
+
+    class FakeCudaGraphManager:
+        device = "cpu"
+
+        def __init__(self):
+            self.dispatch_calls = []
+
+        def dispatch(self, **kwargs):
+            self.dispatch_calls.append(kwargs)
+            # A captured no-LoRA graph is padded to 8 tokens, while the
+            # active-LoRA path stays eager at the unpadded token count.
+            if kwargs["num_active_loras"] == 0:
+                num_tokens = 8
+                mode = CUDAGraphMode.PIECEWISE
+            else:
+                num_tokens = kwargs["num_tokens"]
+                mode = CUDAGraphMode.NONE
+            return BatchExecutionDescriptor(
+                cg_mode=mode,
+                num_tokens=num_tokens,
+                num_reqs=kwargs["num_reqs"],
+                num_active_loras=kwargs["num_active_loras"],
+                num_ubatches=1,
+            )
+
+    manager = FakeCudaGraphManager()
+    helper = FastPrefillHelper(manager, max_num_tokens=max(32, num_tokens))
+    metadata = helper.prepare(
+        torch.arange(num_tokens, dtype=torch.int32),
+        num_reqs=1,
+        cu_num_logits_np=np.array([0, num_tokens], dtype=np.int32),
+        has_prefill=True,
+        batch_desc=BatchExecutionDescriptor(
+            cg_mode=CUDAGraphMode.NONE,
+            num_tokens=num_tokens,
+            num_reqs=1,
+            num_active_loras=num_active_loras,
+            num_ubatches=1,
+        ),
+        num_active_loras=num_active_loras,
+    )
+
+    assert metadata is not None
+    assert metadata.num_logits_indices == num_tokens
+    assert metadata.logits_indices_padded.shape[0] == num_tokens
+    assert metadata.max_logits_per_req == num_tokens
+    assert manager.dispatch_calls[-1]["num_active_loras"] == num_active_loras
+
+
 class _FakeSharedHostRegion:
     def __init__(self) -> None:
         self.cleanup_calls = 0
@@ -382,7 +465,7 @@ def test_init_hisparse_rolls_back_shared_region(monkeypatch, failure_phase):
         cache_config=SimpleNamespace(
             get_resolved_kv_cache_layout=lambda: KVCacheLayout.BLHNC
         ),
-        scheduler_config=SimpleNamespace(max_num_seqs=1, max_num_batched_tokens=1),
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
     )
 
     def allocate(*args):
@@ -443,20 +526,17 @@ def test_reshape_padded_kv_cache_strides_by_padded_page():
 @pytest.mark.parametrize(
     (
         "kernel_block_sizes",
-        "storage_block_size",
         "expected_num_blocks",
         "expected_num_states",
     ),
     [
-        (None, None, 4, 64),
-        ([256], None, 4, 64),
-        ([64], None, 16, 16),
-        ([64], 256, 4, 64),
+        (None, 4, 64),
+        ([256], 4, 64),
+        ([64], 16, 16),
     ],
 )
 def test_allocate_compressed_mla_cache(
     kernel_block_sizes: list[int] | None,
-    storage_block_size: int | None,
     expected_num_blocks: int,
     expected_num_states: int,
 ):
@@ -466,7 +546,6 @@ def test_allocate_compressed_mla_cache(
         head_size=128,
         dtype=torch.bfloat16,
         tokens_per_state=4,
-        storage_block_size=storage_block_size,
     )
     num_pages = 4
     config = KVCacheConfig(
@@ -692,3 +771,114 @@ def test_allocate_hisparse_kv_caches_host_pool_and_view_less_specs():
         backing.untyped_storage().data_ptr()
         == caches["indexer"].untyped_storage().data_ptr()
     )
+
+
+class _TableBuilder:
+    requires_block_table_width = False
+    supports_update_block_table = False
+
+    def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+        self.kv_cache_spec = kv_cache_spec
+
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        return common_attn_metadata.block_table_tensor
+
+
+_VLLM_CONFIG = SimpleNamespace(
+    model_config=SimpleNamespace(max_model_len=8192),
+    scheduler_config=SimpleNamespace(max_num_seqs=4),
+    parallel_config=SimpleNamespace(
+        decode_context_parallel_size=1, prefill_context_parallel_size=1
+    ),
+)
+
+
+def _packed_group(tokens_per_state, row_bytes, supported_sizes):
+    spec = MLAAttentionSpec(
+        block_size=1024,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.uint8,
+        state_content_bytes=row_bytes,
+        tokens_per_state=tokens_per_state,
+    )
+    backend = SimpleNamespace(
+        get_builder_cls=lambda: _TableBuilder,
+        get_supported_kernel_block_sizes=lambda _=None: supported_sizes,
+        get_name=lambda: "FAKE",
+        customize_spec=lambda spec: spec,
+    )
+    return AttentionGroup(backend, ["layer.0"], spec, 0)
+
+
+def test_pcp_kernel_block_table_covers_both_prefill_chunks():
+    config = SimpleNamespace(
+        model_config=_VLLM_CONFIG.model_config,
+        scheduler_config=_VLLM_CONFIG.scheduler_config,
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1, prefill_context_parallel_size=2
+        ),
+    )
+    group = _packed_group(4, 132, [128, 256])
+    group.create_metadata_builders(config, "cpu", kernel_block_size=1024)
+    table = torch.arange(16, dtype=torch.int32).view(8, 2)
+
+    mapped = group.map_to_kernel_block_table(table)
+
+    expected = (table.unsqueeze(-1) * 4 + torch.arange(4, dtype=torch.int32)).flatten(1)
+    assert mapped.shape == (8, 8)
+    torch.testing.assert_close(mapped, expected)
+    assert mapped.data_ptr() == group.kernel_block_table.data_ptr()
+
+
+def test_packed_compressed_group_gets_kernel_block_table():
+    """A packed indexer cache whose kernel needs 64-state pages gets a table and
+    a bound view in kernel blocks that address the same packed-block rows."""
+    row, stride_rows = 132, 5 * 64
+    group = _packed_group(4, row, [128, 256])
+    group.create_metadata_builders(_VLLM_CONFIG, "cpu", kernel_block_size=1024)
+    assert group.get_metadata_builder().kv_cache_spec.block_size == 256
+
+    backing = torch.arange(3 * stride_rows).repeat_interleave(row)
+    manager = backing.view(3, 1, stride_rows, row)[:, :, :256]
+    pages = map_kv_caches_to_kernel_blocks({"layer.0": manager}, [group])["layer.0"]
+    metadata = create_common_attn_metadata(BatchSpec([2048], [1]), 1024, "cpu")
+    metadata.block_table_tensor = torch.tensor([[0, 2]], dtype=torch.int32)
+    table = group.build_metadata(metadata)
+    assert table.tolist() == [[0, 1, 2, 3, 10, 11, 12, 13]]
+    assert torch.equal(pages[table[0, 4:], 0].flatten(0, 1), manager[2, 0])
+
+
+def test_split_group_maps_manager_block_table():
+    """Groups split in a dense layout keep manager block tables; builders get
+    b * blocks_per_kv_block + j against the view allocated in kernel blocks."""
+    group = _packed_group(4, 132, [128, 256])
+    group.create_metadata_builders(_VLLM_CONFIG, "cpu", kernel_block_size=256)
+    kernel_view = torch.zeros(12, 1, 64, 132)
+    bound = map_kv_caches_to_kernel_blocks({"layer.0": kernel_view}, [group])
+    assert bound["layer.0"] is kernel_view
+
+    metadata = create_common_attn_metadata(BatchSpec([2048], [1]), 1024, "cpu")
+    metadata.block_table_tensor = torch.tensor([[0, 2]], dtype=torch.int32)
+    table = group.build_metadata(metadata)
+    assert table.tolist() == [[0, 1, 2, 3, 8, 9, 10, 11]]
+
+
+@pytest.mark.parametrize(
+    ("block_size", "page_states"), [(1024, 64), (384, 32), (256, 0)]
+)
+def test_split_blocks_align_to_kernel_blocks(block_size, page_states):
+    """Backends taking only fixed kernel blocks align packed blocks to the kernel
+    block the final block size is split into, and not at all when unsplit."""
+    group = _packed_group(4, 132, [128, 256])
+    spec = customize_attention_spec(group.backend, group.kv_cache_spec)
+    spec = spec.copy_with_new_block_size(block_size)
+    assert spec.get_block_stride_alignment() == max(page_states * 132, 1)
+
+
+def test_packed_token_cache_cannot_be_split():
+    group = _packed_group(1, 1152, [64])
+    group.create_metadata_builders(_VLLM_CONFIG, "cpu", kernel_block_size=1024)
+    packed = torch.zeros(3, 1, 2048, 1152, dtype=torch.uint8)[:, :, :1024]
+    with pytest.raises(ValueError, match="cannot be split"):
+        map_kv_caches_to_kernel_blocks({"layer.0": packed}, [group])

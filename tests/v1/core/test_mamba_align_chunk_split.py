@@ -17,6 +17,7 @@ import torch
 from vllm.multimodal.inputs import PlaceholderRange
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.kv_cache_utils import get_draft_replay_boundary
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -134,6 +135,7 @@ def _split(
     partial_hit: bool = False,
     num_prefill_checkpoint_blocks: int = 0,
     max_num_scheduled_tokens: int = 16384,
+    draft_replay_reserve: int = 0,
 ) -> int:
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
     if use_eagle_block_drop is None:
@@ -146,14 +148,59 @@ def _split(
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         # `prefix_match_unit` finer than the block size (#46384).
         mamba_partial_cache_hit=partial_hit,
-        mamba_fine_grained_prefix_cache=False,
+        mamba_shared_prefix_checkpoint=False,
         hash_block_size=ATTN_BLOCK_SIZE,
         mamba_has_prefill_checkpoint_blocks=(num_prefill_checkpoint_blocks > 0),
         mamba_prefill_checkpoint_alignment=(
             16 if num_prefill_checkpoint_blocks > 0 else None
         ),
+        draft_replay_reserve=draft_replay_reserve,
+        kv_cache_manager=SimpleNamespace(
+            get_draft_replay_boundary=lambda req: get_draft_replay_boundary(
+                req.num_prompt_tokens,
+                draft_replay_reserve,
+                MAMBA_BLOCK_SIZE,
+            )
+        ),
     )
     return Scheduler._mamba_block_aligned_split(stub, request, num_new_tokens)
+
+
+def test_dflash_replay_boundary_stops_initial_and_resumed_prefill(monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "MAMBA_BLOCK_SIZE", 512)
+    (request,) = create_requests(1, num_tokens=7000, block_size=ATTN_BLOCK_SIZE)
+
+    assert (
+        _split(
+            request,
+            7000,
+            use_eagle=False,
+            draft_replay_reserve=2048,
+        )
+        == 4608
+    )
+
+    request.num_computed_tokens = 4096
+    assert (
+        _split(
+            request,
+            7000 - 4096,
+            use_eagle=False,
+            draft_replay_reserve=2048,
+        )
+        == 512
+    )
+
+    request.num_computed_tokens = 4608
+    assert (
+        _split(
+            request,
+            7000 - 4608,
+            use_eagle=False,
+            draft_replay_reserve=2048,
+        )
+        > 0
+    )
 
 
 @pytest.mark.parametrize(
@@ -180,6 +227,55 @@ def test_internal_checkpoint_split(
         )
         == expected
     )
+
+
+@pytest.mark.parametrize("mamba_block_size", [528, MAMBA_BLOCK_SIZE])
+def test_incremental_multimodal_sibling_reuses_mamba_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    mamba_block_size: int,
+) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "MAMBA_BLOCK_SIZE", mamba_block_size)
+    manager = _make_hybrid_kv_cache_manager(use_eagle=False)
+    last_mm_end = mamba_block_size + 100
+    (producer,) = create_requests(
+        1,
+        num_tokens=2 * mamba_block_size + 402,
+        block_size=ATTN_BLOCK_SIZE,
+        same_prompt=True,
+        mm_hashes_list=[["img0"]],
+        mm_positions=[[PlaceholderRange(offset=100, length=mamba_block_size)]],
+        req_ids=["producer"],
+    )
+    while producer.num_computed_tokens < producer.num_tokens:
+        remaining = producer.num_tokens - producer.num_computed_tokens
+        num_new_tokens = _split(producer, remaining, use_eagle=False)
+        assert num_new_tokens > 0
+        assert (
+            manager.allocate_slots(
+                producer, num_new_tokens, num_lookahead_tokens=NUM_SPEC
+            )
+            is not None
+        )
+        producer.num_computed_tokens += num_new_tokens
+        manager.cache_blocks(producer, producer.num_computed_tokens)
+
+    (consumer,) = create_requests(
+        1,
+        num_tokens=3 * mamba_block_size + 402,
+        block_size=ATTN_BLOCK_SIZE,
+        same_prompt=True,
+        mm_hashes_list=[["img0", "img1"]],
+        mm_positions=[
+            [
+                PlaceholderRange(offset=100, length=mamba_block_size),
+                PlaceholderRange(offset=last_mm_end, length=400),
+            ]
+        ],
+        req_ids=["consumer"],
+    )
+    _, num_computed, shared_prefix_boundary = manager.get_computed_blocks(consumer)
+    assert shared_prefix_boundary == last_mm_end // ATTN_BLOCK_SIZE * ATTN_BLOCK_SIZE
+    assert num_computed == mamba_block_size
 
 
 def test_partial_checkpoint_resume_stops_at_mamba_block_boundary() -> None:
@@ -281,60 +377,6 @@ def _count_cached_boundary_states(
         )
         checked += 1
     return checked
-
-
-@pytest.mark.parametrize("mamba_block_size", [528, MAMBA_BLOCK_SIZE])
-def test_incremental_multimodal_sibling_reuses_mamba_boundary(
-    monkeypatch: pytest.MonkeyPatch,
-    mamba_block_size: int,
-) -> None:
-    """A sibling appending a new MM item reuses the producer's last item."""
-    monkeypatch.setattr(sys.modules[__name__], "MAMBA_BLOCK_SIZE", mamba_block_size)
-    manager = _make_hybrid_kv_cache_manager(use_eagle=False)
-    last_mm_end = mamba_block_size + 100
-    producer = create_requests(
-        1,
-        num_tokens=2 * mamba_block_size + 402,
-        block_size=ATTN_BLOCK_SIZE,
-        same_prompt=True,
-        mm_hashes_list=[["img0"]],
-        mm_positions=[[PlaceholderRange(offset=100, length=mamba_block_size)]],
-        req_ids=["producer"],
-    )[0]
-
-    while producer.num_computed_tokens < producer.num_tokens:
-        remaining = producer.num_tokens - producer.num_computed_tokens
-        num_new_tokens = _split(producer, remaining, use_eagle=False)
-        assert num_new_tokens > 0
-        assert (
-            manager.allocate_slots(
-                producer,
-                num_new_tokens,
-                num_lookahead_tokens=NUM_SPEC,
-            )
-            is not None
-        )
-        producer.num_computed_tokens += num_new_tokens
-        manager.cache_blocks(producer, producer.num_computed_tokens)
-
-    consumer = create_requests(
-        1,
-        num_tokens=3 * mamba_block_size + 402,
-        block_size=ATTN_BLOCK_SIZE,
-        same_prompt=True,
-        mm_hashes_list=[["img0", "img1"]],
-        mm_positions=[
-            [
-                PlaceholderRange(offset=100, length=mamba_block_size),
-                PlaceholderRange(offset=last_mm_end, length=400),
-            ]
-        ],
-        req_ids=["consumer"],
-    )[0]
-
-    _, num_computed, shared_prefix_boundary = manager.get_computed_blocks(consumer)
-    assert shared_prefix_boundary == last_mm_end // ATTN_BLOCK_SIZE * ATTN_BLOCK_SIZE
-    assert num_computed == mamba_block_size
 
 
 def _prefill(prompt_len: int, budgets: list[int]) -> int:

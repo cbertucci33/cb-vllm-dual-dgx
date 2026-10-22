@@ -1,0 +1,10 @@
+--- a/sparkinfer/_lib/intrinsics.py
++++ b/sparkinfer/_lib/intrinsics.py
+@@ -1 +1 @@
+-version = 0
++version = 1
+--- a/sparkinfer/moe/_shared/kernels/w4a16/kernel.py
++++ b/sparkinfer/moe/_shared/kernels/w4a16/kernel.py
+@@ -1 +1 @@
+-version = 0
++version = 1

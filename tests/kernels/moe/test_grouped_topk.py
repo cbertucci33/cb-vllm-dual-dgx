@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for the MoE grouped topk kernel
+"""Tests for the MoE grouped topk kernel.
 
 Run `pytest tests/kernels/moe/test_grouped_topk.py`.
 """
@@ -15,9 +15,14 @@ from vllm.config import (
     get_cached_compilation_config,
     set_current_vllm_config,
 )
+from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
     GroupedTopk,
+    GroupedTopKRouter,
     fused_grouped_topk,
+)
+from vllm.model_executor.layers.fused_moe.router.router_factory import (
+    create_fused_moe_router,
 )
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
@@ -57,7 +62,8 @@ def _single_group_reference(
     routed_scaling_factor: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if scoring_func == "sigmoid":
-        scores = 0.5 * torch.tanh(0.5 * logits.float()) + 0.5
+        # Independent logistic oracle, rounded only at the FP32 score boundary.
+        scores = logits.double().sigmoid().float()
     else:
         scores = torch.softmax(logits, dim=-1).float()
     indices = torch.argsort(
@@ -65,9 +71,44 @@ def _single_group_reference(
     )[:, :topk]
     values = scores.gather(1, indices)
     if renormalize:
-        values /= values.sum(dim=-1, keepdim=True) + 1e-20
+        total = values.double().sum(dim=-1, keepdim=True)
+        if scoring_func == "softmax":
+            total += 1e-20
+        else:
+            total = torch.where(total == 0, torch.ones_like(total), total)
+        values = (values.double() / total).float()
     values *= routed_scaling_factor
     return values, indices.to(torch.int32)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="This test is skipped on non-CUDA platform."
+)
+@pytest.mark.parametrize("skip_padding", [False, True])
+def test_kimi_grouped_topk_masks_padding_when_enabled(skip_padding: bool):
+    hidden_states = torch.randn((2, 16), device="cuda")
+    gating_output = torch.randn((2, 896), device="cuda")
+    is_padding = torch.tensor([False, True], device="cuda")
+    router = GroupedTopKRouter(
+        top_k=16,
+        global_num_experts=896,
+        num_expert_group=1,
+        topk_group=1,
+        skip_padding=skip_padding,
+    )
+
+    with set_forward_context(None, VllmConfig(), is_padding=is_padding):
+        topk_weights, topk_ids = router._compute_routing(
+            hidden_states, gating_output, torch.int32
+        )
+
+    assert torch.all(topk_ids[0] >= 0)
+    if skip_padding:
+        assert torch.all(topk_ids[1] == -1)
+        assert torch.all(topk_weights[1] == 0)
+    else:
+        assert torch.all(topk_ids[1] >= 0)
+        assert torch.all(topk_weights[1] > 0)
 
 
 @pytest.mark.skipif(
@@ -367,3 +408,328 @@ def test_grouped_topk_single_group_nonfinite_scores(
 
     torch.testing.assert_close(actual_ids, expected_ids)
     torch.testing.assert_close(actual_values, expected_values, atol=2e-5, rtol=0)
+
+
+# Observed top-eight correction biases, not a full checkpoint tensor. Other
+# experts use a lower synthetic bias. This preserves the real selected IDs and
+# rounded-addition witness without requiring private model artifacts in CI.
+_MODEL_ROUTER_CASES = [
+    pytest.param(
+        256,
+        1.0,
+        [91, 137, 252, 221, 156, 62, 204, 19],
+        [
+            2.183300733566284,
+            2.1645851135253906,
+            2.115870714187622,
+            2.0943751335144043,
+            2.0889148712158203,
+            2.0862226486206055,
+            2.080620765686035,
+            2.0785624980926514,
+        ],
+        0.0,
+        id="mimo-256-top8",
+    ),
+    pytest.param(
+        288,
+        2.5,
+        [47, 153, 140, 19, 142, 197, 134, 205],
+        [
+            7.786213397979736,
+            7.785406589508057,
+            7.78521203994751,
+            7.7845025062561035,
+            7.783807277679443,
+            7.783804416656494,
+            7.783605575561523,
+            7.783412456512451,
+        ],
+        7.416070938110352,
+        id="glm-288-top8-scale2.5",
+    ),
+]
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="NVIDIA CUDA required")
+@pytest.mark.parametrize(
+    "num_experts,scale,selected_ids,selected_biases,other_bias", _MODEL_ROUTER_CASES
+)
+@pytest.mark.parametrize("num_rows", [1, 8, 1024, 1025, 16384])
+def test_model_grouped_topk_preserves_scores_before_bias(
+    num_experts, scale, selected_ids, selected_biases, other_bias, num_rows
+):
+    """G03/F01: actual top8 block/warp tiers retain scores erased by bias addition.
+
+    Equal -17 logits keep this independent of G04: even the old tanh score is
+    positive here, and retaining it yields exactly the same normalized weights.
+    16384 is the inspected GLM batched-token/prefill capacity, not a context cap.
+    """
+    logits = torch.full(
+        (num_rows, num_experts), -17.0, dtype=torch.float32, device="cuda"
+    )
+    bias = torch.full((num_experts,), other_bias, dtype=torch.float32, device="cuda")
+    bias[selected_ids] = torch.tensor(
+        selected_biases, dtype=torch.float32, device="cuda"
+    )
+    expected_values, expected_ids = _single_group_reference(
+        logits,
+        bias,
+        8,
+        scoring_func="sigmoid",
+        renormalize=True,
+        routed_scaling_factor=scale,
+    )
+    actual_values, actual_ids = _run_single_group_topk(
+        logits,
+        bias,
+        8,
+        scoring_func="sigmoid",
+        renormalize=True,
+        routed_scaling_factor=scale,
+    )
+    torch.testing.assert_close(
+        expected_ids[0], torch.tensor(selected_ids, dtype=torch.int32, device="cuda")
+    )
+    torch.testing.assert_close(actual_ids, expected_ids, rtol=0, atol=0)
+    torch.testing.assert_close(actual_values, expected_values, rtol=2e-6, atol=0)
+    torch.testing.assert_close(
+        actual_values.sum(-1), torch.full((num_rows,), scale, device="cuda")
+    )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="NVIDIA CUDA required")
+@pytest.mark.parametrize("num_experts,scale", [(256, 1.0), (288, 2.5)])
+@pytest.mark.parametrize("num_rows", [1, 1024, 1025])
+@pytest.mark.parametrize("input_dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("renormalize", [False, True])
+@pytest.mark.parametrize("tail_logit", [-20.0, -80.0])
+def test_model_grouped_topk_sigmoid_negative_tail(
+    num_experts, scale, num_rows, input_dtype, renormalize, tail_logit
+):
+    """G04/F02: zero bias isolates tanh loss and epsilon-dominated normalization."""
+    logits = torch.full(
+        (num_rows, num_experts), tail_logit - 20, dtype=input_dtype, device="cuda"
+    )
+    logits[:, :8] = tail_logit - torch.arange(8, device="cuda") * 0.25
+    bias = torch.zeros(num_experts, dtype=torch.float32, device="cuda")
+    expected_values, expected_ids = _single_group_reference(
+        logits,
+        bias,
+        8,
+        scoring_func="sigmoid",
+        renormalize=renormalize,
+        routed_scaling_factor=scale,
+    )
+    actual_values, actual_ids = _run_single_group_topk(
+        logits,
+        bias,
+        8,
+        scoring_func="sigmoid",
+        renormalize=renormalize,
+        routed_scaling_factor=scale,
+    )
+    torch.testing.assert_close(actual_ids, expected_ids, rtol=0, atol=0)
+    torch.testing.assert_close(actual_values, expected_values, rtol=2e-6, atol=0)
+    if renormalize:
+        torch.testing.assert_close(
+            actual_values.sum(-1), torch.full((num_rows,), scale, device="cuda")
+        )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="NVIDIA CUDA required")
+@pytest.mark.parametrize("num_experts", [128, 256, 288, 512, 768])
+@pytest.mark.parametrize("renormalize", [False, True])
+def test_grouped_topk_softmax_preserves_precomputed_scores(num_experts, renormalize):
+    """The modified warp also consumes original precomputed softmax scores."""
+    logits = torch.zeros((1025, num_experts), dtype=torch.float32, device="cuda")
+    logits[:, :8] = -17.0
+    bias = torch.zeros(num_experts, dtype=torch.float32, device="cuda")
+    bias[:8] = 2.0
+    expected_values, expected_ids = _single_group_reference(
+        logits,
+        bias,
+        8,
+        scoring_func="softmax",
+        renormalize=renormalize,
+        routed_scaling_factor=2.5,
+    )
+    actual_values, actual_ids = _run_single_group_topk(
+        logits,
+        bias,
+        8,
+        scoring_func="softmax",
+        renormalize=renormalize,
+        routed_scaling_factor=2.5,
+    )
+    torch.testing.assert_close(actual_ids, expected_ids, rtol=0, atol=0)
+    torch.testing.assert_close(actual_values, expected_values, rtol=2e-6, atol=0)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="NVIDIA CUDA required")
+@pytest.mark.parametrize(
+    "num_experts,num_groups,topk_groups",
+    [
+        (256, 8, 4),  # small-expert grouped kernel
+        (512, 8, 4),  # generic grouped kernel
+        (1152, 1, 1),  # single-group fallback beyond the specialized tiers
+    ],
+)
+@pytest.mark.parametrize("tail_logit", [-20.0, -80.0])
+def test_grouped_topk_other_sigmoid_consumers_negative_tail(
+    num_experts, num_groups, topk_groups, tail_logit
+):
+    """All generic consumers of the shared helper retain finite negative tails."""
+    logits = torch.full(
+        (1, num_experts), tail_logit, dtype=torch.float32, device="cuda"
+    )
+    bias = torch.arange(num_experts, device="cuda", dtype=torch.float32) / num_experts
+    scores = logits.double().sigmoid().float()
+    selection = scores + bias
+    group_scores = selection.view(1, num_groups, -1).topk(2, dim=-1).values.sum(-1)
+    groups = group_scores.argsort(descending=True, stable=True)[:, :topk_groups]
+    mask = torch.zeros_like(group_scores, dtype=torch.bool).scatter_(1, groups, True)
+    selection = selection.masked_fill(
+        ~mask.repeat_interleave(num_experts // num_groups, dim=1), -torch.inf
+    )
+    expected_ids = selection.argsort(descending=True, stable=True)[:, :8]
+    expected_values = scores.gather(1, expected_ids)
+    expected_values = 2.5 * expected_values / expected_values.sum(-1, keepdim=True)
+    actual_values, actual_ids = fused_grouped_topk(
+        hidden_states=logits[:, :0],
+        gating_output=logits,
+        topk=8,
+        renormalize=True,
+        e_score_correction_bias=bias,
+        num_expert_group=num_groups,
+        topk_group=topk_groups,
+        scoring_func="sigmoid",
+        routed_scaling_factor=2.5,
+    )
+    torch.testing.assert_close(actual_ids, expected_ids.to(torch.int32), rtol=0, atol=0)
+    torch.testing.assert_close(actual_values, expected_values, rtol=2e-6, atol=0)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="NVIDIA CUDA required")
+@pytest.mark.parametrize("num_experts,scale", [(256, 1.0), (288, 2.5)])
+@pytest.mark.parametrize("num_rows", [1, 1025])
+@pytest.mark.parametrize(
+    "case", ["ties", "invalid_logits", "invalid_bias", "all_invalid", "zero_scores"]
+)
+def test_model_grouped_topk_preserves_selection_edge_contracts(
+    num_experts, scale, num_rows, case
+):
+    """Both model tiers keep stable ties and the existing finite-input masks."""
+    logits = torch.zeros((num_rows, num_experts), dtype=torch.float32, device="cuda")
+    bias = torch.zeros(num_experts, dtype=torch.float32, device="cuda")
+    first_valid = 0
+    if case == "invalid_logits":
+        logits[:, :3] = torch.tensor([torch.nan, torch.inf, -torch.inf], device="cuda")
+        first_valid = 3
+    elif case == "invalid_bias":
+        bias[:3] = torch.tensor([torch.nan, torch.inf, -torch.inf], device="cuda")
+        first_valid = 3
+    elif case == "all_invalid":
+        logits.fill_(torch.nan)
+    elif case == "zero_scores":
+        logits.fill_(-1000.0)
+    actual_values, actual_ids = _run_single_group_topk(
+        logits,
+        bias,
+        8,
+        scoring_func="sigmoid",
+        renormalize=True,
+        routed_scaling_factor=scale,
+    )
+    expected_ids = torch.arange(
+        first_valid, first_valid + 8, dtype=torch.int32, device="cuda"
+    )[None].expand(num_rows, -1)
+    # Preserve the existing all-invalid fallback, including its unscaled value.
+    expected_weight = (1.0 if case == "all_invalid" else scale) / 8
+    if case == "zero_scores":
+        expected_weight = 0.0
+    expected_values = torch.full((num_rows, 8), expected_weight, device="cuda")
+    torch.testing.assert_close(actual_ids, expected_ids, rtol=0, atol=0)
+    torch.testing.assert_close(actual_values, expected_values, rtol=2e-6, atol=0)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="NVIDIA CUDA required")
+@pytest.mark.parametrize(
+    "num_experts,scale,selected_ids,selected_biases,other_bias", _MODEL_ROUTER_CASES
+)
+def test_model_grouped_router_factory_reaches_original_score_contract(
+    monkeypatch, num_experts, scale, selected_ids, selected_biases, other_bias
+):
+    """Exercise actual factory, router, wrapper and native op, not a substitute topk."""
+    monkeypatch.setenv("VLLM_USE_FUSED_MOE_GROUPED_TOPK", "1")
+    logits = torch.full((1025, num_experts), -20.0, dtype=torch.float32, device="cuda")
+    bias = torch.full((num_experts,), other_bias, dtype=torch.float32, device="cuda")
+    bias[selected_ids] = torch.tensor(
+        selected_biases, dtype=torch.float32, device="cuda"
+    )
+    router = create_fused_moe_router(
+        top_k=8,
+        global_num_experts=num_experts,
+        renormalize=True,
+        use_grouped_topk=True,
+        num_expert_group=1,
+        topk_group=1,
+        scoring_func="sigmoid",
+        routed_scaling_factor=scale,
+        e_score_correction_bias=bias,
+    )
+    assert isinstance(router, GroupedTopKRouter)
+    expected_values, expected_ids = _single_group_reference(
+        logits,
+        bias,
+        8,
+        scoring_func="sigmoid",
+        renormalize=True,
+        routed_scaling_factor=scale,
+    )
+    actual_values, actual_ids = router.select_experts(
+        hidden_states=logits[:, :0],
+        router_logits=logits,
+        topk_indices_dtype=torch.int64,
+    )
+    assert actual_ids.dtype == torch.int64
+    assert actual_values.dtype == torch.float32
+    torch.testing.assert_close(actual_ids, expected_ids.long(), rtol=0, atol=0)
+    torch.testing.assert_close(actual_values, expected_values, rtol=2e-6, atol=0)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="NVIDIA CUDA required")
+@pytest.mark.parametrize("num_experts", [513, 768])
+@pytest.mark.parametrize("num_rows", [1024, 1025])
+@pytest.mark.parametrize(
+    "logit,selection_bias",
+    [(-17.0, 2.0), (-20.0, 0.0), (-80.0, 0.0)],
+    ids=["bias-cancellation", "sigmoid-tail", "tiny-normalizer"],
+)
+def test_grouped_topk_sigmoid_lane_owned_block_and_warp(
+    num_experts, num_rows, logit, selection_bias
+):
+    """Tier768/top16 uses hierarchical block then lane-owned warp, not tuned896."""
+    logits = torch.full(
+        (num_rows, num_experts), logit, dtype=torch.float32, device="cuda"
+    )
+    bias = torch.zeros(num_experts, dtype=torch.float32, device="cuda")
+    bias[:16] = selection_bias
+    expected_values, expected_ids = _single_group_reference(
+        logits,
+        bias,
+        16,
+        scoring_func="sigmoid",
+        renormalize=True,
+        routed_scaling_factor=2.5,
+    )
+    actual_values, actual_ids = _run_single_group_topk(
+        logits,
+        bias,
+        16,
+        scoring_func="sigmoid",
+        renormalize=True,
+        routed_scaling_factor=2.5,
+    )
+    torch.testing.assert_close(actual_ids, expected_ids, rtol=0, atol=0)
+    torch.testing.assert_close(actual_values, expected_values, rtol=2e-6, atol=0)

@@ -1,0 +1,147 @@
+diff --git a/sparkinfer/moe/_shared/kernels/w4a16/kernel.py b/sparkinfer/moe/_shared/kernels/w4a16/kernel.py
+index 9035937..276f644 100644
+--- a/sparkinfer/moe/_shared/kernels/w4a16/kernel.py
++++ b/sparkinfer/moe/_shared/kernels/w4a16/kernel.py
+@@ -173,6 +173,40 @@ def _materialize_w4a16_topk_route_f32(value, *, loc=None, ip=None):
+     )
+ 
+ 
++@dsl_user_op
++def _clamp_swiglu_f32(gate, up, limit, *, loc=None, ip=None):
++    # Preserve FP32, subnormals and NaNs. A positive limit makes xorsign.abs
++    # clamp the up magnitude while retaining its sign (SM86+, including GB10).
++    limit_ir = cutlass.Float32(limit).ir_value(loc=loc, ip=ip)
++    gate = cutlass.Float32(
++        llvm.inline_asm(
++            T.f32(),
++            [cutlass.Float32(gate).ir_value(loc=loc, ip=ip), limit_ir],
++            "min.NaN.f32 $0, $1, $2;",
++            "=f,f,f",
++            has_side_effects=False,
++            is_align_stack=False,
++            asm_dialect=llvm.AsmDialect.AD_ATT,
++            loc=loc,
++            ip=ip,
++        )
++    )
++    up = cutlass.Float32(
++        llvm.inline_asm(
++            T.f32(),
++            [cutlass.Float32(up).ir_value(loc=loc, ip=ip), limit_ir],
++            "min.NaN.xorsign.abs.f32 $0, $1, $2;",
++            "=f,f,f",
++            has_side_effects=False,
++            is_align_stack=False,
++            asm_dialect=llvm.AsmDialect.AD_ATT,
++            loc=loc,
++            ip=ip,
++        )
++    )
++    return gate, up
++
++
+ def _m_specialization_key(size_m: int) -> int:
+     """M bucket for branches that genuinely specialize on token count."""
+     return 1 if int(size_m) == 1 else 0
+@@ -4686,10 +4720,9 @@ class W4A16FusedMoeKernel:
+                 raise ValueError(
+                     "intermediate_rotation is only supported for trellis3_t256"
+                 )
+-            if not is_gated or self.activation_is_swigluoai or self.has_swiglu_limit:
++            if not is_gated or self.activation_is_swigluoai:
+                 raise ValueError(
+-                    "intermediate_rotation requires plain gated silu "
+-                    "(no swiglu limit/oai)"
++                    "intermediate_rotation requires gated silu (no swiglu oai)"
+                 )
+             if int(intermediate_size) % 128 != 0:
+                 raise ValueError(
+@@ -4838,14 +4871,9 @@ class W4A16FusedMoeKernel:
+         up: cutlass.Float32,
+     ):
+         if cutlass.const_expr(self.has_swiglu_limit):
+-            limit = cutlass.Float32(self.swiglu_limit)
+-            neg_limit = cutlass.Float32(-self.swiglu_limit)
+-            if gate > limit:
+-                gate = limit
+-            if up > limit:
+-                up = limit
+-            if up < neg_limit:
+-                up = neg_limit
++            gate, up = _clamp_swiglu_f32(
++                gate, up, cutlass.Float32(self.swiglu_limit)
++            )
+         return gate, up
+ 
+     @cute.jit
+@@ -5396,6 +5424,12 @@ class W4A16FusedMoeKernel:
+                 iu1 = uh1 * svu1
+                 iu2 = uh2 * svu2
+                 iu3 = uh3 * svu3
++                # Clamp in logical projection space, after inverse rotation
++                # and svh scaling, before SiLU and the down-input transform.
++                ig0, iu0 = self._clamp_swiglu_inputs(ig0, iu0)
++                ig1, iu1 = self._clamp_swiglu_inputs(ig1, iu1)
++                ig2, iu2 = self._clamp_swiglu_inputs(ig2, iu2)
++                ig3, iu3 = self._clamp_swiglu_inputs(ig3, iu3)
+                 down = isz + isz
+                 sd0 = rot_scales_flat[s_base + down + Int32(0)].to(cutlass.Float32)
+                 sd1 = rot_scales_flat[s_base + down + Int32(1)].to(cutlass.Float32)
+@@ -5658,6 +5692,10 @@ class W4A16FusedMoeKernel:
+                 iu2_1 = uh1 * svu1
+                 iu2_2 = uh2 * svu2
+                 iu2_3 = uh3 * svu3
++                ig2_0, iu2_0 = self._clamp_swiglu_inputs(ig2_0, iu2_0)
++                ig2_1, iu2_1 = self._clamp_swiglu_inputs(ig2_1, iu2_1)
++                ig2_2, iu2_2 = self._clamp_swiglu_inputs(ig2_2, iu2_2)
++                ig2_3, iu2_3 = self._clamp_swiglu_inputs(ig2_3, iu2_3)
+                 # silu(gate) * up, then pre-scale suh_down
+                 d2 = isz + isz
+                 sd0 = rot_scales_flat[s_base + d2 + Int32(0)].to(cutlass.Float32)
+diff --git a/sparkinfer/moe/trellis_moe/_impl.py b/sparkinfer/moe/trellis_moe/_impl.py
+index ef16a19..854542c 100644
+--- a/sparkinfer/moe/trellis_moe/_impl.py
++++ b/sparkinfer/moe/trellis_moe/_impl.py
+@@ -9,6 +9,7 @@ from math import prod
+ import torch
+ 
+ from ..._lib.scratch import ScratchBufferSpec, scratch_buffer_spec, scratch_tensor
++from .._shared.kernels.activations import normalize_swiglu_limit_for_activation
+ from .._shared.kernels.w4a16.host import (
+     W4A16BufferPlan,
+     max_packed_route_slots,
+@@ -104,6 +105,7 @@ class TrellisMoECaps:
+     trellis_bits: int = 3
+     tile_config: tuple[int, int, int, int] = _DEFAULT_TILE_CONFIG
+     activation: str = "silu"
++    swiglu_limit: float | None = None
+     fast_math: bool = True
+ 
+     def __post_init__(self) -> None:
+@@ -169,6 +171,10 @@ class TrellisMoECaps:
+         if str(self.activation).strip().lower() != "silu":
+             raise ValueError("the validated full-rotation Trellis recipe requires silu")
+         object.__setattr__(self, "activation", "silu")
++        object.__setattr__(
++            self, "swiglu_limit",
++            normalize_swiglu_limit_for_activation("silu", self.swiglu_limit),
++        )
+         object.__setattr__(self, "fast_math", bool(self.fast_math))
+ 
+     @property
+@@ -510,6 +516,7 @@ def plan_trellis_moe(caps: TrellisMoECaps) -> TrellisMoEPlan:
+             num_experts=caps.num_experts,
+             top_k=caps.num_topk,
+             activation=caps.activation,
++            swiglu_limit=caps.swiglu_limit,
+             apply_router_weight_on_input=False,
+             zero_fc2_output=False,
+             moe_block_size=caps.block_size_m,
+@@ -731,6 +738,7 @@ def run_trellis_moe(*, binding: TrellisMoEBinding) -> torch.Tensor:
+         binding.topk_weights,
+         binding.topk_ids,
+         activation=caps.activation,
++        swiglu_limit=caps.swiglu_limit,
+         intermediate_cache13=binding.intermediate_cache13,
+         intermediate_cache2=binding.intermediate_cache2,
+         output=binding.output,

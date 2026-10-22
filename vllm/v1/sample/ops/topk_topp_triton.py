@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Combined Top-K and Top-P Triton kernels.
+"""Combined Top-K and Top-P Triton kernels.
 
 Based on the paper "Qrita: High-performance Top-k and Top-p Algorithm for GPUs
 using Pivot-based Truncation and Selection" By Park et al.
@@ -104,7 +103,7 @@ def _update_min_larger_stats(data, above_mask, min_larger, num_min_larger, senti
     return min_larger, num_min_larger
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["BATCH_SIZE"])
 def _topk_topp_kernel(
     LOGITS,
     LOGITS_STRIDE_0,
@@ -640,8 +639,8 @@ def _topk_topp_kernel(
                 std_logit = tl.sqrt(
                     tl.maximum(sq_avg_logit - avg_logit * avg_logit, 0.0)
                 )
-                max_sample = avg_logit + std_logit * 10.0
                 sum_exp_logits = 0.0
+                max_sample = tl.where(max_logit > -float("inf"), max_logit, 0.0)
 
                 # First pass: compute max and min logits and sum_exp_logits
                 for i in range(0, NUM_TILES):
@@ -650,7 +649,14 @@ def _topk_topp_kernel(
                     logits_blk = tl.load(
                         LOGITS_ROW + offs_n, mask=mask_n, other=-float("inf")
                     )
+                    previous_max = max_logit
                     max_logit = tl.maximum(max_logit, tl.max(logits_blk))
+                    # Use an online log-sum-exp rather than the first tile's
+                    # estimated maximum: grammar masks or logit bias can put
+                    # the actual maximum arbitrarily far outside that sample.
+                    # A finite anchor also keeps all-masked tiles at zero.
+                    max_sample = tl.where(max_logit > -float("inf"), max_logit, 0.0)
+                    sum_exp_logits *= tl.exp(previous_max - max_sample)
                     # Exclude -inf from min to keep binary search bounds
                     # finite (avoids NaN pivots).
                     finite_blk = tl.where(
@@ -985,13 +991,19 @@ _SPLIT_MAX_BATCH = 64
 _SPLIT_MAX_SPLITS = 32  # power of two
 _SPLIT_FANOUT = 8
 _SPLIT_ROUNDS = 5
+# The step kernels are latency-bound at one program per SM, so keep splitting
+# past that while slices span at least this many entries; shorter slices no
+# longer amortize each program's row stats and combine replay.
+_SPLIT_MIN_SLICE = 7168
 
 _TRITON_SPLIT_CACHE: dict[torch.device, dict[str, torch.Tensor]] = {}
 
 
-def _topp_split_count(batch_size: int, num_sm: int) -> int:
+def _topp_split_count(batch_size: int, vocab_size: int, num_sm: int) -> int:
     splits = 1
-    while splits < _SPLIT_MAX_SPLITS and splits * 2 * batch_size <= num_sm:
+    while splits < _SPLIT_MAX_SPLITS and (
+        splits * 2 * batch_size <= num_sm or splits * 2 * _SPLIT_MIN_SLICE <= vocab_size
+    ):
         splits *= 2
     return splits
 
@@ -1050,6 +1062,7 @@ def _topp_split_stats_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
     batch_size: Any = WarmupIntRange(
         1, min(_max_sampler_batch_size(vllm_config), _SPLIT_MAX_BATCH) + 1
     )
+    has_k: Any = WarmupChoices(False, True)
     logits = TritonWarmupTensor(
         torch.float32,
         shape=(batch_size, vocab_size),
@@ -1058,7 +1071,7 @@ def _topp_split_stats_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
     return dict(
         logits=logits,
         stats=TritonWarmupTensor(torch.float32),
-        k=WarmupChoices(None, TritonWarmupTensor(torch.int32)),
+        k=TritonWarmupTensor(torch.int32) if has_k else None,
         p=TritonWarmupTensor(torch.float32),
         num_sm=num_sm,
     )
@@ -1076,7 +1089,7 @@ def _topp_split_stats(
     num_sm: int,
 ) -> DispatchSpec:
     batch_size, vocab_size = logits.shape
-    splits = _topp_split_count(batch_size, num_sm)
+    splits = _topp_split_count(batch_size, vocab_size, num_sm)
     return (logits.shape[0] * splits,), dict(
         K=k if k is not None else logits,
         HAS_K=k is not None,
@@ -1225,7 +1238,7 @@ def _topp_sb_combine(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["ROUND"])
 def _topp_sb_step_kernel(
     LOGITS,
     LOGITS_STRIDE_0,
@@ -1339,6 +1352,7 @@ def _topp_split_step_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
         1, min(_max_sampler_batch_size(vllm_config), _SPLIT_MAX_BATCH) + 1
     )
     round: Any = WarmupIntRange(0, _SPLIT_ROUNDS)
+    has_k: Any = WarmupChoices(False, True)
     logits = TritonWarmupTensor(
         torch.float32,
         shape=(batch_size, vocab_size),
@@ -1348,7 +1362,7 @@ def _topp_split_step_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
         logits=logits,
         stats=TritonWarmupTensor(torch.float32),
         parts=TritonWarmupTensor(torch.float32),
-        k=WarmupChoices(None, TritonWarmupTensor(torch.int32)),
+        k=TritonWarmupTensor(torch.int32) if has_k else None,
         p=TritonWarmupTensor(torch.float32),
         round=round,
         num_sm=num_sm,
@@ -1369,7 +1383,7 @@ def _topp_split_step(
     num_sm: int,
 ) -> DispatchSpec:
     batch_size, vocab_size = logits.shape
-    splits = _topp_split_count(batch_size, num_sm)
+    splits = _topp_split_count(batch_size, vocab_size, num_sm)
     return (logits.shape[0] * splits,), dict(
         K=k if k is not None else logits,
         HAS_K=k is not None,
@@ -1509,6 +1523,8 @@ def _topp_sb_mask_kernel(
             cum = tl.cumsum(dmask.to(tl.int32)).to(tl.float32) + num_preceding
             keep_dup = dmask & (cum <= numkeep)
             keep = keep & (~dmask | keep_dup)
+            # Carry the duplicate budget across tiles within this slice too.
+            num_preceding += tl.sum(dmask.to(tl.float32))
         tl.store(ROW + i + offs, tl.where(keep, x, MASK_VALUE), mask=mask_n)
 
 
@@ -1519,6 +1535,7 @@ def _topp_split_mask_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
     batch_size: Any = WarmupIntRange(
         1, min(_max_sampler_batch_size(vllm_config), _SPLIT_MAX_BATCH) + 1
     )
+    has_k: Any = WarmupChoices(False, True)
     logits = TritonWarmupTensor(
         torch.float32,
         shape=(batch_size, vocab_size),
@@ -1528,7 +1545,7 @@ def _topp_split_mask_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
         logits=logits,
         stats=TritonWarmupTensor(torch.float32),
         parts=TritonWarmupTensor(torch.float32),
-        k=WarmupChoices(None, TritonWarmupTensor(torch.int32)),
+        k=TritonWarmupTensor(torch.int32) if has_k else None,
         p=TritonWarmupTensor(torch.float32),
         mask_value=float("-inf"),
         num_sm=num_sm,
@@ -1549,7 +1566,7 @@ def _topp_split_mask(
     num_sm: int,
 ) -> DispatchSpec:
     batch_size, vocab_size = logits.shape
-    splits = _topp_split_count(batch_size, num_sm)
+    splits = _topp_split_count(batch_size, vocab_size, num_sm)
     return (logits.shape[0] * splits,), dict(
         K=k if k is not None else logits,
         HAS_K=k is not None,
@@ -1613,9 +1630,9 @@ def apply_top_k_top_p_triton(
     k: torch.Tensor | None,
     p: torch.Tensor | None,
     mask_value: float = float("-inf"),
+    has_topp_only_rows: bool = True,
 ) -> torch.Tensor:
-    """
-    Apply combined top-k and top-p masking using Triton.
+    """Apply combined top-k and top-p masking using Triton.
 
     Top-k is applied first (by logit value), then top-p is applied
     to the remaining k values (by probability).
@@ -1628,9 +1645,13 @@ def apply_top_k_top_p_triton(
         p: [batch_size] float32 tensor of top-p values per row (0 to 1),
             or None to disable top-p
         mask_value: Value for masked positions (default: -inf)
+        has_topp_only_rows: Whether any row has p < 1 and k >= vocab_size.
+            False lets small batches skip the split top-p pipeline; pass it
+            only if no such row exists, as such a row would get no top-p.
 
     Returns:
         The masked logits tensor. It may or may not be modified in-place.
+
     """
     assert logits.ndim == 2
     assert logits.dtype == torch.float32
@@ -1709,7 +1730,7 @@ def apply_top_k_top_p_triton(
         mask_value,
         num_sm,
     )
-    if use_split:
+    if use_split and has_topp_only_rows:
         _apply_topp_split(logits, k_ptr, p_ptr, mask_value, num_sm)
 
     return logits

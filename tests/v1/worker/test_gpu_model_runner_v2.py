@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import contextlib
+from dataclasses import dataclass
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 import vllm.v1.worker.gpu.model_runner as model_runner_module
+from vllm.config import CacheConfig, ParallelConfig
 from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
@@ -17,8 +20,48 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.worker.gpu.async_utils import async_copy_to_np
 from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.model_runner import ExecuteModelState, GPUModelRunner
+from vllm.v1.worker.gpu.spec_decode.standalone_ar import speculator as ar_module
+from vllm.v1.worker.gpu.spec_decode.utils import get_drafter_hidden_states
+
+
+def test_non_last_pp_rank_uses_global_batch_for_sample_feedback():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.is_last_pp_rank = False
+    local_batch = object()
+    global_batch = SimpleNamespace(idx_mapping=object())
+    runner.pcp_manager = SimpleNamespace(
+        global_batch=global_batch,
+        restore_for_sampling=Mock(),
+    )
+    runner.pp_handler = SimpleNamespace(receive=Mock(return_value=False))
+    runner.postprocess_num_computed_tokens = Mock()
+    runner.model_state = SimpleNamespace(postprocess_state=Mock())
+    runner.kv_connector = SimpleNamespace(post_forward=Mock(return_value=None))
+    runner.eplb = SimpleNamespace(step=Mock())
+    runner.execute_model_state = ExecuteModelState(
+        input_batch=local_batch,
+        attn_metadata=None,
+        slot_mappings_by_layer=None,
+        hidden_states=None,
+        aux_hidden_states=None,
+        dp_sync_state=None,
+        finished_req_ids=set(),
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        num_spec_tokens_to_schedule=0,
+    )
+
+    runner.sample_tokens(None)
+
+    runner.pp_handler.receive.assert_called_once_with(global_batch)
+    runner.postprocess_num_computed_tokens.assert_called_once_with(global_batch)
+    runner.model_state.postprocess_state.assert_called_once_with(
+        global_batch.idx_mapping, 0
+    )
+    runner.pcp_manager.restore_for_sampling.assert_not_called()
 
 
 def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
@@ -126,7 +169,6 @@ def test_initialize_kv_cache_does_not_dcp_shard_mamba_block_table(
     expected: int,
 ):
     """Mamba/GDN block-table rows index global positions, unlike DCP KV."""
-
     max_model_len = 1_048_576
     attention_block_size = 1_536
     mamba_block_size = 16
@@ -199,7 +241,6 @@ def test_append_block_ids_rejects_write_past_row_capacity():
 
     block_tables = BlockTables.__new__(BlockTables)
     block_tables.num_kv_cache_groups = 1
-    block_tables.blocks_per_kv_block = [1]
     block_tables.block_tables = [_BlockTable()]
     block_tables.num_blocks = SimpleNamespace(
         np=torch.tensor([[0, 3]], dtype=torch.int32)
@@ -222,7 +263,9 @@ def _make_capture_runner(captured: bool) -> GPUModelRunner:
     """Minimal V2 runner for capture_model: fakes everything except the
     cudagraph_manager's needs_capture decision."""
     runner = GPUModelRunner.__new__(GPUModelRunner)
-    runner.model_state = SimpleNamespace(supports_mm_inputs=False)
+    runner.model_state = SimpleNamespace(
+        supports_mm_inputs=False, capture_inner_cudagraphs=lambda *args: None
+    )
     runner.cudagraph_manager = SimpleNamespace(
         needs_capture=lambda: captured,
         capture=lambda *args, **kwargs: None,
@@ -298,3 +341,321 @@ def test_capture_model_profile_only_skips_lock(monkeypatch):
     runner.capture_model(profile_only=True)
 
     assert lock_calls == []
+
+
+@pytest.mark.parametrize("target_buffer", ["absent", "none", "tensor"])
+def test_get_drafter_hidden_states_tolerates_missing_target_buffer(target_buffer):
+    """Targets allocate the MTP hidden buffer only for hidden-state drafters."""
+    hidden_states = torch.zeros(4, 8)
+    buffer = torch.arange(16 * 8, dtype=torch.float32).view(16, 8)
+    if target_buffer == "absent":
+        model = SimpleNamespace()
+    else:
+        returned = buffer if target_buffer == "tensor" else None
+        model = SimpleNamespace(get_mtp_target_hidden_states=lambda: returned)
+
+    out = get_drafter_hidden_states(model, hidden_states)
+
+    if target_buffer == "tensor":
+        assert torch.equal(out, buffer[:4])
+    else:
+        assert out is hidden_states
+
+
+def test_async_copy_to_np_does_not_alias_reused_buffer():
+    buffer = torch.zeros(4, dtype=torch.int64)
+
+    snapshot = async_copy_to_np(buffer)
+    buffer.fill_(1)
+
+    assert snapshot.tolist() == [0, 0, 0, 0]
+
+
+@pytest.mark.parametrize(
+    ("draft_dtype", "expected_dtype"),
+    [("auto", "auto"), ("bfloat16", "bfloat16"), (None, "fp8_e4m3")],
+)
+def test_standalone_draft_kv_dtype_override(monkeypatch, draft_dtype, expected_dtype):
+    @dataclass
+    class Config:
+        cache_config: CacheConfig
+        parallel_config: ParallelConfig
+        model_config: object
+        quant_config: object | None = None
+
+    target = Config(CacheConfig(cache_dtype="fp8_e4m3"), ParallelConfig(), object())
+    speculator = object.__new__(ar_module.StandaloneARSpeculator)
+    speculator.vllm_config = target
+    speculator.draft_model_config = object()
+    speculator.speculative_config = SimpleNamespace(
+        kv_cache_dtype=draft_dtype, draft_parallel_config=ParallelConfig()
+    )
+    get_model = Mock(return_value=object())
+    monkeypatch.setattr(ar_module, "get_model", get_model)
+    monkeypatch.setattr(ar_module, "set_model_tag", lambda _: contextlib.nullcontext())
+
+    speculator.load_draft_model(object(), set())
+
+    draft_config = get_model.call_args.kwargs["vllm_config"]
+    assert draft_config.cache_config.cache_dtype == expected_dtype
+    assert speculator.attn_vllm_config.cache_config.cache_dtype == expected_dtype
+    assert target.cache_config.cache_dtype == "fp8_e4m3"
+
+
+class _DeferredStream:
+    def __init__(self):
+        self.work = []
+        self.completed = 0
+
+    def finish_through(self, end):
+        while self.completed < end:
+            self.work[self.completed]()
+            self.completed += 1
+
+    def wait_stream(self, _stream):
+        pass
+
+
+class _DeferredEvent:
+    def __init__(self, **kwargs):
+        self.stream = None
+        self.end = 0
+
+    def record(self, stream):
+        self.stream = stream
+        self.end = len(stream.work)
+
+    def synchronize(self):
+        assert self.stream is not None
+        self.stream.finish_through(self.end)
+
+
+@pytest.mark.parametrize("depth", [1, 2, 3, 4])
+def test_input_buffer_lifetime_retires_delayed_readers_before_rotation(
+    monkeypatch, depth
+):
+    """An early token copy must not release UVA still read by the drafter."""
+    from vllm.v1.worker.gpu import buffer_utils
+    from vllm.v1.worker.gpu.async_utils import InputBufferLifetime
+    from vllm.v1.worker.gpu.sample.states import SamplingStates
+
+    class AliasedCpuBuffer:
+        def __init__(self, size, dtype):
+            self.cpu = torch.zeros(size, dtype=dtype)
+            self.np = self.cpu.numpy()
+
+        def uva(self, n=None):
+            return self.cpu if n is None else self.cpu[:n]
+
+    monkeypatch.setattr(buffer_utils, "is_uva_available", lambda: True)
+    monkeypatch.setattr(buffer_utils, "UvaBuffer", AliasedCpuBuffer)
+    monkeypatch.setattr(torch.cuda, "Event", _DeferredEvent)
+    lifetime = InputBufferLifetime(depth)
+    state = object.__new__(SamplingStates)
+    for name in ("temperature", "top_p", "top_k", "min_p", "seeds"):
+        setattr(
+            state,
+            name,
+            buffer_utils.UvaBackedTensor(
+                1, torch.float32, max_concurrency=lifetime.depth
+            ),
+        )
+    stream = _DeferredStream()
+    seen = []
+    for step in range(2 * lifetime.depth + 1):
+        lifetime.begin_step()
+        state.temperature.np[0] = step + 1
+        state.apply_staged_writes()
+        value = state.temperature.gpu
+        stream.work.append(lambda value=value: seen.append(float(value[0])))
+        # No get_output call: this also models a non-output TP rank.
+        lifetime.end_step(stream)
+    stream.finish_through(len(stream.work))
+    assert seen == list(range(1, 2 * lifetime.depth + 2))
+
+
+def test_input_buffer_lifetime_retains_non_output_rank_copy_sources(monkeypatch):
+    import gc
+    import weakref
+
+    from vllm.v1.worker.gpu.async_utils import InputBufferLifetime
+
+    monkeypatch.setattr(torch.cuda, "Event", _DeferredEvent)
+    lifetime = InputBufferLifetime(2)
+    stream = _DeferredStream()
+
+    class Output:
+        def __init__(self):
+            self.copy_event = _DeferredEvent()
+            self.copy_event.record(stream)
+
+    lifetime.begin_step()
+    output = Output()
+    reference = weakref.ref(output)
+    lifetime.end_step(stream, output)
+    del output
+    gc.collect()
+    assert reference() is not None
+    lifetime.begin_step()
+    lifetime.end_step(stream)
+    lifetime.begin_step()
+    gc.collect()
+    assert reference() is None
+
+
+def test_async_output_does_not_wait_for_post_sample_state_writes():
+    import numpy as np
+
+    from vllm.v1.outputs import ModelRunnerOutput
+    from vllm.v1.worker.gpu.async_utils import AsyncOutput
+
+    stream = _DeferredStream()
+    output = object.__new__(AsyncOutput)
+    output.copy_event = _DeferredEvent()
+    output.copy_event.record(stream)  # Token copy finishes before state write.
+    completed = []
+    stream.work.append(lambda: completed.append("state-write"))
+    output.execution_event = _DeferredEvent()
+    output.execution_event.record(stream)
+    output.model_runner_output = ModelRunnerOutput(["req"], {"req": 0})
+    output.sampled_token_ids = np.array([[7]])
+    output.num_sampled_tokens_np = np.array([1])
+    output.sampling_mask_tensors = None
+    output.num_nans = None
+    output.logprobs_tensors = None
+    output.prompt_logprobs_dict = {}
+    output.prompt_token_id_logprobs_dict = {}
+    output.pending_aux_output = None
+    output._has_fault = None
+    result = output.get_output()
+    assert result.sampled_token_ids == [[7]]
+    assert completed == []  # Delivery requires only the copied output.
+
+
+def test_input_buffer_lifetime_empty_step_is_sealed(monkeypatch):
+    from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
+    from vllm.v1.worker.gpu.async_utils import InputBufferLifetime
+
+    monkeypatch.setattr(torch.cuda, "Event", _DeferredEvent)
+    stream = _DeferredStream()
+    lifetime = InputBufferLifetime(2)
+    runner = SimpleNamespace(
+        input_buffer_lifetime=lifetime,
+        main_stream=stream,
+        update_pp_decode_requests=lambda: None,
+        finish_requests=lambda _: None,
+        free_states=lambda _: None,
+        add_requests=lambda _: None,
+        update_requests=lambda _: None,
+        block_tables=SimpleNamespace(apply_staged_writes=lambda: None),
+        aux_output_connector=None,
+        kv_connector=SimpleNamespace(no_forward=lambda _: EMPTY_MODEL_RUNNER_OUTPUT),
+        _merge_ec_connector_no_forward=lambda _, output: output,
+    )
+    for _ in range(3):
+        output = GPUModelRunner.execute_model(
+            runner, SimpleNamespace(total_num_scheduled_tokens=0)
+        )
+        assert output is EMPTY_MODEL_RUNNER_OUTPUT
+    assert not lifetime._active
+
+
+@pytest.mark.parametrize("num_drafts", [0, 1, 7])
+def test_sample_output_preserves_overlap_and_protects_input_reuse(
+    monkeypatch, num_drafts
+):
+    from vllm.v1.worker.gpu import async_utils
+    from vllm.v1.worker.gpu.sample.output import SamplerOutput
+
+    monkeypatch.setattr(torch.cuda, "Event", _DeferredEvent)
+    monkeypatch.setattr(async_utils, "stream", lambda *args: contextlib.nullcontext())
+    monkeypatch.setattr(
+        model_runner_module, "use_workspace_lane", lambda _: contextlib.nullcontext()
+    )
+    main_stream = _DeferredStream()
+    copy_stream = _DeferredStream()
+    completed = []
+    lifetime = async_utils.InputBufferLifetime(2)
+    lifetime.begin_step()
+    sampled = torch.tensor([[7]])
+    counts = torch.tensor([1], dtype=torch.int32)
+    rejected = torch.tensor([0], dtype=torch.int32)
+    sampler_output = SamplerOutput(sampled, None, None, counts, rejected)
+    batch = SimpleNamespace(
+        req_ids=["req"],
+        idx_mapping=torch.tensor([0]),
+        query_start_loc=torch.tensor([0, 1]),
+    )
+    state = SimpleNamespace(
+        input_batch=batch,
+        attn_metadata=None,
+        slot_mappings_by_layer=None,
+        hidden_states=torch.ones(1, 2),
+        aux_hidden_states=None,
+        dp_sync=None,
+        finished_req_ids=set(),
+        ec_connector_output=None,
+        cudagraph_stats=None,
+    )
+
+    def propose(*args, **kwargs):
+        main_stream.work.append(lambda: completed.append("draft"))
+        return torch.zeros((1, num_drafts), dtype=torch.int64)
+
+    speculator = (
+        SimpleNamespace(supports_mm_inputs=False, propose=propose)
+        if num_drafts
+        else None
+    )
+    runner = SimpleNamespace(
+        execute_model_state=state,
+        is_last_pp_rank=True,
+        pcp_manager=None,
+        pp_handler=None,
+        sample=lambda *args: (sampler_output, counts, rejected),
+        model=SimpleNamespace(compute_logits=None),
+        prompt_logprobs_worker=SimpleNamespace(
+            compute_prompt_logprobs=lambda *args: {},
+            compute_prompt_token_id_logprobs=lambda *args: {},
+        ),
+        req_states=SimpleNamespace(
+            all_token_ids=SimpleNamespace(gpu=None),
+            num_computed_tokens=SimpleNamespace(gpu=None),
+            prompt_len=SimpleNamespace(np=None),
+            last_sampled_tokens=sampled,
+            next_prefill_tokens=None,
+            draft_tokens=torch.zeros((1, num_drafts), dtype=torch.int64),
+        ),
+        aux_output_connector=None,
+        main_stream=main_stream,
+        output_copy_stream=copy_stream,
+        check_ep_fault=False,
+        speculator=speculator,
+        postprocess_sampled=lambda *args: main_stream.work.append(
+            lambda: completed.append("state")
+        ),
+        sampler=SimpleNamespace(
+            sampling_states=SimpleNamespace(
+                temperature=SimpleNamespace(gpu=None),
+                seeds=SimpleNamespace(gpu=None),
+            )
+        ),
+        _draft_workspace_lane=0,
+        adaptive_verification=None,
+        num_speculative_steps=num_drafts,
+        draft_tokens_handler=SimpleNamespace(set_draft_tokens=lambda *args: None),
+        kv_connector=SimpleNamespace(post_forward=lambda *args: None),
+        eplb=SimpleNamespace(step=lambda *args, **kwargs: None),
+        input_buffer_lifetime=lifetime,
+    )
+    output = GPUModelRunner.sample_tokens(runner, None)
+    assert completed == []  # Submission itself stays asynchronous.
+    assert output.get_output().sampled_token_ids == [[7]]
+    assert completed == []  # Host delivery overlaps pending state/draft work.
+    assert not lifetime._active
+    # Retire the input slot only when its pool is about to rotate back to it.
+    lifetime.begin_step()
+    assert completed == []
+    lifetime.end_step(main_stream)
+    lifetime.begin_step()
+    assert completed == (["state", "draft"] if num_drafts else ["state"])

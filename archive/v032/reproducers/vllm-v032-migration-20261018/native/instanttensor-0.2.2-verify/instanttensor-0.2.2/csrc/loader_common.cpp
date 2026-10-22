@@ -1,0 +1,862 @@
+#include <instant_tensor/loader.hpp>
+#include <instant_tensor/cleanup.hpp>
+
+
+namespace instanttensor {
+
+
+int Loader::next_loader_task_id() {
+    int request_id = this->loader_task_id;
+    this->loader_task_id = static_cast<int>((static_cast<unsigned int>(request_id) + 1U) & 0x7fffffffU);
+    return request_id;
+}
+
+int Loader::next_io_worker_task_id() {
+    int request_id = this->io_worker_task_id;
+    this->io_worker_task_id = static_cast<int>((static_cast<unsigned int>(request_id) + 1U) & 0x7fffffffU);
+    return request_id;
+}
+
+Loader::Loader(std::shared_ptr<SPSCQueue<RPCRequest>> input_queue, std::shared_ptr<SPSCQueue<RPCResponse>> output_queue, std::shared_ptr<OperationControl> control) {
+    this->control = std::move(control);
+    this->input_queue = std::move(input_queue);
+    this->output_queue = std::move(output_queue);
+    this->use_internal_memory_register = _env_use_internal_memory_register();
+}
+
+Loader::~Loader() noexcept {
+    // Failed workers cannot prove DMA quiescence: retain staging until process exit.
+    if (!this->threads_joined) return;
+    CleanupErrors errors;
+    errors.attempt([&] { this->destroy_threads(); });
+    errors.attempt([&] { this->destroy_buffer(); });
+    errors.attempt([&] { this->close_file(); });
+    try { errors.rethrow(); }
+    catch (const std::exception& error) {
+        fprintf(stderr, "InstantTensor residual cleanup: %s\n", error.what());
+    }
+}
+
+void Loader::open_file() {
+    if(!is_valid_backend(this->backend)) {
+        print_and_throw(std::runtime_error("Internal error: Unsupported backend: " + std::to_string(this->backend)));
+    }
+    for(size_t i = 0; i < this->file_info.size(); i++) {
+        this->control->check();
+        FileInfo& f = this->file_info[i];
+        f.in_memory = instanttensor::file_in_memory(f.filename);
+
+        if (this->backend == Backend::MMAP) {
+            this->open_file_inmem(f);
+        } else if (this->backend == Backend::CUFILE) {
+            this->open_file_cufile(f);
+        } else if (this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
+            this->open_file_uring(f);
+        } else if (this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
+            this->open_file_aio(f);
+        }
+    }
+    if(this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
+        this->initialize_aio_context();
+    }
+    if(this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
+        this->initialize_uring_context();
+    }
+}
+
+void Loader::close_file() {
+    CleanupErrors errors;
+    for(size_t i = 0; i < this->file_info.size(); i++) {
+        FileInfo& f = this->file_info[i];
+        if (this->backend == Backend::MMAP) {
+            errors.attempt([&] { this->close_file_inmem(f); });
+        } else if (this->backend == Backend::CUFILE) {
+            errors.attempt([&] { this->close_file_cufile(f); });
+        } else if (this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
+            errors.attempt([&] { this->close_file_uring(f); });
+        } else if (this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
+            errors.attempt([&] { this->close_file_aio(f); });
+        }
+    }
+    if(this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
+        errors.attempt([&] { this->destroy_aio_context(); });
+    }
+    if(this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
+        errors.attempt([&] { this->destroy_uring_context(); });
+    }
+    errors.rethrow();
+}
+
+void Loader::init_buffer() {
+    this->control->check();
+    this->rank_alignment = PAGE_SIZE;
+    this->world_chunk_alignment = this->rank_alignment * this->world_size;
+    if(this->rank_chunk_size % this->rank_alignment != 0) {
+        size_t new_chunk_size = ROUND_UP(this->rank_chunk_size, this->rank_alignment);
+        debug_log("Enlarge rank_chunk_size from %zu to %zu to align to %zu", this->rank_chunk_size, new_chunk_size, this->rank_alignment);
+        this->rank_chunk_size = new_chunk_size;
+    }
+    this->world_chunk_size = this->rank_chunk_size * this->world_size;
+
+    size_t inflight_device_buffer_size = required_buffer_size_for_io(
+        this->rank_chunk_size, this->io_depth, this->world_size);
+    if (this->buffer_size < inflight_device_buffer_size) this->buffer_size = inflight_device_buffer_size;
+
+    // At most first_tensor_alignment bytes are padded both before and after the chunk
+    // At most rank_alignment bytes are padded before a chunk if the previous chunk's size < world_chunk_size
+    // At most world_chunk_alignment bytes are padded after a chunk if its size < world_chunk_size
+    // For three tensors, these paddings exist at most 3 times
+    size_t padded_size = 3 * (this->first_tensor_alignment + this->rank_alignment + this->world_chunk_alignment); // can be any value that >= 0
+    this->buffer_size += padded_size;
+    CUDA_CHECK(cudaMalloc(&this->device_buffer, this->buffer_size));
+
+    if (this->backend == Backend::CUFILE) {
+        this->register_device_buffer_cufile();
+    }
+
+    if (this->need_host_buffer) {
+        size_t inflight_host_buffer_size = this->io_depth * this->rank_chunk_size;
+        size_t host_buffer_size = inflight_host_buffer_size;
+        this->host_buffer_entry = host_buffer_cache->get(host_buffer_size);
+        if (this->host_buffer_entry.ptr == NULL) {
+            // aligned_alloc + cudaHostRegister is faster than cudaHostAlloc
+            this->host_buffer_entry.ptr = aligned_alloc(this->rank_alignment, host_buffer_size);
+            if (this->host_buffer_entry.ptr == NULL) {
+                throw std::runtime_error("Failed to allocate host buffer: " + std::string(strerror(errno)));
+            }
+
+            // NOTE: cudaHostRegisterReadOnly is not used since the host buffer is writable for the CPU
+            // Own the ordinary allocation even when pinning fails.
+            this->host_buffer_entry.size = host_buffer_size;
+            this->host_buffer_entry.deleter = [](void *ptr) { free(ptr); };
+            CUDA_CHECK(cudaHostRegister(this->host_buffer_entry.ptr, host_buffer_size, this->cuda_host_register_flags));
+
+            this->host_buffer_entry.size = host_buffer_size;
+            this->host_buffer_entry.deleter = [](void *ptr) {
+                CleanupErrors errors;
+                errors.attempt([&] { CUDA_CHECK(cudaHostUnregister(ptr)); });
+                free(ptr);
+                errors.rethrow();
+            };
+        }
+        this->host_buffer = (char*)this->host_buffer_entry.ptr;
+    }
+
+    if (this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
+        this->register_host_buffer_uring();
+    }
+}
+
+void Loader::destroy_buffer() {
+    CleanupErrors errors;
+    if (this->backend == Backend::CUFILE) {
+        errors.attempt([&] { this->deregister_device_buffer_cufile(); });
+    }
+    if (this->device_buffer) {
+        errors.attempt([&] {
+            CUDA_CHECK(cudaFree(this->device_buffer));
+            this->device_buffer = nullptr;
+        });
+    }
+    if (this->need_host_buffer && this->host_buffer_entry.ptr) {
+        if (this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
+            errors.attempt([&] { this->deregister_host_buffer_uring(); });
+        }
+        errors.attempt([&] {
+            if (_env_cache_buffer() && this->host_buffer) {
+                host_buffer_cache->put(std::move(this->host_buffer_entry));
+            } else {
+                this->host_buffer_entry.deleter(this->host_buffer_entry.ptr);
+            }
+        });
+        this->host_buffer_entry.ptr = nullptr;
+        this->host_buffer = nullptr;
+    }
+    errors.rethrow();
+}
+
+void Loader::init_threads() {
+    this->control->check();
+    auto driver_factory = [=]() {
+        CUDA_CHECK(cudaSetDevice(this->device_idx));
+        return std::make_unique<FunctionWorkerDriver>();
+    };
+
+    if(this->need_worker_threads) {
+        if(!this->worker_threads) {
+            this->worker_threads = std::make_unique<ThreadPoolTaskExecutor>(this->concurrency, driver_factory);
+        }
+    }
+    if(!this->io_thread) {
+        IOWorkerDriver::PollCompletions poll;
+        if (this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
+            poll = [this](auto& completed) { this->poll_aio(completed); };
+        } else if (this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
+            poll = [this](auto& completed) { this->poll_uring(completed); };
+        } else {
+            poll = [this](auto& completed) { this->poll_worker_completions(completed); };
+        }
+        this->io_thread = std::make_unique<IOExecutor>(
+            std::move(poll), [this]() { this->abort_io(); },
+            _env_debug() ? &this->io_stats : nullptr);
+    }
+    if (this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
+        if (!this->last_page_reader_thread) {
+            this->last_page_reader_thread = std::make_unique<SingleThreadTaskExecutor>(driver_factory);
+        }
+    }
+    if(!this->cuda_executor) {
+        this->cuda_executor = std::make_unique<CUDAExecutor>(
+            this->device_idx, _env_debug() ? &this->cuda_stats : nullptr);
+    }
+    if(!this->cuda_stream) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&this->cuda_stream, cudaStreamNonBlocking));
+    }
+    if(!this->nccl_stream) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&this->nccl_stream, cudaStreamNonBlocking));
+    }
+
+    this->cuda_events.resize(this->io_depth);
+    for(size_t i = 0; i < this->io_depth; i++) {
+        this->control->check();
+        CUDA_CHECK(cudaEventCreateWithFlags(&this->cuda_events[i], cudaEventDisableTiming));
+    }
+
+}
+
+void Loader::poll_worker_completions(std::vector<IOCompletion> &completed) {
+    if (!this->worker_threads) return;
+    ThreadPoolTaskExecutor::ResultItem result;
+    while (this->worker_threads->try_reap_any(result)) {
+        std::exception_ptr error;
+        if (result.value.type() == typeid(std::exception_ptr)) {
+            error = std::any_cast<std::exception_ptr>(result.value);
+        }
+        completed.push_back({result.request_id, error});
+    }
+}
+
+void Loader::abort_io() {
+    if (this->worker_threads) {
+        this->worker_threads->join();
+    }
+    if (this->aio_context_initialized) {
+        if (this->last_page_reader_thread) {
+            this->drain_aio_submissions();
+            this->last_page_reader_thread->join();
+        }
+        this->destroy_aio_context();
+        this->aio_last_page_submissions.clear();
+    }
+    if (this->uring_context_initialized) {
+        this->abort_io_uring();
+    }
+}
+
+IOCompletion Loader::complete_native_read(chunk_id_t id, ssize_t result) {
+    Chunk &chunk = this->chunks[id];
+    ChunkIOState &state = chunk.io_state;
+    IOCompletion completion{state.io_request_id, {}};
+    try {
+        if (result == -EAGAIN || result == -EINTR) {
+            completion.retry = true;
+            return completion;
+        }
+        std::string name = backend_to_string(this->backend);
+        if (result == 0 && state.bytes_completed < state.rank_size) {
+            throw std::runtime_error(name + " unexpected EOF for chunk id: " + std::to_string(id));
+        }
+        if (result < 0) {
+            throw std::runtime_error(name + " read error for chunk id: " +
+                std::to_string(id) + ", error: " + strerror(-result));
+        }
+        size_t read_offset = ROUND_DOWN(state.bytes_completed, this->rank_alignment);
+        size_t covered = read_offset + static_cast<size_t>(result);
+        state.bytes_completed = std::min(state.rank_size,
+            std::max(state.bytes_completed, covered));
+        if (state.bytes_completed >= state.rank_size) {
+            return completion;
+        }
+        completion.retry = true;
+    } catch (...) {
+        completion.error = std::current_exception();
+    }
+    return completion;
+}
+
+void Loader::destroy_threads() {
+    CleanupErrors joins;
+    if (this->cuda_executor) {
+        joins.attempt([&] {
+            this->cuda_executor->join();
+        });
+    }
+    if (this->io_thread) {
+        joins.attempt([&] {
+            this->io_thread->join();
+        });
+    }
+    if (this->worker_threads) {
+        joins.attempt([&] {
+            this->worker_threads->join();
+        });
+    }
+    if (this->last_page_reader_thread) {
+        joins.attempt([&] { this->drain_aio_submissions(); });
+        joins.attempt([&] { this->last_page_reader_thread->join(); });
+    }
+    joins.rethrow();
+    this->threads_joined = true;
+    CleanupErrors errors;
+    for (auto& event : this->cuda_events) {
+        if (event) errors.attempt([&] {
+            CUDA_CHECK(cudaEventDestroy(event));
+            event = nullptr;
+        });
+    }
+    if (this->cuda_stream) {
+        errors.attempt([&] { CUDA_CHECK(cudaStreamDestroy(this->cuda_stream)); });
+        this->cuda_stream = nullptr;
+    }
+    if (this->nccl_stream) {
+        errors.attempt([&] { CUDA_CHECK(cudaStreamDestroy(this->nccl_stream)); });
+        this->nccl_stream = nullptr;
+    }
+    errors.rethrow();
+}
+
+/*
+ * Compute: 1) addresses of the tensors in the buffer, 2) each chunk's range, 3) prefetch chunk for each tensor
+ */
+void Loader::compute_layout(const vector<pair<size_t, size_t>>& tensor_offsets,
+                            const vector<bool>& tensor_keep) {// list[(file_index, tensor_offset)]
+    // NOTE: One chunk is a group of contiguous tensors, may have left and right non-tensor paddings.
+    //       It may correspond to at most three types of storage: file, host buffer, device buffer.
+    //       The size and offset of the file storage and the host buffer of a chunk is aligned to rank_alignment (== PAGE_SIZE)
+    //       since libaio with O_DIRECT requres page-aligned I/O. (cuFile does not require this)
+    //       The size of the device buffer of a chunk is aligned to world_chunk_alignment for ncclAllGather, and the offset is set to let tensors aligned (see below).
+    // NOTE: We set the device buffer offset of the first chunk of a file properly
+    //       to let the device buffer offset of the first tensor be aligned to first_tensor_alignment.
+    //       Since for any dtype (FP32/FP16/...), first_tensor_alignment % sizeof(dtype) == 0, the first tensor is always dtype-aligned.
+    //       Consecutive tensors in current and consecutive chunks are then also dtype-aligned since the tensors
+    //       are listed in the order of decreasing dtype size (e.g., FP32->FP16/BF16->FP8/INT8) in safetensors files.
+    size_t chunk_file_index = 0;
+    size_t chunk_file_offset = 0; // The chunk offset from the beginning of the file, aligned to rank_alignment (typically == PAGE_SIZE)
+    size_t chunk_device_buffer_offset = 0;
+    size_t current_chunk_size = 0;
+    size_t current_chunk_payload_size = 0;
+
+    // Points to the current tensor
+    size_t tensor_id = 0;
+    // Points to the earliest tensor that is still in the device buffer
+    // in_buffer_tensor_id increases with tensor_id and satisfies in_buffer_tensor_id <= tensor_id
+    size_t in_buffer_tensor_id = 0;
+    // Points to the tensor with the smallest device memory address
+    // left_most_tensor_id increases with tensor_id and satisfies in_buffer_tensor_id <= left_most_tensor_id <= tensor_id
+    size_t left_most_tensor_id = 0;
+
+    size_t num_files = tensor_offsets[tensor_offsets.size() - 1].first + 1;
+    size_t num_tensors = tensor_offsets.size() - num_files; // for each file, num_offsets = num_tensors + 1
+    if (!tensor_keep.empty() && tensor_keep.size() != num_tensors) {
+        throw std::invalid_argument("tensor_keep must have one entry per tensor");
+    }
+    this->tensors.resize(tensor_keep.empty() ? num_tensors :
+                         std::count(tensor_keep.begin(), tensor_keep.end(), true));
+    size_t source_tensor_id = 0;
+
+    auto tensor_device_buffer_offset = [&](size_t tensor_file_offset) -> size_t {
+        return tensor_file_offset - chunk_file_offset + chunk_device_buffer_offset;
+        // assert(tensor_file_offset - chunk_file_offset == current_chunk_size);
+    };
+
+    auto finish_chunk = [&]() {
+        // Between reset_chunk_file() and an immediate reset_chunk_buffer_offset(),
+        // this can run with only a page prefix and no tensor payload.
+        if(current_chunk_payload_size == 0) {
+            return;
+        }
+        // ROUND_UP/DOWN make real effect only at the right most chunk
+        this->chunks.push_back(Chunk{current_chunk_size, chunk_file_index, chunk_file_offset, chunk_device_buffer_offset, {}});
+
+        if(chunk_file_offset % this->rank_alignment != 0) {
+            throw std::runtime_error("Internal error: Chunk alignment error.");
+        }
+
+        // may reread the last file page
+        chunk_file_offset += ROUND_DOWN(current_chunk_size, this->rank_alignment);
+        chunk_device_buffer_offset += ROUND_UP(current_chunk_size, this->world_chunk_alignment);
+        // equals to "current_chunk_size -= ROUND_DOWN(current_chunk_size, this->rank_alignment);""
+        current_chunk_size %= this->rank_alignment;
+        current_chunk_payload_size = 0;
+
+
+        chunk_id_t prev_chunk_id = (chunk_id_t)this->chunks.size() - 2;
+        while(in_buffer_tensor_id < left_most_tensor_id
+            && (this->tensors[in_buffer_tensor_id].size == 0 ||
+                this->chunks[this->tensors[in_buffer_tensor_id].first_chunk_id].device_buffer_offset < chunk_device_buffer_offset)) {
+            this->tensors[in_buffer_tensor_id].prefetch_chunk_id = prev_chunk_id;
+            in_buffer_tensor_id++;
+        }
+    };
+    auto reset_chunk_buffer_offset = [&](size_t new_left_most_tensor_id) {
+        if(current_chunk_size >= this->rank_alignment) {
+            print_and_throw(std::runtime_error("Internal error: Unchunked page detected when resetting chunk buffer offset."));
+        }
+        chunk_id_t latest_chunk_id = (chunk_id_t)this->chunks.size() - 1;
+        while(in_buffer_tensor_id < left_most_tensor_id) {
+            this->tensors[in_buffer_tensor_id].prefetch_chunk_id = latest_chunk_id;
+            in_buffer_tensor_id++;
+        }
+        chunk_device_buffer_offset = this->first_tensor_alignment - current_chunk_size % this->first_tensor_alignment; // make the first tensor address aligned to first_tensor_alignment
+        left_most_tensor_id = new_left_most_tensor_id;
+    };
+    auto reset_chunk_file = [&](size_t file_index, size_t file_offset) {
+        if(current_chunk_size >= this->rank_alignment) {
+            print_and_throw(std::runtime_error("Internal error: Unchunked page detected when resetting chunk file offset."));
+        }
+        chunk_file_index = file_index;
+        chunk_file_offset = ROUND_DOWN(file_offset, this->rank_alignment);
+        current_chunk_size = file_offset % this->rank_alignment;
+        chunk_device_buffer_offset = ROUND_UP(chunk_device_buffer_offset, this->first_tensor_alignment) + this->first_tensor_alignment - current_chunk_size % this->first_tensor_alignment; // make the first tensor address aligned to first_tensor_alignment
+    };
+
+
+    reset_chunk_file(tensor_offsets[0].first, tensor_offsets[0].second);
+
+    for (size_t i = 0; i < tensor_offsets.size() - 1; i++) {
+        size_t file_index = tensor_offsets[i].first;
+        size_t tensor_file_offset = tensor_offsets[i].second;
+        size_t next_file_index = tensor_offsets[i + 1].first;
+        size_t next_tensor_offset = tensor_offsets[i + 1].second;
+        if (file_index != next_file_index) {
+            finish_chunk();
+            reset_chunk_file(next_file_index, next_tensor_offset);
+            continue;
+        }
+        if (!tensor_keep.empty() && !tensor_keep[source_tensor_id++]) {
+            finish_chunk();
+            reset_chunk_file(file_index, next_tensor_offset);
+            continue;
+        }
+        if(current_chunk_size != tensor_file_offset - chunk_file_offset) {
+            throw std::runtime_error("Internal error: Unchunked file size mismatch.");
+        }
+        size_t tensor_size = next_tensor_offset - tensor_file_offset;
+        if (tensor_size > this->buffer_size) {
+            print_and_throw(std::runtime_error("Internal error: Buffer size is smaller than a single tensor size. This should be forbidden by the python frontend."));
+        }
+        if (chunk_device_buffer_offset + ROUND_UP(current_chunk_size + tensor_size, this->world_chunk_alignment) > this->buffer_size) {
+            finish_chunk();
+            // place the tensor at the beginning of the buffer
+            reset_chunk_buffer_offset(tensor_id);
+        }
+        // Finish a full chunk before assigning the next tensor's first chunk ID.
+        if (current_chunk_size == this->world_chunk_size) {
+            finish_chunk();
+        }
+        chunk_id_t next_chunk_id = static_cast<chunk_id_t>(this->chunks.size());
+        // Empty tensors anchor to the previous emitted chunk, or -1 if none exists.
+        chunk_id_t first_chunk_id = tensor_size ? next_chunk_id : next_chunk_id - 1;
+        size_t _tensor_device_buffer_offset = tensor_device_buffer_offset(tensor_file_offset);
+        size_t tensor_size_left = tensor_size;
+        while(current_chunk_size + tensor_size_left > this->world_chunk_size) {
+        this->control->check();
+            size_t size_add = this->world_chunk_size - current_chunk_size;
+            current_chunk_size += size_add;
+            current_chunk_payload_size += size_add;
+            tensor_size_left -= size_add;
+            finish_chunk();
+        }
+        current_chunk_size += tensor_size_left;
+        current_chunk_payload_size += tensor_size_left;
+        chunk_id_t last_chunk_id = tensor_size ? static_cast<chunk_id_t>(this->chunks.size()) : first_chunk_id;
+        this->tensors[tensor_id] = TensorMetadate{tensor_size, file_index, tensor_file_offset, _tensor_device_buffer_offset, first_chunk_id, last_chunk_id, 0};
+
+        tensor_id ++;
+    }
+    finish_chunk();
+    // set prefetch_chunk_id of the remaining second-to-last layer tensors to the last chunk
+    reset_chunk_buffer_offset(tensor_id);
+    // set prefetch_chunk_id of all last layer tensors to the last chunk
+    reset_chunk_buffer_offset(tensor_id);
+
+
+    // // for debugging. Uncomment to print the layout of the tensors and chunks
+    // if(this->rank == 0) {
+    //     size_t min_alignment = this->tensors[0].file_offset & -this->tensors[0].file_offset;
+    //     for(size_t i = 0; i < this->tensors.size(); i++) {
+    //         min_alignment = std::min(min_alignment, this->tensors[i].file_offset & -this->tensors[i].file_offset);
+    //     }
+    //     fprintf(stderr, "min_alignment = %zu\n", min_alignment);
+    //     for(size_t i = 0; i < this->tensors.size(); i++) {
+    //         fprintf(stderr, "tensor %zu: size = %zu, file_index = %zu, file_offset = %zu, buffer_offset = %zu, last_chunk_id = %zu, prefetch_chunk_id = %zu\n", 
+    //             i, this->tensors[i].size, this->tensors[i].file_index, this->tensors[i].file_offset, this->tensors[i].device_buffer_offset, this->tensors[i].last_chunk_id, this->tensors[i].prefetch_chunk_id);
+    //     }
+    //     for(size_t i = 0; i < this->chunks.size(); i++) {
+    //         fprintf(stderr, "chunk %zu: size = %zu, file_index = %zu, file_offset = %zu, buffer_offset = %zu, file_page = %zu-%zu, buffer_page = %zu-%zu\n", 
+    //             i, this->chunks[i].size, this->chunks[i].file_index, this->chunks[i].file_offset, this->chunks[i].device_buffer_offset,
+    //             this->chunks[i].file_offset / PAGE_SIZE, (this->chunks[i].file_offset + this->chunks[i].size - 1) / PAGE_SIZE,
+    //             this->chunks[i].device_buffer_offset / PAGE_SIZE, (this->chunks[i].device_buffer_offset + this->chunks[i].size - 1) / PAGE_SIZE
+    //         );
+    //     }
+    // }
+}
+
+void Loader::open(OpenArgs args) {
+    this->control->check();
+    this->file_info.resize(args.filenames.size());
+    for(size_t i = 0; i < args.filenames.size(); i++) {
+        this->file_info[i].filename = args.filenames[i];
+    }
+    this->device_idx = args.device_idx;
+    this->group_communicator = args.group_communicator;
+    this->rank = args.rank;
+    this->world_size = args.world_size;
+    this->buffer_size = args.buffer_size;
+    this->rank_chunk_size = args.chunk_size;
+    this->concurrency = args.concurrency;
+    this->io_depth = args.io_depth;
+    this->backend = args.backend;
+    this->io_retry_warning_emitted = false;
+
+    if(this->rank_chunk_size == 0) {
+        print_and_throw(std::invalid_argument("chunk_size must be greater than zero"));
+    }
+    if(ROUND_UP(this->rank_chunk_size, PAGE_SIZE) > MAX_CHUNK_SIZE) {
+        print_and_throw(std::invalid_argument(
+            "chunk_size must be no greater than " + std::to_string(MAX_CHUNK_SIZE) +
+            " bytes after page alignment"));
+    }
+    if(this->concurrency == 0 &&
+       (this->backend == Backend::MMAP || this->backend == Backend::CUFILE)) {
+        print_and_throw(std::invalid_argument("concurrency must be greater than zero"));
+    }
+    if(this->io_depth == 0 || this->io_depth > MAX_IO_DEPTH) {
+        print_and_throw(std::invalid_argument(
+            "io_depth must be between 1 and " + std::to_string(MAX_IO_DEPTH)));
+    }
+
+    if (this->world_size > 1 && this->group_communicator == NULL) {
+        print_and_throw(std::runtime_error("Internal error: A communicatior should be provided if world_size > 1"));
+    }
+    if (this->world_size == 1 && this->group_communicator != NULL) {
+        print_and_throw(std::runtime_error("Internal error: A communicatior should not be provided if world_size == 1"));
+    }
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+    CUDA_CHECK(cudaSetDevice(this->device_idx));
+    auto t1 = std::chrono::high_resolution_clock::now();
+
+    // this->init_comm();
+    auto t2 = std::chrono::high_resolution_clock::now();
+    this->open_file();// NOTE: this should be called before init_buffer/init_threads/
+    auto t3 = std::chrono::high_resolution_clock::now();
+    this->init_buffer();
+    auto t4 = std::chrono::high_resolution_clock::now();
+    this->init_threads();
+    auto t5 = std::chrono::high_resolution_clock::now();
+    for (auto* executor : {static_cast<CUDAExecutorBase*>(this->cuda_executor.get())}) {
+        if (executor) executor->set_operation_control(this->control);
+    }
+    if (this->io_thread) this->io_thread->set_operation_control(this->control);
+    if (this->worker_threads) this->worker_threads->set_operation_control(this->control);
+    if (this->last_page_reader_thread) this->last_page_reader_thread->set_operation_control(this->control);
+    this->compute_layout(args.tensor_offsets, args.tensor_keep);
+    auto t6 = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> d1 = t1 - t0;
+    std::chrono::duration<double> d2 = t2 - t1;
+    std::chrono::duration<double> d3 = t3 - t2;
+    std::chrono::duration<double> d4 = t4 - t3;
+    std::chrono::duration<double> d5 = t5 - t4;
+    std::chrono::duration<double> d6 = t6 - t5;
+    if(_env_debug()) {
+        debug_log("Config: rank=%d/%d, backend=%s, concurrency=%zu, device_buffer_size=%zu, host_buffer_size=%zu, chunk_size=%zu, io_depth=%zu, device=%d, communicator=%p",
+            this->rank, this->world_size, backend_to_string(this->backend).c_str(), this->concurrency, this->buffer_size, this->host_buffer_entry.size, this->rank_chunk_size, this->io_depth, this->device_idx, (void*)(this->group_communicator));
+        debug_log("Open time: device=%f, comm=%f, file=%f, buffer=%f, threads=%f, layout=%f", d1.count(), d2.count(), d3.count(), d4.count(), d5.count(), d6.count());
+    }
+}
+
+void Loader::close(CloseArgs args) {
+    this->stop = true;
+    auto t0 = std::chrono::high_resolution_clock::now();
+    CleanupErrors errors;
+    errors.attempt([&] { this->destroy_threads(); });
+    // A failed join leaves buffer ownership unresolved.
+    if (!this->threads_joined) errors.rethrow();
+    auto t1 = std::chrono::high_resolution_clock::now();
+    errors.attempt([&] { this->destroy_buffer(); });
+    auto t2 = std::chrono::high_resolution_clock::now();
+    errors.attempt([&] { this->close_file(); });
+    auto t3 = std::chrono::high_resolution_clock::now();
+    // this->destroy_comm();
+    auto t4 = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> d1 = t1 - t0;
+    std::chrono::duration<double> d2 = t2 - t1;
+    std::chrono::duration<double> d3 = t3 - t2;
+    std::chrono::duration<double> d4 = t4 - t3;
+    if(_env_debug()) {
+        debug_log("Close time: threads=%f, buffer=%f, file=%f, comm=%f", d1.count(), d2.count(), d3.count(), d4.count());
+        auto counts = this->cuda_stats.average_stage_counts();
+        debug_log("Average queue depth: IO=%.3f, IO_READY=%.3f, CUDA=%.3f",
+            this->io_stats.average_active_tasks(), counts[0], counts[1]);
+    }
+    errors.rethrow();
+}
+
+void Loader::set_fatal_error(std::exception_ptr error) {
+    if (!this->fatal_error) {
+        this->fatal_error = std::move(error);
+    }
+}
+
+void Loader::rethrow_fatal_error() const {
+    if (this->fatal_error) {
+        std::rethrow_exception(this->fatal_error);
+    }
+}
+
+void Loader::post_read_chunk() {
+    this->chunk_reading.store(this->chunk_reading.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    chunk_id_t chunk_id = this->chunk_reading.load(std::memory_order_relaxed);
+    Chunk &chunk = this->chunks[chunk_id];
+
+    // only the right most chunks of files and of buffers may not be aligned and need padding
+    size_t padded_world_chunk_size = ROUND_UP(chunk.size, this->world_chunk_alignment);
+    size_t padded_rank_size = padded_world_chunk_size / this->world_size;
+    size_t rank_offset = padded_rank_size * this->rank;
+    size_t rank_size = rank_logical_size(chunk.size, rank_offset, padded_rank_size);
+    size_t window_idx = chunk_id % this->io_depth;
+    size_t window_offset = window_idx * this->rank_chunk_size;
+    void *rank_dst = (char*)this->device_buffer + chunk.device_buffer_offset + rank_offset;
+    void *all_dst = (char*)this->device_buffer + chunk.device_buffer_offset;
+
+    cudaEvent_t event = this->cuda_events[window_idx];// NOTE: cudaEvent_t is a pointer type
+
+    chunk_id_t wait_chunk_id = max(
+        chunk_id - (chunk_id_t)MAX_IO_DEPTH,
+        chunk_id - (chunk_id_t)this->io_depth);
+    if(wait_chunk_id >= 0) {
+        // wait for the SingleThreadTaskExecutor to be available to post tasks
+        // and wait for existing usage of host_buffer
+        this->wait_read_chunk(wait_chunk_id);
+    }
+
+    // if(_env_debug()) {
+    //     if (this->rank == 0 && this->prev_file_index != chunk.file_index) {
+    //         this->prev_file_index = chunk.file_index;
+    //         fprintf(stderr, "file_index = %zu\n", chunk.file_index);
+    //     }
+    // }
+
+    FileInfo &f = this->file_info[chunk.file_index];
+    chunk.io_state.rank_size = rank_size;
+    chunk.io_state.rank_file_offset = chunk.file_offset + rank_offset;
+    chunk.io_state.window_offset = window_offset;
+    ChunkIOParams params{chunk_id, chunk, f, window_idx, rank_dst, all_dst, event};
+
+    IORequest io_request;
+    if (this->backend == Backend::MMAP) {
+        io_request = this->post_read_chunk_inmem(params);
+    } else if (this->backend == Backend::CUFILE) {
+        io_request = this->post_read_chunk_cufile(params);
+    } else if (this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
+        io_request = this->post_read_chunk_uring(params);
+    } else if (this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
+        io_request = this->post_read_chunk_aio(params);
+    }
+
+    bool loaded_to_device = io_request.loaded_to_device;
+    auto launch = [this, loaded_to_device, rank_dst, window_offset, rank_size,
+                   event, padded_rank_size, all_dst]() {
+        if (!loaded_to_device) {
+            CUDA_CHECK(cudaMemcpyAsync(
+                rank_dst, (char*)this->host_buffer + window_offset,
+                rank_size, cudaMemcpyHostToDevice, this->cuda_stream));
+        }
+        CUDA_CHECK(cudaEventRecord(event, this->cuda_stream));
+        if (this->world_size > 1) {
+            CUDA_CHECK(cudaStreamWaitEvent(this->nccl_stream, event));
+            NCCL_CHECK(ncclAllGather(
+                rank_dst, all_dst, padded_rank_size, ncclInt8,
+                this->group_communicator, this->nccl_stream));
+            CUDA_CHECK(cudaEventRecord(event, this->nccl_stream));
+        }
+    };
+    int completion_req_id = this->next_loader_task_id();
+    this->cuda_executor->submit(completion_req_id, CUDAOperation{
+        io_request, std::move(launch), event});
+    ChunkIOState &state = chunk.io_state;
+    state.cuda_executor = this->cuda_executor.get();
+    state.cuda_request_id = completion_req_id;
+}
+
+void Loader::poll_read_chunk() {
+    chunk_id_t next_chunck_id = this->chunk_read.load(std::memory_order_relaxed) + 1;
+    while(next_chunck_id <= this->chunk_reading.load(std::memory_order_relaxed)) {
+        this->control->check();
+        ChunkIOState &state = this->chunks[next_chunck_id].io_state;
+        std::any ignored;
+        if(!state.cuda_executor->try_reap(state.cuda_request_id, ignored)) {
+            break;
+        }
+        next_chunck_id++;
+    }
+    this->chunk_read.store(next_chunck_id - 1, std::memory_order_relaxed);
+}
+
+void Loader::wait_read_chunk(chunk_id_t chunk_id) {
+    chunk_id_t next_chunck_id = this->chunk_read.load(std::memory_order_relaxed) + 1;
+    if(chunk_id > this->chunk_reading.load(std::memory_order_relaxed)) {
+        print_and_throw(std::runtime_error("Internal error: chunk_id out of range."));
+    }
+    while(next_chunck_id <= chunk_id) {
+        this->control->check();
+        ChunkIOState &state = this->chunks[next_chunck_id].io_state;
+        state.cuda_executor->reap(state.cuda_request_id);
+        next_chunck_id++;
+    }
+    this->chunk_read.store(next_chunck_id - 1, std::memory_order_relaxed);
+}
+
+void Loader::step() {
+    this->post_read_chunk();
+    this->poll_read_chunk();
+}
+
+bool Loader::can_step() {
+    if(this->tensors.size() == 0) { // not opened
+        return false;
+    }
+    if(this->current_tensor_index >= this->tensors.size()) {
+        print_and_throw(std::runtime_error("Internal error: current_tensor_index (" + std::to_string(this->current_tensor_index) + ") out of range (" + std::to_string(this->tensors.size()) + ")."));
+    }
+    TensorMetadate& tensor = this->tensors[this->current_tensor_index];
+    chunk_id_t prefetch_chunk_id = tensor.prefetch_chunk_id;
+
+    if(this->chunk_reading.load(std::memory_order_relaxed) > prefetch_chunk_id) {
+        print_and_throw(std::runtime_error("Internal error: chunk_reading is greater than prefetch_chunk_id."));
+    }
+    return this->chunk_reading.load(std::memory_order_relaxed) < prefetch_chunk_id;
+}
+
+void Loader::try_step() {
+    if(this->can_step()) {
+        this->step();
+    }
+    else {
+        this->poll_read_chunk();
+    }
+}
+
+void Loader::wait_step(chunk_id_t chunk_id) {
+    while (this->chunk_read.load(std::memory_order_relaxed) < chunk_id) {
+        this->control->check();
+        if(this->can_step()) {
+            this->step();
+        }
+        else {
+            this->wait_read_chunk(chunk_id);
+        }
+    }
+}
+
+void* Loader::get_tensor_ptr(GetTensorArgs args) {
+    auto index = args.tensor_index;
+
+    if (index >= this->tensors.size()) {
+        print_and_throw(std::runtime_error("Internal error: index out of range."));
+    }
+
+    if (index < this->current_tensor_index) {
+        print_and_throw(std::runtime_error("Should call get_tensor_ptr(key) with keys in order of keys()."));
+    }
+    if (index > this->current_tensor_index + 1) {
+        fprintf(stderr, "WARNING: index jumped from %zu to %zu\n", this->current_tensor_index, index);
+    }
+    this->current_tensor_index = index;
+
+    TensorMetadate& tensor = this->tensors[this->current_tensor_index];
+    chunk_id_t last_chunk_id = tensor.last_chunk_id;
+
+    this->wait_step(last_chunk_id);
+
+    return (char*)this->device_buffer + this->tensors[index].device_buffer_offset;
+}
+
+std::any Loader::dispatch(const RPCRequest &m) {
+    switch (m.op) {
+        case OPEN:
+            this->open(std::any_cast<OpenArgs>(m.args));
+            return std::any();
+        case CLOSE:
+            this->close(std::any_cast<CloseArgs>(m.args));
+            return std::any();
+        case GET_TENSOR_PTR:
+            void* ret = this->get_tensor_ptr(std::any_cast<GetTensorArgs>(m.args));
+            return std::any(ret);
+    }
+    print_and_throw(std::runtime_error("Invalid operation"));
+}
+
+void Loader::run() {
+    while (!this->stop.load(std::memory_order_relaxed)) {
+        this->control->check();
+        bool should_dispatch = false;
+        try {
+            should_dispatch = this->fatal_error || !this->can_step() || !this->input_queue->empty();
+        }
+        catch (...) {
+            this->set_fatal_error(std::current_exception());
+            should_dispatch = true;
+        }
+
+        if (should_dispatch) {
+            RPCRequest m;
+            while (!this->input_queue->try_pop(m)) {
+                this->control->check();
+                std::this_thread::yield();
+            }
+            try {
+                if (m.op != CLOSE) {
+                    this->rethrow_fatal_error(); // throw this to catch
+                }
+                std::any ret = this->dispatch(m);
+                RPCResponse response{m.id, std::move(ret)};
+                while (!this->output_queue->try_push(std::move(response))) {
+                    this->control->check();
+                    std::this_thread::yield();
+                }
+            }
+            catch (...) {
+                auto error = std::current_exception();
+                this->set_fatal_error(error);
+                RPCResponse response{m.id, std::any(error)};
+                while (!this->output_queue->try_push(std::move(response))) {
+                    this->control->check();
+                    std::this_thread::yield();
+                }
+            }
+            continue;
+        }
+
+        try {
+            this->try_step();
+        }
+        catch (...) {
+            this->set_fatal_error(std::current_exception());
+        }
+    }
+}
+
+void run_loader(std::shared_ptr<SPSCQueue<RPCRequest>> input_queue, std::shared_ptr<SPSCQueue<RPCResponse>> output_queue, std::shared_ptr<LoaderThreadState> state) {
+    try {
+        Loader loader(std::move(input_queue), std::move(output_queue), state->control);
+        loader.run();
+    }
+    catch (...) {
+        state->error = std::current_exception();
+    }
+    state->finished.store(true, std::memory_order_release);
+}
+
+} // namespace instanttensor

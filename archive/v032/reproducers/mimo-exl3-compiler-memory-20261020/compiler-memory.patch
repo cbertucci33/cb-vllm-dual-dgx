@@ -1,0 +1,60 @@
+diff --git a/exllamav3/exllamav3_ext/ptx.cuh b/exllamav3/exllamav3_ext/ptx.cuh
+index 0d591bd..9c298ab 100644
+--- a/exllamav3/exllamav3_ext/ptx.cuh
++++ b/exllamav3/exllamav3_ext/ptx.cuh
+@@ -111,7 +111,7 @@ __device__ inline void barrier_acquire
+         volatile int state = -1;
+         do
+         {
+-            asm volatile ("ld.global.acquire.gpu.b32 %0, [%1];\n" : "=r"(state) : "l"(lock));
++            asm volatile ("ld.global.acquire.gpu.b32 %0, [%1];\n" : "=r"(state) : "l"(lock) : "memory");
+         }
+         while (state != stage);
+     }
+@@ -133,8 +133,8 @@ __device__ inline void barrier_release
+             *lock = 0;
+             return;
+         }
+-        asm volatile ("fence.acq_rel.gpu;\n");
+-        asm volatile ("red.relaxed.gpu.global.add.s32 [%0], %1;\n" : : "l"(lock), "r"(val));
++        asm volatile ("fence.acq_rel.gpu;\n" ::: "memory");
++        asm volatile ("red.relaxed.gpu.global.add.s32 [%0], %1;\n" : : "l"(lock), "r"(val) : "memory");
+     }
+ }
+ 
+@@ -163,7 +163,7 @@ __device__ inline void cp_async(void* smem_ptr, const void* glob_ptr)
+     asm volatile(
+         "{\n"
+         "   cp.async.cg.shared.global [%0], [%1], %2;\n"
+-        "}\n" :: "r"(smem), "l"(glob_ptr), "n"(bytes)
++        "}\n" :: "r"(smem), "l"(glob_ptr), "n"(bytes) : "memory"
+     );
+ }
+ 
+@@ -187,7 +187,7 @@ __device__ inline void cp_async_stream(void* smem_ptr, const void* glob_ptr)
+ 
+ __device__ inline void cp_async_fence()
+ {
+-    asm volatile("cp.async.commit_group;\n" ::);
++    asm volatile("cp.async.commit_group;\n" ::: "memory");
+ }
+ 
+ // Wait until at most n async groups are still pending.
+@@ -195,7 +195,7 @@ __device__ inline void cp_async_fence()
+ template <int n>
+ __device__ inline void cp_async_wait()
+ {
+-    asm volatile("cp.async.wait_group %0;\n" :: "n"(n));
++    asm volatile("cp.async.wait_group %0;\n" :: "n"(n) : "memory");
+ }
+ 
+ // Load 16x16 matrix fragment from shared memory, directly in tensor core layout
+@@ -207,7 +207,7 @@ __device__ inline void ldsm4(FragA& frag_a, const void* smem_ptr)
+     asm volatile
+     (
+         "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+-        : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(smem)
++        : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(smem) : "memory"
+     );
+ }
+ 

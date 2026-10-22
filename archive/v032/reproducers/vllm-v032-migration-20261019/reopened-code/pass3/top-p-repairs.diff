@@ -1,0 +1,38 @@
+diff --git a/vllm/v1/sample/ops/topk_topp_triton.py b/vllm/v1/sample/ops/topk_topp_triton.py
+index 01b358ca00..10e202f562 100755
+--- a/vllm/v1/sample/ops/topk_topp_triton.py
++++ b/vllm/v1/sample/ops/topk_topp_triton.py
+@@ -639,8 +639,8 @@ def _topk_topp_kernel(
+                 std_logit = tl.sqrt(
+                     tl.maximum(sq_avg_logit - avg_logit * avg_logit, 0.0)
+                 )
+-                max_sample = avg_logit + std_logit * 10.0
+                 sum_exp_logits = 0.0
++                max_sample = tl.where(max_logit > -float("inf"), max_logit, 0.0)
+ 
+                 # First pass: compute max and min logits and sum_exp_logits
+                 for i in range(0, NUM_TILES):
+@@ -649,7 +649,14 @@ def _topk_topp_kernel(
+                     logits_blk = tl.load(
+                         LOGITS_ROW + offs_n, mask=mask_n, other=-float("inf")
+                     )
++                    previous_max = max_logit
+                     max_logit = tl.maximum(max_logit, tl.max(logits_blk))
++                    # Use an online log-sum-exp rather than the first tile's
++                    # estimated maximum: grammar masks or logit bias can put
++                    # the actual maximum arbitrarily far outside that sample.
++                    # A finite anchor also keeps all-masked tiles at zero.
++                    max_sample = tl.where(max_logit > -float("inf"), max_logit, 0.0)
++                    sum_exp_logits *= tl.exp(previous_max - max_sample)
+                     # Exclude -inf from min to keep binary search bounds
+                     # finite (avoids NaN pivots).
+                     finite_blk = tl.where(
+@@ -1516,6 +1523,8 @@ def _topp_sb_mask_kernel(
+             cum = tl.cumsum(dmask.to(tl.int32)).to(tl.float32) + num_preceding
+             keep_dup = dmask & (cum <= numkeep)
+             keep = keep & (~dmask | keep_dup)
++            # Carry the duplicate budget across tiles within this slice too.
++            num_preceding += tl.sum(dmask.to(tl.float32))
+         tl.store(ROW + i + offs, tl.where(keep, x, MASK_VALUE), mask=mask_n)
+ 
+ 

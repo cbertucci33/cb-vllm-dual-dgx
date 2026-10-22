@@ -28,12 +28,16 @@ def cdiv_fn(x, y):
 def apply_softcap(S, x):
     """Softcap (aka tanh-style clamp) used to bound attention scores.
 
-    ``x * tanh(S / x)`` rewritten to avoid a direct ``tanh`` call.
+    ``x * tanh(S / x)`` computed without a direct ``tanh`` call.
+
+    Use ``tanh(y) = 1 - 2 / (exp(2y) + 1)`` rather than
+    ``(exp(y) - exp(-y)) / (exp(y) + exp(-y))``. The symmetric-exponential
+    form overflows to ``inf`` for ``|y| > ~88`` and then evaluates to
+    ``inf / inf = NaN``, poisoning the attention row. The single-exponential
+    form saturates cleanly at +/-1 for either sign.
     """
-    Sdiv = S / x
-    p1 = tl.exp(Sdiv)
-    p2 = tl.exp(-Sdiv)
-    return x * (p1 - p2) / (p1 + p2)
+    y = S / x
+    return x * (1.0 - 2.0 / (tl.exp(2.0 * y) + 1.0))
 
 
 # ===========================================================================
@@ -203,11 +207,8 @@ def compute_tile_loop_bounds(
 
     # ---- Sliding-window tile pruning --------------------
     # Default: keep previous global behavior
-    # Keep the loop bounds in int64. Runtime sequence lengths are int64, and
-    # Triton rejects reassignment when the default literal makes tile_start
-    # int32 before sliding-window pruning computes an int64 tile index.
-    tile_start = q_block_local_idx.to(tl.int64) * 0
-    tile_end = num_tiles.to(tl.int64)
+    tile_start = 0
+    tile_end = num_tiles
     # Prefix ranges normally override the sliding window, so they require the
     # complete sequence. Gemma4 instead clamps prefix attention to the left
     # edge of the sliding window. In that case, the union of possible keys is
@@ -268,8 +269,8 @@ def compute_tile_loop_bounds(
                 )
         last_allowed_key = tl.minimum(last_allowed_key, seq_len - 1)
         # Convert to tile indices and clamp
-        tile_start = tl.maximum(tile_start, first_allowed_key // TILE_SIZE)
-        tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, tile_end)
+        tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
+        tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
 
     if IS_3D:
         loop_lo = max(segm_idx_or_0 * tiles_per_segment_or_0, tile_start)

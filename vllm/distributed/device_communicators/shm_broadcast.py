@@ -9,6 +9,7 @@ import shutil
 import sys
 import threading
 import time
+import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
@@ -34,6 +35,7 @@ import vllm.envs as envs
 from vllm.distributed.utils import StatelessProcessGroup, sched_yield
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.utils.cpu_resource_utils import check_cgroup_memory_available
 from vllm.utils.network_utils import (
     get_ip,
     get_open_zmq_inproc_path,
@@ -59,6 +61,10 @@ SPINLOOP_TIMEOUT_SECONDS = 0.1
 if TYPE_CHECKING:
     from _typeshed import SizedBuffer
 
+    from vllm.distributed.device_communicators.shm_tensor_arena import (
+        ShmTensorArena,
+    )
+
 VLLM_RINGBUFFER_WARNING_INTERVAL = envs.VLLM_RINGBUFFER_WARNING_INTERVAL
 # Cap on how long an idle reader parks before re-reading the authoritative SHM
 # written-flag. Bounds lost-notify recovery latency to ~5s while the periodic
@@ -76,8 +82,7 @@ _memory_fence_lock = threading.Lock()
 
 
 def memory_fence():
-    """
-    Full memory barrier for shared memory synchronization.
+    """Full memory barrier for shared memory synchronization.
 
     Ensures all prior memory writes are visible to other processes before
     any subsequent reads. This is critical for lock-free producer-consumer
@@ -110,8 +115,7 @@ LONG_WAIT_TIME_LOG_MSG = (
 
 
 class SpinCondition:
-    """
-    This class implements an interface similar to a threading.Condition. It
+    """This class implements an interface similar to a threading.Condition. It
     allows a writer to notify readers to wake up and read from the shared memory
     buffer. This notification is done over a zmq socket.
 
@@ -224,26 +228,38 @@ class SpinCondition:
 SHM_PATH = "/dev/shm"
 
 
-def check_shm_free_space(required_bytes: int, shm_path: str = SHM_PATH) -> None:
-    """Raise if ``shm_path`` cannot fit a ``required_bytes`` shared segment.
+def check_shm_free_space(
+    required_bytes: int,
+    shm_path: str = SHM_PATH,
+    *,
+    allocation_name: str = "shared-memory allocation",
+) -> None:
+    """Raise if SHM cannot fit a shared segment and log cgroup headroom.
 
     Args:
         required_bytes: Size of the shared-memory segment to be created.
-        shm_path: Mount point backing POSIX shared memory; skipped if absent.
+        shm_path: Mount point backing POSIX shared memory; its filesystem
+            check is skipped if absent.
+        allocation_name: Human-readable name used in errors and logs.
 
     Raises:
-        RuntimeError: If ``required_bytes`` exceeds the free space.
+        RuntimeError: If the SHM filesystem has insufficient space.
+
     """
-    if not os.path.isdir(shm_path):
-        return
-    free_bytes = shutil.disk_usage(shm_path).free
-    if required_bytes <= free_bytes:
-        return
-    mib = 1 << 20
-    raise RuntimeError(
-        f"Insufficient space in {shm_path}: {required_bytes / mib:.0f} MiB "
-        f"required, {free_bytes / mib:.0f} MiB free. Increase {shm_path} "
-        "(e.g. --shm-size or --ipc=host)."
+    if os.path.isdir(shm_path):
+        free_bytes = shutil.disk_usage(shm_path).free
+        if required_bytes > free_bytes:
+            mib = 1 << 20
+            raise RuntimeError(
+                f"Insufficient space in {shm_path} for {allocation_name}: "
+                f"{required_bytes / mib:.0f} MiB required, "
+                f"{free_bytes / mib:.0f} MiB free. Increase {shm_path} "
+                "(e.g. --shm-size or --ipc=host)."
+            )
+
+    check_cgroup_memory_available(
+        required_bytes,
+        allocation_name,
     )
 
 
@@ -392,8 +408,8 @@ def _rebuild_tensor(buf: Any, shape: tuple[int, ...], dtype_str: str) -> torch.T
     Counterpart of `_reduce_tensor`. Note that pickle passes the original
     buffer-providing object from `loads(buffers=...)` straight to this
     function (no `PickleBuffer` wrapper on the receiving side), so `buf` is
-    a `zmq.Frame`, a `memoryview` of a shared-memory ring chunk, or `bytes`
-    if the buffer was serialized in-band.
+    a `zmq.Frame`, an owned `bytearray` from the shared-memory ring, or
+    `bytes`/`bytearray` if the buffer was serialized in-band.
     """
     dtype = getattr(torch, dtype_str)
     assert isinstance(dtype, torch.dtype)
@@ -407,11 +423,8 @@ def _rebuild_tensor(buf: Any, shape: tuple[int, ...], dtype_str: str) -> torch.T
         except ValueError:
             # Empty or read-only frame buffer; fall through to the copy path.
             pass
-    # Shared-memory ring buffer chunks are reused by the writer once all
-    # readers have marked them read, so we must copy out of them. bytearray
-    # (vs bytes) keeps the resulting tensor writable, matching normal tensor
-    # semantics.
-    raw = bytearray(buf)
+    # dequeue already owns SHM buffers. Copy other buffers to keep them writable.
+    raw = buf if isinstance(buf, bytearray) else bytearray(buf)
     if not raw:
         assert 0 in shape
         return torch.empty(shape, dtype=dtype)
@@ -459,6 +472,13 @@ class Handle:
     local_notify_addr: str | None = None
     remote_subscribe_addr: str | None = None
     remote_addr_ipv6: bool = False
+    tensor_arena_handle: tuple[int, int, int, str] | None = None
+
+
+def _close_zmq(context: zmq.Context, sockets: list[zmq.Socket]) -> None:
+    for socket in sockets:
+        socket.close(linger=0)
+    context.term()
 
 
 class MessageQueue:
@@ -472,6 +492,7 @@ class MessageQueue:
         max_chunk_bytes: int = 1024 * 1024 * 24,
         max_chunks: int = 10,
         connect_ip: str | None = None,
+        enable_shm_tensor_arena: bool = False,
     ):
         if local_reader_ranks is None:
             local_reader_ranks = list(range(n_local_reader))
@@ -483,11 +504,21 @@ class MessageQueue:
         self.shutting_down = False
         context = Context()
 
+        self.tensor_arena: ShmTensorArena | None = None
         if n_local_reader > 0:
             # for local readers, we will:
             # 1. create a shared memory ring buffer to communicate small data
             # 2. create a publish-subscribe socket to communicate large data
             self.buffer = ShmRingBuffer(n_local_reader, max_chunk_bytes, max_chunks)
+
+            # Zero-copy arena for large CPU tensors (see ShmTensorArena).
+            # Local readers only: remote readers receive the pickled bytes
+            # over a socket and cannot map the arena, so the substitution
+            # would break them.
+            if enable_shm_tensor_arena and n_remote_reader == 0:
+                from vllm.distributed.device_communicators import shm_tensor_arena
+
+                self.tensor_arena = shm_tensor_arena.ShmTensorArena(n_local_reader)
 
             # XPUB is very similar to PUB,
             # except that it can receive subscription messages
@@ -549,9 +580,29 @@ class MessageQueue:
             local_notify_addr=local_notify_addr,
             remote_subscribe_addr=remote_subscribe_addr,
             remote_addr_ipv6=remote_addr_ipv6,
+            tensor_arena_handle=(
+                self.tensor_arena.handle() if self.tensor_arena is not None else None
+            ),
         )
+        self._close_zmq_on_collect(context)
 
         logger.debug("vLLM message queue communication handle: %s", self.handle)
+
+    def _close_zmq_on_collect(self, context: zmq.Context) -> None:
+        # pyzmq's Context.__del__ can block forever in term() when the context
+        # and its sockets are collected in the same GC cycle, so the finalizer
+        # keeps them alive and closes the sockets before terminating.
+        sockets = [self.local_socket, self.remote_socket]
+        if self._spin_condition is not None:
+            sockets += [
+                self._spin_condition.local_notify_socket,
+                self._spin_condition.read_cancel_socket,
+                self._spin_condition.write_cancel_socket,
+            ]
+        finalizer = weakref.finalize(
+            self, _close_zmq, context, [s for s in sockets if s is not None]
+        )
+        finalizer.atexit = False  # type: ignore[misc]
 
     def export_handle(self) -> Handle:
         return self.handle
@@ -564,6 +615,7 @@ class MessageQueue:
 
         context = Context()
 
+        self.tensor_arena = None
         if rank in handle.local_reader_ranks:
             assert handle.buffer_handle is not None
             self.buffer = ShmRingBuffer(*handle.buffer_handle)
@@ -571,6 +623,23 @@ class MessageQueue:
             self.local_reader_rank = handle.local_reader_ranks.index(rank)
             self._is_local_reader = True
             self._is_remote_reader = False
+
+            arena_handle = handle.tensor_arena_handle
+            if arena_handle is not None:
+                from vllm.distributed.device_communicators import shm_tensor_arena
+
+                self.tensor_arena = shm_tensor_arena.ShmTensorArena(
+                    *arena_handle, reader_rank=self.local_reader_rank
+                )
+                # `shared_memory` is unset (not just None) if attaching to
+                # the writer's segment raised FileNotFoundError -- see
+                # ShmTensorArena.__init__'s reader branch. Registering a
+                # broken arena is a no-op deferred failure (same convention
+                # ShmRingBuffer uses above), not a crash here.
+                if hasattr(self.tensor_arena, "shared_memory"):
+                    shm_tensor_arena._TENSOR_ARENAS[
+                        self.tensor_arena.shared_memory.name
+                    ] = self.tensor_arena
 
             self.local_socket = context.socket(SUB)
             self.local_socket.setsockopt_string(SUBSCRIBE, "")
@@ -602,40 +671,70 @@ class MessageQueue:
             self._spin_condition = None  # type: ignore
 
         self.shutting_down = False
+        self._close_zmq_on_collect(context)
         return self
 
-    def wait_until_ready(self):
+    def wait_until_ready(self, timeout: float | None = None):
         """This is a collective operation. All processes (including the
         readers and the writer) should call this function.
         """
+        deadline = None if timeout is None else time.monotonic() + timeout
         if self._is_writer:
             # wait for all readers to connect
 
             # local readers
             for i in range(self.n_local_reader):
                 # wait for subscription messages from all local readers
-                self.local_socket.recv()
+                self._recv_ready(self.local_socket, deadline)
             if self.n_local_reader > 0:
                 # send a message to all local readers
                 # to make sure the publish channel is working
-                self.local_socket.send(b"READY")
+                self._send(self.local_socket, [b"READY"], deadline)
 
             # remote readers
             for i in range(self.n_remote_reader):
                 # wait for subscription messages from all remote readers
-                self.remote_socket.recv()
+                self._recv_ready(self.remote_socket, deadline)
             if self.n_remote_reader > 0:
                 # send a message to all remote readers
                 # to make sure the publish channel is working
-                self.remote_socket.send(b"READY")
+                self._send(self.remote_socket, [b"READY"], deadline)
         elif self._is_local_reader:
             # wait for the writer to send a message
-            recv = self.local_socket.recv()
+            recv = self._recv_ready(self.local_socket, deadline)
             assert recv == b"READY"
         elif self._is_remote_reader:
             # wait for the writer to send a message
-            recv = self.remote_socket.recv()
+            recv = self._recv_ready(self.remote_socket, deadline)
             assert recv == b"READY"
+
+    def _wait_socket(self, socket: zmq.Socket, event: int, deadline) -> None:
+        while True:
+            if self.shutting_down:
+                raise RuntimeError("cancelled")
+            wait_ms = SHM_READER_RECHECK_INTERVAL_MS
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError
+                wait_ms = min(wait_ms, max(1, int(remaining * 1000)))
+            if socket.poll(timeout=wait_ms, flags=event):
+                if self.shutting_down:
+                    raise RuntimeError("cancelled")
+                return
+
+    def _recv_ready(self, socket: zmq.Socket, deadline) -> bytes:
+        self._wait_socket(socket, zmq.POLLIN, deadline)
+        return socket.recv(flags=zmq.NOBLOCK)
+
+    def _send(self, socket: zmq.Socket, buffers, deadline) -> None:
+        while True:
+            self._wait_socket(socket, zmq.POLLOUT, deadline)
+            try:
+                socket.send_multipart(buffers, copy=False, flags=zmq.NOBLOCK)
+                return
+            except zmq.Again:
+                continue
 
     def shutdown(self):
         """If this is an idle reader, wakes it up so it can clean up and shut
@@ -650,6 +749,8 @@ class MessageQueue:
         start_time = time.monotonic()
         n_warning = 1
         while True:
+            if self.shutting_down:
+                raise RuntimeError("cancelled")
             with self.buffer.get_metadata(self.current_idx) as metadata_buffer:
 
                 def check():
@@ -823,6 +924,7 @@ class MessageQueue:
     def enqueue(self, obj, timeout: float | None = None):
         """Write to message queue with optional timeout (in seconds)"""
         assert self._is_writer, "Only writers can enqueue"
+        deadline = None if timeout is None else time.monotonic() + timeout
         all_buffers: list[SizedBuffer] = [b""]
         total_bytes = 6  # 2 bytes for oob buffer count, 4 for main buffer size
 
@@ -844,26 +946,39 @@ class MessageQueue:
         # dispatch table would otherwise shadow them.
         dispatch_table = dict(copyreg.dispatch_table)
         dispatch_table[torch.Tensor] = _reduce_tensor
+        arena = self.tensor_arena
         with io.BytesIO() as bio:
-            pickler = pickle.Pickler(
-                bio,
-                protocol=pickle.HIGHEST_PROTOCOL,
-                buffer_callback=oob_callback,
-            )
+            pickler: pickle.Pickler
+            if arena is not None:
+                from vllm.distributed.device_communicators.shm_tensor_arena import (
+                    _ArenaPickler,
+                )
+
+                pickler = _ArenaPickler(bio, arena, buffer_callback=oob_callback)
+            else:
+                pickler = pickle.Pickler(
+                    bio,
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                    buffer_callback=oob_callback,
+                )
             pickler.dispatch_table = dispatch_table
             pickler.dump(obj)
             all_buffers[0] = bio.getvalue()
         if self.n_local_reader > 0:
             if total_bytes + len(all_buffers[0]) >= self.buffer.max_chunk_bytes:
-                with self.acquire_write(timeout) as buf:
+                with self.acquire_write(
+                    None if deadline is None else max(0.0, deadline - time.monotonic())
+                ) as buf:
                     buf[0] = 1  # overflow
-                self.local_socket.send_multipart(all_buffers, copy=False)
+                self._send(self.local_socket, all_buffers, deadline)
             else:
                 # Byte 0: 0
                 # Bytes 1-2: Count of buffers
                 # Then each buffer follows, preceded by 4 bytes containing its length:
                 # [4 byte int L][L bytes of buffer content] ...
-                with self.acquire_write(timeout) as buf:
+                with self.acquire_write(
+                    None if deadline is None else max(0.0, deadline - time.monotonic())
+                ) as buf:
                     buf[0] = 0  # not overflow
                     offset = 3
                     buf[1:offset] = to_bytes_big(len(all_buffers), 2)  # oob buf count
@@ -877,7 +992,7 @@ class MessageQueue:
             self._spin_condition.notify()
 
         if self.n_remote_reader > 0:
-            self.remote_socket.send_multipart(all_buffers, copy=False)
+            self._send(self.remote_socket, all_buffers, deadline)
 
     def dequeue(
         self,
@@ -886,6 +1001,9 @@ class MessageQueue:
     ):
         """Read from message queue with optional timeout (in seconds)"""
         if self._is_local_reader:
+            # See ShmTensorArena.flush_releases for what this retires and why.
+            if self.tensor_arena is not None:
+                self.tensor_arena.flush_releases()
             with self.acquire_read(timeout, indefinite) as buf:
                 overflow = buf[0] == 1
                 if not overflow:
@@ -896,24 +1014,39 @@ class MessageQueue:
                         buf_offset = offset + 4
                         buf_len = from_bytes_big(buf[offset:buf_offset])
                         offset = buf_offset + buf_len
-                        all_buffers.append(buf[buf_offset:offset])
+                        buffer = buf[buf_offset:offset]
+                        # Out-of-band arrays may outlive this reusable ring slot.
+                        all_buffers.append(buffer if i == 0 else bytearray(buffer))
                     obj = pickle.loads(all_buffers[0], buffers=all_buffers[1:])
             if overflow:
-                obj = MessageQueue.recv(self.local_socket, timeout)
+                obj = MessageQueue.recv(
+                    self.local_socket, timeout, lambda: self.shutting_down
+                )
         elif self._is_remote_reader:
-            obj = MessageQueue.recv(self.remote_socket, timeout)
+            obj = MessageQueue.recv(
+                self.remote_socket, timeout, lambda: self.shutting_down
+            )
         else:
             raise RuntimeError("Only readers can dequeue")
         return obj
 
     @staticmethod
-    def recv(socket: zmq.Socket, timeout: float | None) -> Any:
-        # Ensure non-negative timeout passed to zmq poll.
-        timeout_ms = None if timeout is None else max(0, int(timeout * 1000))
-        if not socket.poll(timeout=timeout_ms):
-            raise TimeoutError
-        recv, *recv_oob = socket.recv_multipart(copy=False)
-        return pickle.loads(recv, buffers=recv_oob)
+    def recv(socket: zmq.Socket, timeout: float | None, cancelled=None) -> Any:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            if cancelled is not None and cancelled():
+                raise RuntimeError("cancelled")
+            wait_ms = SHM_READER_RECHECK_INTERVAL_MS
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError
+                wait_ms = min(wait_ms, max(1, int(remaining * 1000)))
+            if socket.poll(timeout=wait_ms):
+                if cancelled is not None and cancelled():
+                    raise RuntimeError("cancelled")
+                recv, *recv_oob = socket.recv_multipart(copy=False, flags=zmq.NOBLOCK)
+                return pickle.loads(recv, buffers=recv_oob)
 
     def broadcast_object(self, obj=None):
         if self._is_writer:
@@ -929,8 +1062,7 @@ class MessageQueue:
         reader_rank: int = 0,
         blocking: bool = False,
     ) -> tuple["MessageQueue", list[Handle]]:
-        """
-        Creates a MessageQueue for a process group with a single reader.
+        """Creates a MessageQueue for a process group with a single reader.
 
         This method is designed for scenarios where only one process (the reader)
         will consume messages, and all other processes are writers. It sets up
@@ -950,6 +1082,7 @@ class MessageQueue:
             tuple[MessageQueue, list[Handle]]:
             The MessageQueue instance for the calling process,
             and a list of handles (only non-empty for the reader process).
+
         """
         from vllm.platforms.interface import get_assigned_physical_gpu_ids
 
@@ -982,8 +1115,7 @@ class MessageQueue:
         external_writer_handle=None,
         blocking: bool = True,
     ) -> "MessageQueue":
-        """
-        Creates a MessageQueue for a distributed process group with one writer and
+        """Creates a MessageQueue for a distributed process group with one writer and
         multiple readers.
 
         This method is designed for scenarios where one process (the writer) sends

@@ -19,20 +19,19 @@ logger = init_logger(__name__)
 
 
 def _collect_warmup_units(
-    models: Iterable[torch.nn.Module],
+    model: torch.nn.Module,
     token_counts: tuple[int, ...],
     output_dtype: torch.dtype,
 ) -> Iterable[B12xWarmupUnit]:
     units: dict[object, B12xWarmupUnit] = {}
-    for model in models:
-        for layer in model.modules():
-            provider = getattr(layer, "b12x_warmup_provider", None)
-            get_unit = getattr(provider, "get_b12x_warmup_unit", None)
-            if not callable(get_unit):
-                continue
-            unit = get_unit(layer, token_counts, output_dtype)
-            assert isinstance(unit, B12xWarmupUnit)
-            units.setdefault(unit.key, unit)
+    for layer in model.modules():
+        provider = getattr(layer, "b12x_warmup_provider", None)
+        get_unit = getattr(provider, "get_b12x_warmup_unit", None)
+        if not callable(get_unit):
+            continue
+        unit = get_unit(layer, token_counts, output_dtype)
+        assert isinstance(unit, B12xWarmupUnit)
+        units.setdefault(unit.key, unit)
     return units.values()
 
 
@@ -77,37 +76,8 @@ def b12x_warmup(worker: "Worker", cudagraph_capture_sizes: list[int]) -> None:
         max_tokens=max_tokens,
         cudagraph_capture_sizes=serving_sizes,
     )
-    speculative_config = worker.vllm_config.speculative_config
-    if speculative_config is not None and speculative_config.method in (
-        "dflash",
-        "dspark",
-    ):
-        # Parallel drafting runs the dense draft projections on flattened
-        # request groups, not on the target runner's capture-size rows. Cover
-        # every live concurrency for both the sampled-token span and the
-        # anchor-plus-sampled query span. These are the two B12X policy classes
-        # observed compiling on the first DFlash request after readiness.
-        num_speculative_tokens = int(speculative_config.num_speculative_tokens)
-        max_num_seqs = int(worker.scheduler_config.max_num_seqs)
-        dflash_rows = {
-            num_reqs * tokens_per_req
-            for num_reqs in range(1, max_num_seqs + 1)
-            for tokens_per_req in (
-                num_speculative_tokens,
-                num_speculative_tokens + 1,
-            )
-        }
-        token_counts = tuple(sorted({*token_counts, *dflash_rows}))
-    # The GB10 profile measures 1,536 rows for every GLM geometry. Compile the
-    # selected policy during startup so medium prefills cannot JIT in service.
-    token_counts = tuple(sorted({*token_counts, 1536}))
-
-    models = [worker.get_model()]
-    draft_model = worker.get_draft_model()
-    if draft_model is not None:
-        models.append(draft_model)
     units = _collect_warmup_units(
-        models,
+        worker.get_model(),
         token_counts,
         output_dtype,
     )

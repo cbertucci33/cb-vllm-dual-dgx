@@ -11,16 +11,24 @@ FILES=("$@")
 if printf '%s\n' "${FILES[@]}" | grep -q "^docker/Dockerfile$"; then
   echo "docker/Dockerfile has changed, attempting to update dependency graph..."
 
-  # Check if Docker is installed and running
-  if ! command -v docker &> /dev/null; then
-    echo "Warning: Docker command not found. Skipping Dockerfile graph update."
-    echo "Please install Docker to automatically update the graph: https://docs.docker.com/get-docker/"
-    exit 0
-  fi
-  if ! docker info &> /dev/null; then
-    echo "Warning: Docker daemon is not running. Skipping Dockerfile graph update."
-    echo "Please start Docker to automatically update the graph."
-    exit 0
+  # Upstream also ships native binaries (including arm64); Graphviz is required.
+  if command -v dockerfilegraph &> /dev/null && command -v dot &> /dev/null; then
+    GRAPH_COMMAND=(dockerfilegraph)
+  else
+    # Check if Docker is installed and running
+    if ! command -v docker &> /dev/null; then
+      echo "Warning: Docker command not found. Skipping Dockerfile graph update."
+      echo "Please install Docker to automatically update the graph: https://docs.docker.com/get-docker/"
+      exit 0
+    fi
+    if ! docker info &> /dev/null; then
+      echo "Warning: Docker daemon is not running. Skipping Dockerfile graph update."
+      echo "Please start Docker to automatically update the graph."
+      exit 0
+    fi
+    GRAPH_COMMAND=(docker run --rm --user "$(id -u):$(id -g)"
+      --workdir /workspace --volume "$(pwd -P)":/workspace
+      ghcr.io/patrickhoefler/dockerfilegraph:alpine)
   fi
 
   # Define the target file path
@@ -37,12 +45,7 @@ if printf '%s\n' "${FILES[@]}" | grep -q "^docker/Dockerfile$"; then
   
   # Generate Dockerfile graph
   echo "Running dockerfilegraph tool..."
-  docker run \
-    --rm \
-    --user "$(id -u):$(id -g)" \
-    --workdir /workspace \
-    --volume "$(pwd -P)":/workspace \
-    ghcr.io/patrickhoefler/dockerfilegraph:alpine \
+  "${GRAPH_COMMAND[@]}" \
     --output png \
     --dpi 200 \
     --max-label-length 50 \

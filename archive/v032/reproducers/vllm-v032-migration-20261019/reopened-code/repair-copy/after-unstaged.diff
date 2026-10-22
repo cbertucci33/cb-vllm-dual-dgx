@@ -1,0 +1,16 @@
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index a4e7e3ca26..1d51bac688 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -4674,8 +4674,10 @@ class GPUModelRunner(
+                 self.draft_token_ids_cpu[:num_reqs, :num_spec_tokens].copy_(
+                     draft_token_ids, non_blocking=True
+                 )
++                draft_token_ids.record_stream(self.draft_token_ids_copy_stream)
+             else:
+-                # No copy needed, just zero-out cpu tensor.
++                # A previous D2H copy may still be writing this CPU tensor.
++                self.draft_token_ids_event.synchronize()
+                 self.draft_token_ids_cpu[:num_reqs, :num_spec_tokens] = 0
+             self.draft_token_ids_event.record()
+ 

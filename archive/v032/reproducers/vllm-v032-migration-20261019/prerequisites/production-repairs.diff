@@ -1,0 +1,201 @@
+diff --git a/vllm/entrypoints/openai/responses/context.py b/vllm/entrypoints/openai/responses/context.py
+index 839eacdf38..42bea098ae 100644
+--- a/vllm/entrypoints/openai/responses/context.py
++++ b/vllm/entrypoints/openai/responses/context.py
+@@ -489,6 +489,7 @@ class ParsableContext(ConversationContext):
+             self.response_parser = self._parser_factory()
+         elif self.request.stream and self.parser_cls is not None:
+             # Standalone contexts use the same constructor as their first turn.
++            assert self.response_parser is not None
+             self.response_parser = self.parser_cls(
+                 self.response_parser.model_tokenizer, self.request.tools
+             )
+diff --git a/vllm/entrypoints/openai/responses/serving.py b/vllm/entrypoints/openai/responses/serving.py
+index 5c6432e337..d0821c43b9 100644
+--- a/vllm/entrypoints/openai/responses/serving.py
++++ b/vllm/entrypoints/openai/responses/serving.py
+@@ -1279,7 +1279,10 @@ class OpenAIServingResponses(GenerateBaseServing):
+                     turn_items.append(event.item)
+                 if not request.include_reasoning:
+                     event_item = getattr(event, "item", None)
+-                    if getattr(event_item, "type", None) == "reasoning":
++                    if (
++                        event_item is not None
++                        and getattr(event_item, "type", None) == "reasoning"
++                    ):
+                         hidden_reasoning_ids.add(event_item.id)
+                     item_id = getattr(event, "item_id", None) or getattr(
+                         event_item, "id", None
+diff --git a/vllm/entrypoints/openai/responses/streaming_events.py b/vllm/entrypoints/openai/responses/streaming_events.py
+index 293d3e8180..a72265f0ba 100644
+--- a/vllm/entrypoints/openai/responses/streaming_events.py
++++ b/vllm/entrypoints/openai/responses/streaming_events.py
+@@ -1443,14 +1443,14 @@ class ParsableBuiltinEventBridge:
+                     item_id=item_id,
+                 ),
+             ]
+-        item_id = (
++        source_item_id = (
+             event.item.id
+             if isinstance(event, ResponseOutputItemDoneEvent)
+             else getattr(event, "item_id", None)
+         )
+-        if item_id not in self._open:
++        if source_item_id not in self._open:
+             return [event]
+-        index, call = self._open[item_id]
++        index, call = self._open[source_item_id]
+         mcp_id = self._item_id(call)
+         if isinstance(event, ResponseFunctionCallArgumentsDeltaEvent):
+             return [
+@@ -1463,7 +1463,7 @@ class ParsableBuiltinEventBridge:
+                 )
+             ]
+         if isinstance(event, ResponseFunctionCallArgumentsDoneEvent):
+-            self._arguments_done.add(item_id)
++            self._arguments_done.add(source_item_id)
+             return [
+                 ResponseMcpCallArgumentsDoneEvent(
+                     type="response.mcp_call_arguments.done",
+@@ -1477,9 +1477,9 @@ class ParsableBuiltinEventBridge:
+         if isinstance(event, ResponseOutputItemDoneEvent):
+             call = event.item
+             self._pending[call.call_id] = (index, call)
+-            del self._open[item_id]
+-            if item_id in self._arguments_done:
+-                self._arguments_done.remove(item_id)
++            del self._open[source_item_id]
++            if source_item_id in self._arguments_done:
++                self._arguments_done.remove(source_item_id)
+                 return []
+             return [
+                 ResponseMcpCallArgumentsDoneEvent(
+diff --git a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index c6c73f8c96..56d2173426 100644
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -457,6 +457,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         output_gate_type = getattr(config, "output_gate_type", None) or getattr(
+             config, "hidden_act", "silu"
+         )
++        assert isinstance(output_gate_type, str), f"unsupported {output_gate_type=}"
+         return "silu" if output_gate_type == "swish" else output_gate_type
+ 
+     def get_state_shape(
+diff --git a/vllm/models/glm5next/common/attention.py b/vllm/models/glm5next/common/attention.py
+index f551c0fa2e..c852f8c890 100644
+--- a/vllm/models/glm5next/common/attention.py
++++ b/vllm/models/glm5next/common/attention.py
+@@ -244,6 +244,7 @@ class Indexer(nn.Module):
+         self.scale_fmt = "ue8m0"
+         self.quant_block_size = 128  # TODO: get from config
+         self.topk_indices_buffer = topk_indices_buffer
++        self._wp_fp32: torch.Tensor | None
+         self.register_buffer("_wp_fp32", None, persistent=False)
+ 
+         # NOTE: (zyongye) we use fp8 naive cache,
+@@ -308,6 +309,7 @@ class Indexer(nn.Module):
+         k = kw[:, : self.head_dim]
+         if self._wp_fp32 is None:
+             self.refresh_derived_weights()
++        assert self._wp_fp32 is not None
+         weights = torch.mm(hidden_states.float(), self._wp_fp32)
+ 
+         # Replicated keys must agree across TP ranks. Inductor autotuning can
+diff --git a/vllm/models/glm5next/common/kda.py b/vllm/models/glm5next/common/kda.py
+index d0c4e42cc7..621a6f5310 100644
+--- a/vllm/models/glm5next/common/kda.py
++++ b/vllm/models/glm5next/common/kda.py
+@@ -296,6 +296,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+         self.v_conv1d.weight.data = self.v_conv1d.weight.data.unsqueeze(1)
+         # Derived, not a checkpoint weight. Refresh in place after loading so
+         # captured convolution kernels keep the same address across reloads.
++        self._merged_conv_weight: torch.Tensor | None
+         self.register_buffer("_merged_conv_weight", None, persistent=False)
+ 
+         self.A_log = nn.Parameter(
+@@ -569,6 +570,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+         # merged q|k|v state, so it is used directly.
+         if self._merged_conv_weight is None:
+             self.refresh_derived_weights()
++        assert self._merged_conv_weight is not None
+         conv_weights = self._merged_conv_weight
+         conv_bias = self.q_conv1d.bias
+ 
+diff --git a/vllm/parser/engine/parser_engine.py b/vllm/parser/engine/parser_engine.py
+index 81b296a6d6..bdb81dee22 100644
+--- a/vllm/parser/engine/parser_engine.py
++++ b/vllm/parser/engine/parser_engine.py
+@@ -555,8 +555,8 @@ class ParserEngine(Parser):
+         if finished:
+             events.extend(self._engine.finish())
+         results = []
+-        for delta in self._events_to_deltas(events, finished=finished):
+-            delta = self._strip_trailing_reasoning(delta)
++        for raw_delta in self._events_to_deltas(events, finished=finished):
++            delta = self._strip_trailing_reasoning(raw_delta)
+             if delta is not None and not request.include_reasoning:
+                 delta.reasoning = None
+                 if not delta.content and not delta.tool_calls:
+diff --git a/vllm/parser/engine/token_id_scanner.py b/vllm/parser/engine/token_id_scanner.py
+index 0c4b29556b..7f2d692066 100644
+--- a/vllm/parser/engine/token_id_scanner.py
++++ b/vllm/parser/engine/token_id_scanner.py
+@@ -12,7 +12,10 @@ from dataclasses import dataclass
+ import tokenizers
+ from transformers import TokenizersBackend
+ 
+-from vllm.tokenizers.streaming import create_decode_stream
++from vllm.tokenizers.streaming import (
++    _PartialPromptDecodeStream,
++    create_decode_stream,
++)
+ 
+ DROP_TERMINAL = "__DROP__"
+ 
+@@ -51,7 +54,9 @@ class _TokenTextPositions:
+         self.reset()
+ 
+     def reset(self) -> None:
+-        self.stream = None
++        self.stream: (
++            tokenizers.decoders.DecodeStream | _PartialPromptDecodeStream | None
++        ) = None
+         self.prompt_token_ids: Sequence[int] | None = None
+         self.decoded_chars = 0
+         self.emitted_chars = 0
+diff --git a/vllm/v1/attention/backends/triton_attn_diffkv.py b/vllm/v1/attention/backends/triton_attn_diffkv.py
+index 97d7141d59..9bb527ce5a 100644
+--- a/vllm/v1/attention/backends/triton_attn_diffkv.py
++++ b/vllm/v1/attention/backends/triton_attn_diffkv.py
+@@ -156,10 +156,6 @@ class TritonAttentionDiffKVImpl(TritonAttentionImpl):
+         if attn_metadata is None:
+             return output.fill_(0)
+ 
+-        assert attn_metadata.use_cascade is False, (
+-            "Cascade attention not supported for TritonAttentionDiffKVImpl"
+-        )
+-
+         if attn_metadata.causal is not True:
+             raise NotImplementedError("DiffKV requires causal attention metadata")
+         if (
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 7a948fab49..bffcf28cd0 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -1225,8 +1225,14 @@ class DFlashRingManager(SlidingWindowManager):
+         request_id: str,
+         num_local_computed_tokens: int,
+         num_external_computed_tokens: int,
++        record_for_zeroing: bool = True,
+     ) -> None:
+-        del request_id, num_local_computed_tokens, num_external_computed_tokens
++        del (
++            request_id,
++            num_local_computed_tokens,
++            num_external_computed_tokens,
++            record_for_zeroing,
++        )
+ 
+     def remove_skipped_blocks(
+         self,

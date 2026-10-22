@@ -497,7 +497,7 @@ def causal_conv1d_fn(
     metadata=None,
     validate_data=False,
 ):
-    """support varlen + continuous batching when x is 2D tensor
+    """Support varlen + continuous batching when x is 2D tensor.
 
     x: (dim,cu_seq_len)
         cu_seq_len = total tokens of all seqs in that batch
@@ -800,12 +800,13 @@ def _causal_conv1d_update_kernel(
     IS_VARLEN: tl.constexpr,
     IS_APC_ENABLED: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
+    MAX_ACCEPTED_TOKENS: tl.constexpr,
     NP2_STATELEN: tl.constexpr,
     HAS_NULL_BLOCK: tl.constexpr,
     BLOCK_N: tl.constexpr,
     launch_pdl: tl.constexpr,
 ):
-    """Causal conv1d decode step; an invalid accepted count zeroes the output."""
+    """Causal conv1d decode step; invalid accepted counts zero the output."""
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
 
@@ -873,7 +874,9 @@ def _causal_conv1d_update_kernel(
         # - accept 2 tokens: [history3, ..., historyM, draft1, draft2]
         # - and so on.
         num_accepted = tl.load(num_accepted_tokens_ptr + idx_seq).to(tl.int64)
-        if (num_accepted < 1) | (num_accepted > seqlen):
+        # Acceptance selects the previous step's stored history. The new
+        # query may be shorter, including a partial speculative step.
+        if (num_accepted < 1) | (num_accepted > MAX_ACCEPTED_TOKENS):
             zero = tl.zeros((BLOCK_N,), dtype=tl.float32)
             for idx_token in tl.range(seqlen):
                 o_ptrs = (
@@ -1122,8 +1125,7 @@ def causal_conv1d_update(
     validate_data=False,
     out: torch.Tensor | None = None,
 ):
-    """
-    x: Input tensor which can take the following shapes:
+    """x: Input tensor which can take the following shapes:
 
     - `[batch, dim]` - single token prediction
     - `[batch, dim, seqlen]` - single or multiple tokens prediction
@@ -1282,6 +1284,7 @@ def causal_conv1d_update(
         IS_VARLEN=query_start_loc is not None,
         IS_APC_ENABLED=block_idx_last_scheduled_token is not None,
         IS_SPEC_DECODING=num_accepted_tokens is not None,
+        MAX_ACCEPTED_TOKENS=conv_state.size(-1) - width + 2,
         NP2_STATELEN=np2_statelen,
         HAS_NULL_BLOCK=null_block_id is not None,
         BLOCK_N=256,

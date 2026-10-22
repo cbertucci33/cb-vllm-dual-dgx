@@ -1,0 +1,30 @@
+exec(open('/opt/project/evidence/vllm-v032-migration-20261018/source/reconcile_models.py').read().split("p='vllm/model_executor/model_loader/default_loader.py'")[0])
+for p in ['vllm/model_executor/layers/sparse_attn_indexer.py','vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py']:
+ put(p,blob('HEAD',p))
+p='vllm/models/glm5next/nvidia/sparse_indexer.py';s=blob('HEAD',p)
+s=s.replace('pool_ids = pool_topk.to(torch.int64)','pool_ids = pool_topk')
+s=s.replace('                    expanded = kpool_ops.expand_pools_and_append_tail(\n                        pool_ids, q_seq, index_kpool\n                    )','                    kpool_ops.expand_pools_and_append_tail(\n                        pool_ids, q_seq, index_kpool,\n                        out=topk_indices_buffer[row_start:row_end, : topk_tokens + index_kpool - 1],\n                    )')
+s=s.replace('                topk_indices_buffer[row_start:row_end, : expanded.shape[-1]] = expanded','                    topk_indices_buffer[row_start:row_end, : expanded.shape[-1]] = expanded')
+s=s.replace('        # Resolve to token-level indices in the output buffer.','        direct_output = index_kpool > 1 and not decode_metadata.requires_padding\n        # Resolve to token-level indices in the output buffer.')
+s=s.replace('            out = kpool_ops.expand_pools_and_append_tail(pool_ids, dec_seq, index_kpool)','            destination = (\n                topk_indices_buffer[:n, : topk_tokens + index_kpool - 1]\n                if direct_output else None\n            )\n            out = kpool_ops.expand_pools_and_append_tail(\n                pool_ids, dec_seq, index_kpool, out=destination\n            )')
+s=s.replace('        topk_indices_buffer[: out.shape[0], : out.shape[-1]] = out','        if not direct_output:\n            topk_indices_buffer[: out.shape[0], : out.shape[-1]] = out');put(p,s)
+p='vllm/v1/attention/backends/mla/indexer.py';s=blob('HEAD',p);l=blob('9a3af353e8',p)
+s=s.replace('    positions: torch.Tensor | None = None\n','    positions: torch.Tensor | None = None\n    uncompressed_slot_mapping: torch.Tensor | None = None\n')
+s=s.replace('            block_table=common_attn_metadata.block_table_tensor,','            positions=common_attn_metadata.positions,\n            uncompressed_slot_mapping=common_attn_metadata.slot_mapping,\n            block_table=common_attn_metadata.block_table_tensor,')
+s=s.replace('        self.supports_draft_decode_metadata_update = self.dcp_world_size == 1','        self.indexer_decode_block_table_buffer: torch.Tensor | None = None\n        self._max_num_batched_tokens = scheduler_config.max_num_batched_tokens\n        self.supports_draft_decode_metadata_update = self.dcp_world_size == 1')
+a=l.index('    def update_draft_decode_metadata(', l.index('class DeepseekV32IndexerMetadataBuilder'));b=l.find('\n    def ',a+10);b=len(l) if b<0 else b
+x=s.index('    def update_draft_decode_metadata(',s.index('class DeepseekV32IndexerMetadataBuilder'));y=s.find('\n    def ',x+10);y=len(s) if y<0 else y;s=s[:x]+l[a:b]+s[y:];put(p,s)
+p='vllm/v1/attention/backends/mla/flashattn_mla_sparse.py';put(p,resolve(p,'ours'))
+p='vllm/v1/attention/backends/triton_attn.py';s=resolve(p,'ours');s=s.replace('        headdim_padded = next_power_of_2(self.headdim)','        headdim_padded = next_power_of_2(kv_cache_spec.head_size_v)');put(p,s)
+p='vllm/v1/attention/backends/triton_attn_diffkv.py';put(p,resolve(p,'theirs'))
+p='vllm/v1/attention/ops/triton_unified_attention_diffkv.py';s=resolve(p,'theirs')
+block='    if USE_Q_SCALE:\n        scale *= tl.load(q_descale_ptr)\n    if USE_KV_SCALES:\n        scale *= tl.load(k_descale_ptr)\n        v_descale = tl.load(v_descale_ptr)\n'
+assert block+'\n'+block in s
+s=s.replace(block+'\n'+block,block);put(p,s)
+p='vllm/platforms/interface.py';s=resolve(p,'ours');put(p,s)
+p='vllm/v1/core/single_type_kv_cache_manager.py';s=get(p);u=blob('HEAD',p)
+a=u.index('    def get_num_common_prefix_blocks(',u.index('class SlidingWindowManager'));b=u.index('\n\nclass CircularBufferManager',a)
+if s[s.index('class SlidingWindowManager'):s.index('class DFlashRingManager')].find('    def get_num_common_prefix_blocks(')<0:
+ s=s.replace('\n\nclass DFlashRingManager', '\n\n'+u[a:b]+'\n\nclass DFlashRingManager')
+put(p,s)
+print('Attention conflicts reconciled with upstream row-shard abstraction and local direct-output, raw-slot update, per-instance V ownership; not staged.')

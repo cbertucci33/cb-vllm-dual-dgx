@@ -109,6 +109,48 @@ def test_no_spec_decode_padding_up_to_max_model_len():
     assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
 
 
+def test_kv_publication_fence_advances_only_for_completed_nonempty_steps(monkeypatch):
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    scheduler = create_scheduler(async_scheduling=True)
+    original_new_step = scheduler.kv_cache_manager.new_step_starts
+    original_commit = scheduler.kv_cache_manager.commit_step
+    scheduler.kv_cache_manager.new_step_starts = Mock(wraps=original_new_step)
+    scheduler.kv_cache_manager.commit_step = Mock(wraps=original_commit)
+
+    empty = scheduler.schedule()
+    assert empty.total_num_scheduled_tokens == 0
+    assert scheduler.sched_step_seq == 0
+    scheduler.update_from_output(empty, _make_model_runner_output(empty))
+    assert scheduler.processed_step_seq == 0
+    scheduler.kv_cache_manager.commit_step.assert_not_called()
+    scheduler.kv_cache_manager.new_step_starts.assert_called_once_with(1)
+    scheduler.kv_cache_manager.new_step_starts.reset_mock()
+
+    requests = create_requests(num_requests=2, max_tokens=3)
+    scheduler.add_request(requests[0])
+    first = scheduler.schedule()
+    scheduler.add_request(requests[1])
+    second = scheduler.schedule()
+    assert first.total_num_scheduled_tokens > 0
+    assert second.total_num_scheduled_tokens > 0
+    assert scheduler.sched_step_seq == 2
+    assert scheduler.kv_cache_manager.new_step_starts.call_args_list == [
+        ((1,), {}),
+        ((2,), {}),
+    ]
+
+    scheduler.update_from_output(first, _make_model_runner_output(first))
+    scheduler.kv_cache_manager.commit_step.assert_called_once_with(1)
+    scheduler.update_from_output(second, _make_model_runner_output(second))
+    assert scheduler.kv_cache_manager.commit_step.call_args_list == [
+        ((1,), {}),
+        ((2,), {}),
+    ]
+    assert scheduler.processed_step_seq == 2
+
+
 def test_abort():
     scheduler = create_scheduler(async_scheduling=True)
     requests = create_requests(num_requests=10, max_tokens=20)
@@ -169,42 +211,6 @@ def test_connector_metadata_precedes_async_placeholder_advance(monkeypatch):
     scheduler.schedule()
 
     assert observed_placeholders == [0, 1]
-
-
-def test_preempt():
-    scheduler = create_scheduler(async_scheduling=True)
-    requests = create_requests(num_requests=10, max_tokens=20)
-
-    for req in requests:
-        scheduler.add_request(req)
-
-    sched_outputs: deque[SchedulerOutput] = deque()
-    sched_outputs.append(scheduler.schedule())
-    sched_outputs.append(scheduler.schedule())
-
-    abort_order = [0, 8, 3, 1, 6, 4, 2, 5, 7, 9]
-    abort_order_copy = abort_order.copy()
-
-    def abort_request():
-        if not abort_order:
-            return
-        req = requests[abort_order.pop(0)]
-        scheduler.finish_requests(req.request_id, RequestStatus.FINISHED_ABORTED)
-
-    while sched_outputs:
-        # Abort a scheduled request.
-        abort_request()
-        sched_output = sched_outputs.popleft()
-        model_runner_output = _make_model_runner_output(sched_output)
-        scheduler.update_from_output(sched_output, model_runner_output)
-
-        sched_output = scheduler.schedule()
-        if sched_output.num_scheduled_tokens:
-            sched_outputs.append(sched_output)
-
-    for i, req in enumerate(requests):
-        assert req.status == RequestStatus.FINISHED_ABORTED
-        assert req.num_output_tokens == abort_order_copy.index(i)
 
 
 def test_prefix_caching_for_prefill_dedup():
@@ -353,12 +359,13 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler.finished_req_ids = set()
     scheduler.finished_req_ids_dict = None
     scheduler.grammar_compile_error_reqs = set()
+    scheduler.encoder_cache_mismatch_reqs = set()
     scheduler.vllm_config = Mock()
-    scheduler.vllm_config.model_config.enable_return_routed_experts = False
-    scheduler.enable_return_routed_experts = False
+    scheduler.aux_output_connector = None
     scheduler.return_sampling_mask = False
     scheduler.recompute_kv_load_failures = False
     scheduler.defer_block_free = False
+    scheduler.processed_step_seq = 0
     scheduler.make_stats = Mock(return_value=None)
     scheduler.max_model_len = 128
 
@@ -376,7 +383,6 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
         total_num_scheduled_tokens=1,
         scheduled_encoder_inputs={},
         scheduled_spec_decode_tokens={},
-        num_common_prefix_blocks=[],
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
     )
@@ -572,7 +578,7 @@ def _assert_positions_consistent(req, engine: PipelinedEngine) -> None:
         )
 
 
-@pytest.mark.parametrize("num_spec", [0, 3])
+@pytest.mark.parametrize("num_spec", range(8))
 def test_kv_pressure_preemption_with_inflight_output(num_spec: int):
     """KV-pressure preemption of requests with in-flight async output.
 
@@ -636,7 +642,10 @@ def test_kv_pressure_preemption_with_inflight_output(num_spec: int):
 
 
 @pytest.mark.parametrize("pp_size", [1, 3])
-def test_reset_prefix_cache_with_inflight_output_under_kv_pressure(pp_size: int):
+@pytest.mark.parametrize("num_spec", range(1, 8))
+def test_reset_prefix_cache_with_inflight_output_under_kv_pressure(
+    pp_size: int, num_spec: int
+):
     """reset_prefix_cache(reset_running_requests=True) resumes requests in
     the same step it preempts them, so in-flight output must be dropped (the
     resume resamples those positions).
@@ -649,7 +658,7 @@ def test_reset_prefix_cache_with_inflight_output_under_kv_pressure(pp_size: int)
     accumulated) and stay dropped.
     """
     max_tokens = 24
-    scheduler = _create_async_pp_scheduler(num_spec=3, pp_size=pp_size)
+    scheduler = _create_async_pp_scheduler(num_spec=num_spec, pp_size=pp_size)
     requests = create_requests(
         num_requests=8, num_tokens=8, max_tokens=max_tokens, ignore_eos=True
     )

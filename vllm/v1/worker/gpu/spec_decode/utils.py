@@ -12,9 +12,24 @@ from vllm.v1.worker.gpu.input_batch import InputBatch
 
 logger = init_logger(__name__)
 
-# Keep draft Gumbel keys disjoint from verifier/recovery keys at the same
-# sequence position. The value stays within Triton's signed 32-bit RNG range.
-DRAFT_GUMBEL_POS_OFFSET = 1 << 30
+
+def get_drafter_hidden_states(
+    model: torch.nn.Module, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    """Hidden states fed to the drafter.
+
+    Targets such as DeepSeek V4 expose the pre-hc_head residual through
+    get_mtp_target_hidden_states(). The buffer is sized at
+    max_num_batched_tokens and only allocated for drafters that consume
+    target hidden states, so None means "use the regular hidden states".
+    """
+    get_target_hidden_states = getattr(model, "get_mtp_target_hidden_states", None)
+    if get_target_hidden_states is None:
+        return hidden_states
+    target_hidden_states = get_target_hidden_states()
+    if target_hidden_states is None:
+        return hidden_states
+    return target_hidden_states[: hidden_states.shape[0]]
 
 
 def get_pp_safe_draft_load_config(load_config: LoadConfig) -> LoadConfig:

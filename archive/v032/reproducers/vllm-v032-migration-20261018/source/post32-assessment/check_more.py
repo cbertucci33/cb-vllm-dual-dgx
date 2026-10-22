@@ -1,0 +1,1 @@
+s=open('/opt/project/evidence/vllm-v032-migration-20261018/source/post32-assessment/check_candidates.py').read();s=s.replace('nums=[61253,62027,59511,61455,55671,61810,62180,61996,61174,46399,61989,58857,62129]','nums=[52477,61938,56549,62221]').replace("out/'candidate-status.json'","out/'additional-candidate-status.json'");exec(s)

@@ -1,0 +1,113 @@
+diff --git a/vllm/entrypoints/openai/responses/serving.py b/vllm/entrypoints/openai/responses/serving.py
+index d0821c43b9..85b9dc6d41 100644
+--- a/vllm/entrypoints/openai/responses/serving.py
++++ b/vllm/entrypoints/openai/responses/serving.py
+@@ -1372,8 +1372,8 @@ class OpenAIServingResponses(GenerateBaseServing):
+         for event in record_events(processor.close_current()):
+             yield event
+ 
+-        assert isinstance(context, SimpleContext)
+-        context.streamed_output_items = processor.output_items
++        if isinstance(context, SimpleContext):
++            context.streamed_output_items = processor.output_items
+ 
+     async def _process_harmony_streaming_events(
+         self,
+diff --git a/vllm/model_executor/models/qwen3_dflash.py b/vllm/model_executor/models/qwen3_dflash.py
+index c596cbd0f0..fe75730185 100644
+--- a/vllm/model_executor/models/qwen3_dflash.py
++++ b/vllm/model_executor/models/qwen3_dflash.py
+@@ -600,14 +600,9 @@ class DFlashQwen3Model(nn.Module):
+             self.register_buffer(name, value, persistent=False)
+ 
+     def refresh_derived_weights(self) -> None:
+-        # Only the GLM MXFP8 policy opts into rebuilding after packed reload.
+-        # Other draft architectures retain their own lifecycle and projections.
+-        policy = getattr(self, "dflash_execution_policy", None)
+-        if (
+-            policy is not None
+-            and policy.fused_mxfp8_context_kv
+-            and hasattr(self, "_num_attn_layers")
+-        ):
++        # Both unquantized and GLM MXFP8 paths retain derived context K/V
++        # copies. Rebuild them after any weight reload from current projections.
++        if hasattr(self, "_num_attn_layers"):
+             self._build_fused_kv_buffers()
+ 
+     @torch.inference_mode()
+diff --git a/vllm/parser/mimo.py b/vllm/parser/mimo.py
+index 277fb2a492..565ce38a1b 100644
+--- a/vllm/parser/mimo.py
++++ b/vllm/parser/mimo.py
+@@ -63,10 +63,9 @@ class MiMoParser(Qwen3Parser):
+             turn_boundary_tokens=CHATML_TURN_BOUNDARIES,
+         )
+         transitions = dict(config.transitions)
+-        if thinking:
+-            transitions[ParserState.CONTENT, "THINK_START"] = Transition(
+-                ParserState.REASONING, (EventType.REASONING_START,)
+-            )
++        transitions[ParserState.CONTENT, "THINK_START"] = Transition(
++            ParserState.REASONING, (EventType.REASONING_START,)
++        )
+         kwargs.setdefault(
+             "parser_engine_config",
+             replace(
+diff --git a/vllm/v1/spec_decode/utils.py b/vllm/v1/spec_decode/utils.py
+index 471d51d355..fe383474d8 100644
+--- a/vllm/v1/spec_decode/utils.py
++++ b/vllm/v1/spec_decode/utils.py
+@@ -661,6 +661,7 @@ def copy_and_expand_dflash_inputs_kernel(
+     num_speculative_tokens,  # tl.int32
+     total_input_tokens,  # tl.int32
+     BLOCK_SIZE: tl.constexpr,
++    PAD_SLOT_ID: tl.constexpr,
+     HAS_NUM_REJECTED: tl.constexpr = False,
+ ):
+     """Fused kernel for DFlash first-pass input setup.
+@@ -705,6 +706,7 @@ def copy_and_expand_dflash_inputs_kernel(
+         valid_ctx_end = ctx_end
+     last_pos = tl.load(target_positions_ptr + valid_ctx_end - 1)
+     query_pos = last_pos + 1 + query_off
++    is_valid_ctx = is_ctx & (ctx_start + j < valid_ctx_end)
+ 
+     positions = tl.where(is_ctx, ctx_pos, query_pos)
+ 
+@@ -724,8 +726,11 @@ def copy_and_expand_dflash_inputs_kernel(
+         other=0,
+     ).to(tl.int64)
+     slot = block_id * block_size + (positions % block_size)
+-    tl.store(out_context_slot_mapping_ptr + ctx_pos_out, slot, mask=is_ctx)
+-    tl.store(out_query_slot_mapping_ptr + query_out, slot, mask=is_query)
++    # Rejected context and evicted/null pages must never write KV into block 0.
++    context_slot = tl.where(is_valid_ctx & (block_id != 0), slot, PAD_SLOT_ID)
++    query_slot = tl.where(block_id != 0, slot, PAD_SLOT_ID)
++    tl.store(out_context_slot_mapping_ptr + ctx_pos_out, context_slot, mask=is_ctx)
++    tl.store(out_query_slot_mapping_ptr + query_out, query_slot, mask=is_query)
+ 
+     # --- Input IDs (query tokens only) ---
+     bonus_token = tl.load(next_token_ids_ptr + req_idx)
+@@ -809,6 +814,7 @@ def _copy_and_expand_dflash_inputs(
+     num_blocks = triton.cdiv(max_tokens_per_req, triton_block_size)
+     return (num_reqs, num_blocks), dict(
+         BLOCK_SIZE=triton_block_size,
++        PAD_SLOT_ID=PADDING_SLOT_ID,
+     )
+ 
+ 
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index a4e7e3ca26..1d51bac688 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -4674,8 +4674,10 @@ class GPUModelRunner(
+                 self.draft_token_ids_cpu[:num_reqs, :num_spec_tokens].copy_(
+                     draft_token_ids, non_blocking=True
+                 )
++                draft_token_ids.record_stream(self.draft_token_ids_copy_stream)
+             else:
+-                # No copy needed, just zero-out cpu tensor.
++                # A previous D2H copy may still be writing this CPU tensor.
++                self.draft_token_ids_event.synchronize()
+                 self.draft_token_ids_cpu[:num_reqs, :num_spec_tokens] = 0
+             self.draft_token_ids_event.record()
+ 

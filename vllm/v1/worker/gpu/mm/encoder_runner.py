@@ -18,6 +18,7 @@ from vllm.multimodal.utils import (
     group_and_batch_mm_kwargs,
     set_mm_embedding_modality,
 )
+from vllm.utils.mem_utils import check_startup_memory
 from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.utils import (
@@ -55,6 +56,11 @@ class EncoderRunner:
         self.encoder_timing_registry: dict[str, EncoderTimingStats] = {}
         self._timing_lock = threading.Lock()
 
+        check_startup_memory(
+            device_bytes=max_num_tokens * hidden_size * dtype.itemsize,
+            label="multimodal input embeddings",
+            device=device,
+        )
         self.inputs_embeds = torch.zeros(
             max_num_tokens, hidden_size, dtype=dtype, device=device
         )
@@ -150,9 +156,12 @@ class EncoderRunner:
     def execute_mm_encoder(
         self, mm_kwargs: list[tuple[str, MultiModalKwargsItem]]
     ) -> list[torch.Tensor]:
+        # Stable-sort items by modality so each modality is encoded in as few
+        # batches as possible. The returned outputs are restored to input order.
+        order = sorted(range(len(mm_kwargs)), key=lambda i: mm_kwargs[i][0])
         encoder_outputs: list[torch.Tensor] = []
         for modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
-            mm_kwargs, device=self.device, pin_memory=PIN_MEMORY
+            [mm_kwargs[i] for i in order], device=self.device, pin_memory=PIN_MEMORY
         ):
             cg_manager = self.cudagraph_manager
             cudagraph_output = (
@@ -169,7 +178,7 @@ class EncoderRunner:
             )
             sanity_check_mm_encoder_outputs(batch_outputs, expected_num_items=num_items)
             encoder_outputs.extend(batch_outputs)
-        return encoder_outputs
+        return [encoder_outputs[i] for i in np.argsort(order)]
 
     @contextmanager
     def timed_encoder_operation(self, request_ids: Collection[str]):

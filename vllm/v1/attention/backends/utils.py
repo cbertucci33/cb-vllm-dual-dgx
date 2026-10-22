@@ -18,11 +18,15 @@ from typing_extensions import runtime_checkable
 
 from vllm.config import CacheConfig, VllmConfig, get_layers_from_vllm_config
 from vllm.config.cache import _layout_from_name
-from vllm.triton_utils import tl, triton
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d, np_to_pinned_tensor
-from vllm.v1.kv_cache_interface import KVCacheLayout, KVCacheSpec, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheLayout,
+    KVCacheSpec,
+    MambaSpec,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -287,9 +291,13 @@ def resolve_kv_cache_layout(
     # specs can re-interpret HNC with different sizes as long as the total number of
     # bytes is the same. If not block-compact, each spec must agree on HNC to alias
     # the same page (this aliasing is done by the Hybrid Memory Allocator, HMA).
+    # Specs without per-layer views lay out their own raw backing tensor.
+    kv_cache_specs = tuple(
+        spec for spec in kv_cache_specs or () if spec.has_layer_views
+    )
     hnc_shapes = {
         (spec.num_heads, spec.num_states, spec.page_size_bytes)
-        for spec in kv_cache_specs or ()
+        for spec in kv_cache_specs
     }
     if len(hnc_shapes) > 1:
         candidates = [m for m in candidates if m.is_block_compact]
@@ -297,6 +305,24 @@ def resolve_kv_cache_layout(
             raise ValueError(
                 "Specs with mixed HNC shapes need a block-compact layout, but "
                 f"none is in every supported set: {supported_layouts}."
+            )
+
+    # Self-addressed per-request rings (e.g. the kpool tail) are replicated
+    # state like Mamba and don't need a separate draft group.
+    dcp_sharding = {
+        spec.dcp_sharded
+        for spec in kv_cache_specs
+        if isinstance(spec, AttentionSpec) and spec.uses_slot_mapping
+    }
+    page_sizes = {spec.page_size_bytes for spec in kv_cache_specs}
+    if len(dcp_sharding) > 1 and len(page_sizes) > 1:
+        # Sharded target and replicated draft caches need independent groups.
+        # Block-outer layouts can pack those groups without equalizing pages.
+        candidates = [layout for layout in candidates if layout.is_block_outermost]
+        if not candidates:
+            raise ValueError(
+                "DCP with a replicated draft and mixed KV page sizes requires "
+                f"a block-outer KV cache layout; supported sets: {supported_layouts}."
             )
 
     if (requested := envs.VLLM_KV_CACHE_LAYOUT) is not None:
@@ -325,8 +351,7 @@ def resolve_kv_cache_layout(
 
 @dataclass
 class PerLayerParameters:
-    """
-    Currently, FlashInfer backend only support models in which all layers share
+    """Currently, FlashInfer backend only support models in which all layers share
     the same values for the following hyperparameters. Should not be used for
     trtllm-gen backend since it supports different values for the following
     hyperparameters.
@@ -344,11 +369,9 @@ class PerLayerParameters:
 def get_per_layer_parameters(
     vllm_config: VllmConfig, layer_names: list[str], cls_: type["AttentionImpl"]
 ) -> dict[str, PerLayerParameters]:
-    """
-    Scan layers in `layer_names` and determine some hyperparameters
+    """Scan layers in `layer_names` and determine some hyperparameters
     to use during `plan`.
     """
-
     layers = get_layers_from_vllm_config(
         vllm_config,
         AttentionLayerBase,  # type: ignore[type-abstract]
@@ -406,8 +429,7 @@ def get_num_attention_heads_from_layers(
 def infer_global_hyperparameters(
     per_layer_params: dict[str, PerLayerParameters],
 ) -> PerLayerParameters:
-    """
-    Currently, FlashInfer backend other than trtllm-gen
+    """Currently, FlashInfer backend other than trtllm-gen
     only support models in which all layers share
     the same values for the following hyperparameters:
     - `window_left`
@@ -417,7 +439,6 @@ def infer_global_hyperparameters(
     So this function asserts that all layers share the same values for these
     hyperparameters and returns the global values.
     """
-
     assert len(per_layer_params) > 0, "No attention layers found in the model."
 
     param_sets = list(per_layer_params.values())
@@ -711,8 +732,7 @@ def split_decodes_prefills_and_extends(
     common_attn_metadata: CommonAttentionMetadata,
     decode_threshold: int = 1,
 ) -> tuple[int, int, int, int, int, int]:
-    """
-    Assuming a reordered batch, finds the boundary between prefill and decode
+    """Assuming a reordered batch, finds the boundary between prefill and decode
     requests.
 
     Args:
@@ -727,6 +747,7 @@ def split_decodes_prefills_and_extends(
         num_decode_tokens: The number of tokens in the decode requests.
         num_extend_tokens: The number of tokens in the extend requests.
         num_prefill_tokens: The number of tokens in the prefill requests.
+
     """
     max_query_len = common_attn_metadata.max_query_len
     num_reqs = common_attn_metadata.num_reqs
@@ -785,8 +806,7 @@ def split_decodes_and_prefills(
     require_uniform: bool = False,
     treat_short_extends_as_decodes: bool = True,
 ) -> tuple[int, int, int, int]:
-    """
-    Assuming a reordered batch, finds the boundary between prefill and decode
+    """Assuming a reordered batch, finds the boundary between prefill and decode
     requests.
 
     The batch is expected to be ordered as:
@@ -808,6 +828,7 @@ def split_decodes_and_prefills(
         num_prefills: The number of prefill requests.
         num_decode_tokens: The number of tokens in the decode requests.
         num_prefill_tokens: The number of tokens in the prefill requests.
+
     """
     max_query_len = common_attn_metadata.max_query_len
     num_reqs = common_attn_metadata.num_reqs
@@ -834,7 +855,7 @@ def split_decodes_and_prefills(
             (query_lens == query_lens[0]) | (query_lens == 0)
         ):
             return num_reqs, 0, num_tokens, 0  # all decodes
-        is_prefill = query_lens != query_lens[0]
+        is_prefill = (query_lens != query_lens[0]) & (query_lens != 0)
     else:
         is_prefill = query_lens > decode_threshold
 
@@ -856,16 +877,17 @@ def split_decodes_and_prefills(
 def split_prefill_chunks(
     seq_lens_cpu: torch.Tensor, workspace_size: int, request_offset: int = 0
 ) -> list[tuple[int, int]]:
-    """
-    Split the prefill requests into chunks such that the total sequence length
+    """Split the prefill requests into chunks such that the total sequence length
     of each chunk is less than or equal to the workspace size.
 
     Args:
         seq_lens_cpu: The sequence lengths of the prefill requests on CPU.
         workspace_size: The maximum workspace size (in tokens) per chunk.
         request_offset: The offset to add to the request indices.
+
     Returns:
         A list of tuples of (reqs_start, reqs_end) representing chunk boundaries.
+
     """
     chunk_bounds = []
     i, n = 0, len(seq_lens_cpu)
@@ -885,8 +907,7 @@ def reorder_batch_to_split_decodes_and_prefills(
     scheduler_output: "SchedulerOutput",
     decode_threshold: int = 1,
 ) -> bool:
-    """
-    Reorders the batch to split into prefill and decode requests; places all
+    """Reorders the batch to split into prefill and decode requests; places all
     requests with <= decode_threshold tokens at the front of the batch.
 
     The batch is reordered into 4 regions:
@@ -897,6 +918,7 @@ def reorder_batch_to_split_decodes_and_prefills(
 
     Returns:
         True if the batch was modified, False otherwise.
+
     """
     num_reqs = len(input_batch.req_ids)
     num_scheduled_tokens = [
@@ -961,8 +983,7 @@ def reorder_batch_to_split_decodes_and_prefills(
 
 
 def reshape_query_for_spec_decode(query: torch.Tensor, batch_size: int) -> torch.Tensor:
-    """
-    Reshapes the query tensor for the specified batch size, so that
+    """Reshapes the query tensor for the specified batch size, so that
     it has shape (batch_size, seq_len, num_heads, head_dim).
     """
     assert query.dim() == 3, f"query must be 3D, got {query.dim()}D"
@@ -977,8 +998,7 @@ def reshape_query_for_spec_decode(query: torch.Tensor, batch_size: int) -> torch
 
 
 def reshape_attn_output_for_spec_decode(attn_output: torch.Tensor) -> torch.Tensor:
-    """
-    Reshapes the attention output tensor, so that
+    """Reshapes the attention output tensor, so that
     the batch_size and seq_len dimensions are combined.
     """
     if attn_output.dim() == 3:
@@ -1103,6 +1123,7 @@ def get_dcp_local_seq_lens(
     Only consider dcp now, we can extend the case of cp based on this.
     """
     seq_lens_i32 = seq_lens.to(torch.int32)
+    rank_offsets: int | torch.Tensor
     if dcp_rank is None:
         rank_offsets = torch.arange(
             dcp_size,
@@ -1120,7 +1141,8 @@ def get_dcp_local_seq_lens(
         rank_offsets = dcp_rank
         seq_lens_tiled = seq_lens_i32
     else:
-        rank_offsets = torch.tensor(dcp_rank, dtype=torch.int32, device=seq_lens.device)
+        # Use the Python scalar directly to avoid a synchronizing H2D copy.
+        rank_offsets = dcp_rank
         seq_lens_tiled = seq_lens_i32
     base = (
         seq_lens_tiled
@@ -1138,52 +1160,14 @@ def get_dcp_local_seq_lens(
     return dcp_local_seq_lens
 
 
-@triton.jit
-def _mamba_align_block_table_kernel(
-    out_ptr,
-    block_table_ptr,
-    block_table_stride,
-    seq_lens_ptr,
-    block_size,
-    n_out,
-    BLOCK: tl.constexpr,
-):
-    """Gather the last ``n_out`` block-table entries of each request.
-
-    One program per request. This replaces a five-statement PyTorch expression
-    that expanded to seven kernels over a ``(num_reqs,)`` tensor -- one element
-    in a single-request decode -- so almost all of its cost was launch
-    overhead rather than work.
-    """
-    req_idx = tl.program_id(0)
-    seq_len = tl.load(seq_lens_ptr + req_idx)
-    # A zero-length request in a CUDA graph has an invalid block table; clamp
-    # to 0 so it reads a valid row, exactly as the previous clamp_ did.
-    start = tl.maximum((seq_len - 1) // block_size, 0)
-    offs = tl.arange(0, BLOCK)
-    mask = offs < n_out
-    vals = tl.load(
-        block_table_ptr + req_idx * block_table_stride + start + offs,
-        mask=mask,
-        other=0,
-    )
-    tl.store(out_ptr + req_idx * n_out + offs, vals, mask=mask)
-
-
 def mamba_get_block_table_tensor(
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
     kv_cache_spec: KVCacheSpec,
     mamba_cache_mode: str,
 ) -> torch.Tensor:
-    """
-    Get the block table tensor for mamba kernels from the input
+    """Get the block table tensor for mamba kernels from the input
     common_attn_metadata.block_table_tensor given different mamba cache modes.
-
-    - "all":   input  (#requests, cdiv(max_model_len, block_size)
-                        + num_speculative_blocks);
-               output (#requests, cdiv(max_model_len, block_size)
-                        + num_speculative_blocks).
 
     - "none":  input  (#requests, 1 + num_speculative_blocks);
                output (#requests, 1 + num_speculative_blocks).
@@ -1192,27 +1176,20 @@ def mamba_get_block_table_tensor(
                output (#requests, 1 + num_speculative_blocks), which are the last
                1 + num_speculative_blocks of each request.
     """
-    if mamba_cache_mode in ("all", "none"):
+    if mamba_cache_mode == "none":
         return block_table
     else:
         assert isinstance(kv_cache_spec, MambaSpec)
-        # The arithmetic here is trivial -- a divide, a clamp, an arange, an
-        # add, a cast and a gather -- but as PyTorch ops it was seven kernel
-        # launches over a (num_reqs,) tensor, which holds a single element in a
-        # one-request decode. One Triton kernel does the same work in one
-        # launch. Zero-length requests in a CUDA graph still clamp to row 0.
-        num_reqs = block_table.shape[0]
-        n_out = 1 + kv_cache_spec.num_speculative_blocks
-        out = block_table.new_empty((num_reqs, n_out))
-        if num_reqs == 0:
-            return out
-        _mamba_align_block_table_kernel[(num_reqs,)](
-            out,
-            block_table,
-            block_table.stride(0),
-            seq_lens,
-            kv_cache_spec.block_size,
-            n_out,
-            BLOCK=triton.next_power_of_2(n_out),
+        # NOTE: For 0-length requests in CUDA graph, use a start_index of 0
+        # to handle the invalid block table.
+        start_indices = (seq_lens - 1) // kv_cache_spec.block_size
+        start_indices.clamp_(min=0)
+        # Use int32 for arithmetic to avoid dtype promotion overhead,
+        # then convert to int64 for gather (which requires Long indices)
+        offsets = torch.arange(
+            1 + kv_cache_spec.num_speculative_blocks,
+            device=block_table.device,
+            dtype=torch.int32,
         )
-        return out
+        indices_to_gather = (start_indices.unsqueeze(1) + offsets).to(torch.int64)
+        return torch.gather(block_table, 1, indices_to_gather)

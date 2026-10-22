@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
 import gc
+import sys
 import time
 from collections.abc import Generator
 from dataclasses import dataclass, field
@@ -13,6 +14,7 @@ import torch.types
 
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.utils.startup_memory import StartupMemoryBudget
 
 from .mem_constants import GiB_bytes, KiB_bytes, MiB_bytes
 
@@ -54,6 +56,7 @@ def release_device_memory_under_pressure(device: torch.device) -> bool:
 
     Returns:
         True if memory was released.
+
     """
     if device.type != "cuda" or not current_platform.is_integrated_gpu(device.index):
         return False
@@ -230,8 +233,7 @@ def memory_profiling(
     baseline_snapshot: MemorySnapshot,
     weights_memory: int = 0,
 ) -> Generator[MemoryProfilingResult, None, None]:
-    """
-    Memory profiling context manager.
+    """Memory profiling context manager.
 
     baseline_snapshot: the memory snapshot before the current vLLM instance.
     weights_memory: memory used by PyTorch when loading the model weights.
@@ -292,30 +294,164 @@ def memory_profiling(
     )
 
     result.before_profile.measure()
+    state = _startup_memory_state(baseline_snapshot.device_)
+    if state is not None:
+        budget, available, _ = state
+        budget.observed_peak = max(0, budget.initial_available - available)
 
-    yield result
+    failed = False
+    try:
+        yield result
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        try:
+            gc.collect()
+            torch.accelerator.empty_cache()
 
-    gc.collect()
-    torch.accelerator.empty_cache()
+            result.after_profile.measure()
 
-    result.after_profile.measure()
+            diff_profile = result.after_profile - result.before_profile
+            diff_from_create = result.after_profile - result.before_create
+            result.torch_peak_increase = diff_profile.torch_peak
+            result.non_torch_increase = diff_from_create.non_torch_memory
+            result.profile_time = diff_profile.timestamp
 
-    diff_profile = result.after_profile - result.before_profile
-    diff_from_create = result.after_profile - result.before_create
-    result.torch_peak_increase = diff_profile.torch_peak
-    result.non_torch_increase = diff_from_create.non_torch_memory
-    result.profile_time = diff_profile.timestamp
+            # Measure total consumption via mem_get_info() instead of
+            # memory_reserved(), which goes negative when pluggable allocators
+            # (e.g. cumem) bypass PyTorch's tracking.
+            result.total_consumed = (
+                result.before_create.free_memory - result.after_profile.free_memory
+            )
 
-    # Measure total consumption via mem_get_info() instead of
-    # memory_reserved(), which goes negative when pluggable allocators
-    # (e.g. cumem) bypass PyTorch's tracking.
-    result.total_consumed = (
-        result.before_create.free_memory - result.after_profile.free_memory
+            # total_consumed already covers persistent torch allocations; add only the
+            # transient peak headroom to avoid double-counting.
+            result.transient_peak_headroom = max(
+                max(
+                    0,
+                    result.after_profile.torch_peak
+                    - result.after_profile.torch_allocated,
+                ),
+                startup_memory_peak_headroom(
+                    result.after_profile.free_memory, baseline_snapshot.device_
+                ),
+            )
+            result.non_kv_cache_memory = (
+                result.total_consumed + result.transient_peak_headroom
+            )
+        except BaseException as exc:
+            if not failed:
+                raise
+            logger.warning("Memory profile cleanup failed after root error: %s", exc)
+
+
+_STARTUP_MEMORY_BUDGETS: dict[int, StartupMemoryBudget] = {}
+_STARTUP_ALLOCATOR_FRACTIONS: dict[int, float] = {}
+
+
+def configure_startup_memory_guard(
+    snapshot: MemorySnapshot, requested_bytes: int
+) -> None:
+    """Compatibility hook; custom startup admission policy has been removed."""
+    return
+
+
+def restore_startup_allocator_limit(device=None) -> None:
+    """Restore startup policy without hiding an already active root failure."""
+    if not _STARTUP_ALLOCATOR_FRACTIONS:
+        return
+    device = torch.device(
+        current_platform.current_device() if device is None else device
     )
+    index = device.index
+    if index not in _STARTUP_ALLOCATOR_FRACTIONS:
+        return
+    previous = _STARTUP_ALLOCATOR_FRACTIONS[index]
+    original_error = sys.exc_info()[1]
+    try:
+        torch.cuda.set_per_process_memory_fraction(previous, device)
+    except BaseException as exc:
+        if original_error is None:
+            raise
+        if hasattr(original_error, "add_note"):
+            original_error.add_note(f"Restoring startup allocator policy failed: {exc}")
+        logger.warning("Could not restore startup allocator policy: %s", exc)
+        return
+    del _STARTUP_ALLOCATOR_FRACTIONS[index]
 
-    # total_consumed already covers persistent torch allocations; add only the
-    # transient peak headroom to avoid double-counting.
-    result.transient_peak_headroom = (
-        result.after_profile.torch_peak - result.after_profile.torch_allocated
+
+def clear_startup_memory_guard(device=None) -> None:
+    """Forget a completed or stopped worker's startup budget."""
+    if not _STARTUP_MEMORY_BUDGETS and not _STARTUP_ALLOCATOR_FRACTIONS:
+        return
+    device = torch.device(
+        current_platform.current_device() if device is None else device
     )
-    result.non_kv_cache_memory = result.total_consumed + result.transient_peak_headroom
+    try:
+        restore_startup_allocator_limit(device)
+    finally:
+        _STARTUP_MEMORY_BUDGETS.pop(device.index, None)
+
+
+def _startup_memory_state(device=None):
+    # Frontend/standalone CPU processes must not initialize CUDA to discover
+    # that they do not own a startup budget.
+    if not _STARTUP_MEMORY_BUDGETS:
+        return None
+    if device is not None:
+        device = torch.device(device)
+    if device is None or device.type == "cpu":
+        if len(_STARTUP_MEMORY_BUDGETS) != 1:
+            raise ValueError("CPU allocation has ambiguous startup device ownership")
+        index = next(iter(_STARTUP_MEMORY_BUDGETS))
+        device = torch.device(f"cuda:{index}")
+    elif device.index is None:
+        device = torch.device(current_platform.current_device())
+    budget = _STARTUP_MEMORY_BUDGETS.get(device.index)
+    if budget is None:
+        raise ValueError(f"No startup budget is configured for {device}")
+    host_available = psutil.virtual_memory().available
+    available = (
+        host_available
+        if budget.integrated
+        else torch.accelerator.get_memory_info(device)[0]
+    )
+    return budget, available, host_available
+
+
+def check_startup_memory(
+    *,
+    device_bytes: int = 0,
+    host_bytes: int = 0,
+    label: str,
+    device=None,
+    respect_reserve: bool = True,
+) -> None:
+    """Compatibility hook; allocation succeeds or fails through the allocator."""
+    return
+
+
+def record_startup_memory_peak(device=None) -> None:
+    """Record joint consumption at explicit allocation/release boundaries."""
+    state = _startup_memory_state(device)
+    if state is not None:
+        budget, available, _ = state
+        budget.observe(available)
+
+
+def startup_memory_guard_remaining_bytes(device=None) -> int | None:
+    """Remaining physical budget, or None outside a configured worker."""
+    state = _startup_memory_state(device)
+    if state is None:
+        return None
+    budget, available, _ = state
+    return budget.remaining(available)
+
+
+def startup_memory_peak_headroom(available_after: int, device=None) -> int:
+    device = torch.device(
+        current_platform.current_device() if device is None else device
+    )
+    budget = _STARTUP_MEMORY_BUDGETS.get(device.index)
+    return 0 if budget is None else budget.transient_headroom(available_after)

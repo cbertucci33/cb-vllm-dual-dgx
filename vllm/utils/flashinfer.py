@@ -8,6 +8,7 @@ Users of vLLM should always import **only** these wrappers.
 import contextlib
 import functools
 import importlib
+import importlib.metadata
 import importlib.util
 import os
 import shutil
@@ -17,6 +18,7 @@ from typing import Any, NoReturn
 
 import requests
 import torch
+from packaging.version import Version
 
 import vllm.envs as envs
 from vllm.logger import init_logger
@@ -25,6 +27,47 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY
 
 logger = init_logger(__name__)
+
+
+# Tuning context entered around each sparse MLA call during a scoped warmup.
+_sparse_mla_autotune_context: ContextVar[
+    Callable[[], contextlib.AbstractContextManager[Any]] | None
+] = ContextVar("flashinfer_sparse_mla_autotune_context", default=None)
+
+
+@contextlib.contextmanager
+def autotune_sparse_mla_only(
+    tune_context: Callable[[], contextlib.AbstractContextManager[Any]],
+) -> Iterator[None]:
+    """Tune only inside sparse MLA calls, not the enclosing model.
+
+    ``tune_context`` builds the FlashInfer tuning context entered around each
+    sparse MLA call, so GEMMs and MoE kernels run by the same warmup are not
+    tuned by it.
+    """
+    from flashinfer.autotuner import AutoTuner
+
+    if AutoTuner.get().is_tuning_mode:
+        raise RuntimeError(
+            "autotune_sparse_mla_only cannot run inside active FlashInfer autotuning"
+        )
+    token = _sparse_mla_autotune_context.set(tune_context)
+    try:
+        yield
+    finally:
+        _sparse_mla_autotune_context.reset(token)
+
+
+def _autotune_sparse_mla_call(fn: Callable[..., Any]) -> Callable[..., Any]:
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        tune_context = _sparse_mla_autotune_context.get()
+        if tune_context is None:
+            return fn(*args, **kwargs)
+        with tune_context():
+            return fn(*args, **kwargs)
+
+    return wrapper
 
 
 _bf16_autotune_buckets: ContextVar[tuple[int, ...] | None] = ContextVar(
@@ -54,21 +97,14 @@ def flashinfer_bf16_mm(
 ) -> torch.Tensor:
     from flashinfer import mm_bf16
 
-    tuning_buckets = _bf16_autotune_buckets.get()
-    tuning = (
-        autotune(tune_mode=True, tuning_buckets=tuning_buckets)
-        if tuning_buckets is not None
-        else contextlib.nullcontext()
+    return mm_bf16(
+        a,
+        b,
+        bias=bias,
+        pdl=pdl,
+        out_dtype=torch.bfloat16,
+        backend=backend,
     )
-    with tuning:
-        return mm_bf16(
-            a,
-            b,
-            bias=bias,
-            pdl=pdl,
-            out_dtype=torch.bfloat16,
-            backend=backend,
-        )
 
 
 # This is the storage path for the cubins, it can be replaced
@@ -78,6 +114,23 @@ FLASHINFER_CUBINS_REPOSITORY = os.environ.get(
     "FLASHINFER_CUBINS_REPOSITORY",
     "https://edge.urm.nvidia.com/artifactory/sw-kernelinferencelibrary-public-generic-local/",  # noqa: E501
 )
+
+_DEFAULT_CUDA_HOME = "/usr/local/cuda"
+
+
+def _flashinfer_nvcc_path() -> str | None:
+    """Return the nvcc FlashInfer's JIT would run, or None if it is missing.
+
+    Mirrors ``flashinfer.jit.cpp_ext.get_cuda_path()`` without importing
+    FlashInfer, whose import initializes CUDA.
+    """
+    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    if not cuda_home:
+        nvcc = shutil.which("nvcc")
+        cuda_home = (
+            os.path.dirname(os.path.dirname(nvcc)) if nvcc else _DEFAULT_CUDA_HOME
+        )
+    return shutil.which(os.path.join(cuda_home, "bin", "nvcc"))
 
 
 @functools.cache
@@ -99,15 +152,66 @@ def has_flashinfer() -> bool:
     if importlib.util.find_spec("flashinfer") is None:
         logger.debug_once("FlashInfer unavailable since package was not found")
         return False
-    # When not using flashinfer cubin,
-    # Also check if nvcc is available since it's required to JIT compile flashinfer
-    if not has_flashinfer_cubin() and shutil.which("nvcc") is None:
-        logger.debug_once(
-            "FlashInfer unavailable since nvcc was not found "
-            "and not using pre-downloaded cubins"
+    # FlashInfer's JIT runs nvcc and `ninja` (from PATH).
+    if not has_flashinfer_cubin() and (
+        _flashinfer_nvcc_path() is None or shutil.which("ninja") is None
+    ):
+        logger.warning_once(
+            "FlashInfer kernels are disabled: flashinfer-cubin is not installed "
+            "and nvcc (CUDA_HOME, CUDA_PATH, PATH or /usr/local/cuda) or ninja "
+            "(PATH) is missing. Set CUDA_HOME to a CUDA toolkit and put ninja on "
+            "PATH, or run `vllm download-kernels`."
         )
         return False
     return True
+
+
+def _installed_version(distribution: str) -> str | None:
+    try:
+        return Version(importlib.metadata.version(distribution)).public
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def has_flashinfer_jit_cache_wheels() -> bool:
+    """Return whether FlashInfer publishes flashinfer-jit-cache for the installed
+    PyTorch's CUDA version, which it does from CUDA 12.9."""
+    cuda_version = torch.version.cuda
+    return cuda_version is not None and Version(cuda_version) >= Version("12.9")
+
+
+def warn_if_flashinfer_kernels_missing() -> None:
+    """Warn on Hopper and newer GPUs when FlashInfer's precompiled kernels are
+    missing or were installed for another FlashInfer version."""
+    if not (
+        current_platform.is_cuda()
+        and current_platform.has_device_capability(90)
+        and has_flashinfer()
+    ):
+        return
+    flashinfer_version = _installed_version("flashinfer-python")
+    packages = []
+    if not envs.VLLM_HAS_FLASHINFER_CUBIN:
+        packages.append("flashinfer-cubin")
+    if has_flashinfer_jit_cache_wheels():
+        packages.append("flashinfer-jit-cache")
+    installed = {name: _installed_version(name) for name in packages}
+    if flashinfer_version is None or all(
+        version == flashinfer_version for version in installed.values()
+    ):
+        return
+    logger.warning_once(
+        "FlashInfer's precompiled kernels are missing or do not match "
+        "flashinfer-python %s (%s). FlashInfer then downloads and compiles "
+        "kernels at startup, which can take several minutes, or fails to import "
+        "mismatched ones. Run `vllm download-kernels` in this Python environment "
+        "to install them.",
+        flashinfer_version,
+        ", ".join(
+            f"{name} {version or 'not installed'}"
+            for name, version in installed.items()
+        ),
+    )
 
 
 @functools.cache
@@ -279,19 +383,26 @@ flashinfer_get_hybrid_num_tokens_buckets = _lazy_import_wrapper(
 trtllm_fp4_block_scale_moe = _lazy_import_wrapper(
     "flashinfer", "trtllm_fp4_block_scale_moe"
 )
-flashinfer_trtllm_batch_decode_with_kv_cache_mla = _lazy_import_wrapper(
-    "flashinfer.decode",
-    "trtllm_batch_decode_with_kv_cache_mla",
-    fallback_fn=_missing_sparse_mla,
+flashinfer_trtllm_batch_decode_with_kv_cache_mla = _autotune_sparse_mla_call(
+    _lazy_import_wrapper(
+        "flashinfer.decode",
+        "trtllm_batch_decode_with_kv_cache_mla",
+        fallback_fn=_missing_sparse_mla,
+    )
 )
-flashinfer_trtllm_batch_decode_sparse_mla_dsv4 = _lazy_import_wrapper(
-    "flashinfer.decode",
-    "trtllm_batch_decode_sparse_mla_dsv4",
-    fallback_fn=_missing_sparse_mla,
+flashinfer_trtllm_batch_decode_sparse_mla_dsv4 = _autotune_sparse_mla_call(
+    _lazy_import_wrapper(
+        "flashinfer.decode",
+        "trtllm_batch_decode_sparse_mla_dsv4",
+        fallback_fn=_missing_sparse_mla,
+    )
 )
 flashinfer_xqa_batch_decode_with_kv_cache = _lazy_import_wrapper(
     "flashinfer.decode",
     "xqa_batch_decode_with_kv_cache",
+)
+flashinfer_packed_fused_kda_decode = _lazy_import_wrapper(
+    "flashinfer", "packed_fused_kda_decode"
 )
 flashinfer_recurrent_kda = _lazy_import_wrapper(
     "flashinfer.kda",
@@ -312,9 +423,31 @@ autotune = _lazy_import_wrapper(
 
 
 @functools.cache
+def has_flashinfer_autotune_v2() -> bool:
+    """Return ``True`` if FlashInfer ships the managed-cache autotuner
+    (``flashinfer.autotune_v2``, flashinfer-ai/flashinfer#3861)."""
+    if not has_flashinfer():
+        return False
+    mod = _get_submodule("flashinfer")
+    return mod is not None and all(
+        callable(getattr(mod, name, None))
+        for name in ("autotune_v2", "autotune_v2_reload")
+    )
+
+
+@functools.cache
 def has_flashinfer_comm() -> bool:
     """Return `True` if FlashInfer comm module is available."""
     return has_flashinfer() and importlib.util.find_spec("flashinfer.comm") is not None
+
+
+@functools.cache
+def has_flashinfer_packed_fused_kda_decode() -> bool:
+    """Return whether FlashInfer's packed fused KDA decode API is available."""
+    if not has_flashinfer():
+        return False
+    module = _get_submodule("flashinfer")
+    return bool(module and callable(getattr(module, "packed_fused_kda_decode", None)))
 
 
 @functools.cache
@@ -415,33 +548,6 @@ def has_flashinfer_sparse_mla_sm120_config(num_q_heads: int, top_k: int) -> bool
     mod = _get_submodule("flashinfer.mla._sparse_mla_sm120")
     dispatch = getattr(mod, "_DECODE_DSV4_DISPATCH", None) if mod else None
     return dispatch is not None and (int(num_q_heads), int(top_k)) in dispatch
-
-
-@functools.cache
-def has_flashinfer_topk_varlen_gvr2() -> bool:
-    """Return ``True`` if FlashInfer ships the ``gvr_2`` varlen top-k backend
-    (self-sampling GVR V2, ``flashinfer.top_k_varlen(backend="gvr_2")``).
-
-    Feature-detected on the production entry ``run_varlen`` (FlashInfer >=
-    0.7.0: per-row ``kv_lens`` plus a capture-stable ``max_seq_len``) and the
-    band-aware ``warmup_varlen`` (``row_stride``) that the dispatcher calls.
-    """
-    if not has_flashinfer():
-        return False
-    try:
-        import inspect
-
-        from flashinfer.topk_varlen.kernels import gvr2_topk_host
-
-        run_params = inspect.signature(gvr2_topk_host.run_varlen).parameters
-        warmup_params = inspect.signature(gvr2_topk_host.warmup_varlen).parameters
-    except Exception:
-        # The module imports the CuTe DSL; anything it raises means unusable.
-        return False
-    return {"pre_idx", "kv_lens", "max_seq_len"} <= set(run_params) and {
-        "num_rows_list",
-        "row_stride",
-    } <= set(warmup_params)
 
 
 @functools.cache
@@ -642,8 +748,7 @@ def supports_trtllm_attention(is_prefill: bool = False) -> bool:
 
 
 def force_use_trtllm_attention() -> bool | None:
-    """
-    This function should only be called during initialization stage when vllm config
+    """This function should only be called during initialization stage when vllm config
     is set.
     Return `None` if --attention-config.use_trtllm_attention is not set,
     return `True` if TRTLLM attention is forced to be used,
@@ -681,7 +786,6 @@ def use_trtllm_attention(
     has_spec: bool = False,
 ) -> bool:
     """Return `True` if TRTLLM attention is used."""
-
     # CLI argument is set to 0 - respect it
     if force_use_trtllm is not None and not force_use_trtllm:
         return False
@@ -789,6 +893,7 @@ if has_flashinfer():
             k_nope: The nope part of k, shape [num_tokens, num_heads, nope_dim].
             k_pe: The rope part of k (shared), shape [num_tokens, 1, rope_dim].
                   This is broadcast to all heads.
+
         """
         from flashinfer.concat_ops import concat_mla_k
 
@@ -1087,47 +1192,6 @@ def flashinfer_scaled_fp4_mm(
     )
 
 
-def flashinfer_scaled_fp4_mm_out(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    block_scale_a: torch.Tensor,
-    block_scale_b: torch.Tensor,
-    alpha: torch.Tensor,
-    out: torch.Tensor,
-    out_dtype: torch.dtype | None,
-    use_8x4_sf_layout: bool,
-    backend: str,
-) -> torch.Tensor:
-    assert a.ndim == 2 and b.ndim == 2 and out.ndim == 2
-    assert block_scale_a.ndim == 2 and block_scale_b.ndim == 2
-    assert a.stride(-1) == 1
-    assert a.shape[1] == b.shape[0]
-    assert out.shape == (a.shape[0], b.shape[1])
-    assert out.device.type == "cuda"
-
-    if backend in ("cutlass", "cudnn"):
-        if block_scale_a.dtype != torch.uint8:
-            block_scale_a = block_scale_a.view(torch.uint8)
-        if block_scale_b.dtype != torch.uint8:
-            block_scale_b = block_scale_b.view(torch.uint8)
-
-    from flashinfer import mm_fp4 as flashinfer_mm_fp4_
-
-    flashinfer_mm_fp4_(
-        a,
-        b,
-        block_scale_a,
-        block_scale_b,
-        alpha,
-        out_dtype or out.dtype,
-        out=out,
-        block_size=16,
-        use_8x4_sf_layout=use_8x4_sf_layout,
-        backend=backend,
-    )
-    return out
-
-
 def flashinfer_scaled_fp8_mm(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1156,38 +1220,6 @@ def flashinfer_scaled_fp8_mm(
     if bias is not None:
         output = output + bias
     return output
-
-
-def flashinfer_scaled_fp8_mm_out(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    scale_a: torch.Tensor,
-    scale_b: torch.Tensor,
-    out: torch.Tensor,
-    out_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    assert a.ndim == 2 and b.ndim == 2 and out.ndim == 2
-    assert a.shape[1] == b.shape[0]
-    assert out.shape == (a.shape[0], b.shape[1])
-    assert scale_a.numel() == 1 and scale_b.numel() == 1
-    assert a.dtype == torch.float8_e4m3fn and b.dtype == torch.float8_e4m3fn
-    assert out.device.type == "cuda"
-    assert a.is_contiguous()
-
-    from flashinfer import bmm_fp8 as bmm_fp8_
-
-    bmm_fp8_(
-        a.unsqueeze(0),
-        # FlashInfer expects the weight in the same column-major view layout
-        # consumed by flashinfer_scaled_fp8_mm, so keep the transposed view.
-        b.unsqueeze(0),
-        scale_a,
-        scale_b,
-        out_dtype or out.dtype,
-        out.unsqueeze(0),
-        "auto",
-    )
-    return out
 
 
 def flashinfer_quant_nvfp4_8x4_sf_layout(
@@ -1289,9 +1321,9 @@ def is_flashinfer_cudnn_fp8_prefill_attn_supported() -> bool:
 
 
 __all__ = [
+    "autotune_sparse_mla_only",
     "has_flashinfer",
     "flashinfer_bf16_mm",
-    "autotune_bf16_only",
     "has_flashinfer_bf16_gemm",
     "is_flashinfer_bf16_gemm_supported",
     "is_flashinfer_cutedsl_bf16_gemm_supported",
@@ -1315,6 +1347,7 @@ __all__ = [
     "flashinfer_fused_kda_decode",
     "autotune",
     "has_flashinfer_moe",
+    "has_flashinfer_autotune_v2",
     "has_flashinfer_comm",
     "has_flashinfer_nvlink_two_sided",
     "has_flashinfer_nvlink_one_sided",
@@ -1333,12 +1366,12 @@ __all__ = [
     "use_trtllm_attention",
     "flashinfer_mxfp4_quantize",
     "flashinfer_scaled_fp4_mm",
-    "flashinfer_scaled_fp4_mm_out",
     "flashinfer_scaled_fp8_mm",
-    "flashinfer_scaled_fp8_mm_out",
     "flashinfer_quant_nvfp4_8x4_sf_layout",
     "flashinfer_fp8_blockscale_gemm",
     "should_use_flashinfer_for_blockscale_fp8_gemm",
     "is_flashinfer_fp8_blockscale_gemm_supported",
     "is_flashinfer_cudnn_fp8_prefill_attn_supported",
+    "has_flashinfer_jit_cache_wheels",
+    "warn_if_flashinfer_kernels_missing",
 ]

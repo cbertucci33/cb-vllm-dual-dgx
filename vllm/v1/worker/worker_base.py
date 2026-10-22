@@ -12,7 +12,7 @@ from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.utils import get_current_attn_backends
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
-from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.cache import worker_receiver_cache_from_config
 from vllm.tracing import instrument
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.system_utils import update_environment_variables
@@ -20,10 +20,9 @@ from vllm.v1.attention.backends.utils import (
     get_supported_kv_cache_layouts,
     record_kv_cache_layout,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec
 
 if TYPE_CHECKING:
-    from vllm.v1.attention.backend import AttentionBackend
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 else:
@@ -56,8 +55,7 @@ class WorkerBase:
         distributed_init_method: str,
         is_driver_worker: bool = False,
     ) -> None:
-        """
-        Initialize common worker components.
+        """Initialize common worker components.
 
         Args:
             vllm_config: Complete vLLM configuration
@@ -66,6 +64,7 @@ class WorkerBase:
             distributed_init_method: Distributed initialization method
             is_driver_worker: Whether this worker handles driver
                 responsibilities
+
         """
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -108,41 +107,7 @@ class WorkerBase:
     def get_supported_kv_cache_layouts(self) -> list[str]:
         """Layout names every attention backend supports, most preferred first."""
         backends = get_current_attn_backends(self.vllm_config)
-        layouts = get_supported_kv_cache_layouts(backends)
-        if self._prefers_packed_kv_cache(backends):
-            layouts.sort(key=lambda layout: not layout.is_block_outermost)
-        return [layout.name for layout in layouts]
-
-    def _prefers_packed_kv_cache(
-        self, backends: list[type["AttentionBackend"]]
-    ) -> bool:
-        """Whether a block-outermost layout should be preferred.
-
-        With mixed page sizes (e.g. a drafter with more KV bytes per token than
-        the target), block-outermost layouts pack layers of different page
-        sizes into one block instead of padding them to a common page and
-        splitting them into more KV cache groups. They cannot split a manager
-        block into smaller kernel blocks, so only prefer them when every
-        backend accepts each attention layer's block size directly, and when
-        packing avoids full attention padding or needs fewer groups.
-        """
-        from vllm.v1.core.kv_cache_utils import packed_kv_cache_layout_is_better
-        from vllm.v1.worker.utils import select_common_block_size
-
-        kv_cache_spec = self.get_kv_cache_spec()
-        specs = list(kv_cache_spec.values())
-        if len({spec.page_size_bytes for spec in specs}) <= 1:
-            return False
-        for spec in specs:
-            if not (isinstance(spec, AttentionSpec) and spec.has_layer_views):
-                continue
-            try:
-                kernel_block_size = select_common_block_size(spec.block_size, backends)
-            except ValueError:
-                return False
-            if kernel_block_size != spec.block_size:
-                return False
-        return packed_kv_cache_layout_is_better(self.vllm_config, kv_cache_spec)
+        return [layout.name for layout in get_supported_kv_cache_layouts(backends)]
 
     def set_kv_cache_layout(self, kv_cache_layout: str) -> None:
         """Adopt the KV cache layout resolved by the engine core."""
@@ -153,6 +118,7 @@ class WorkerBase:
 
         Returns:
             Compilation times (language_model, encoder) in seconds.
+
         """
         raise NotImplementedError
 
@@ -176,6 +142,13 @@ class WorkerBase:
         reset_fn = getattr(self.model_runner, "reset_mm_cache", None)
         if callable(reset_fn):
             reset_fn()
+
+    def release_late_interaction_query_cache(self, query_keys: list[str]) -> None:
+        release_fn = getattr(
+            self.model_runner, "release_late_interaction_query_cache", None
+        )
+        if callable(release_fn):
+            release_fn(query_keys)
 
     def get_model(self) -> nn.Module:
         raise NotImplementedError
@@ -244,8 +217,7 @@ class WorkerBase:
 
 
 class WorkerWrapperBase:
-    """
-    This class represents one process in an executor/engine. It is responsible
+    """This class represents one process in an executor/engine. It is responsible
     for lazily initializing the worker and handling the worker's lifecycle.
     We first instantiate the WorkerWrapper, which remembers the worker module
     and class name. Then, when we call `update_environment_variables`, and the
@@ -257,8 +229,7 @@ class WorkerWrapperBase:
         rpc_rank: int = 0,
         global_rank: int | None = None,
     ) -> None:
-        """
-        Initialize the worker wrapper with the given vllm_config and rpc_rank.
+        """Initialize the worker wrapper with the given vllm_config and rpc_rank.
         Note: rpc_rank is the rank of the worker in the executor. In most cases,
         it is also the rank of the worker in the distributed group. However,
         when multiple executors work together, they can be different.
@@ -287,8 +258,7 @@ class WorkerWrapperBase:
 
     @instrument(span_name="Worker init")
     def init_worker(self, all_kwargs: list[dict[str, Any]]) -> None:
-        """
-        Here we inject some common logic before initializing the worker.
+        """Here we inject some common logic before initializing the worker.
         Arguments are passed to the worker class constructor.
         """
         kwargs = all_kwargs[self.rpc_rank]
@@ -304,6 +274,12 @@ class WorkerWrapperBase:
         from vllm.plugins import load_general_plugins
 
         load_general_plugins()
+
+        # Let the platform replace core Triton kernels (e.g. CPU fallback
+        # implementations) before any worker or model code can launch them.
+        from vllm.platforms import current_platform
+
+        current_platform.register_triton_kernel_overrides()
 
         parallel_config = vllm_config.parallel_config
         if isinstance(parallel_config.worker_cls, str):
@@ -352,26 +328,10 @@ class WorkerWrapperBase:
             )
 
         shared_worker_lock = kwargs.pop("shared_worker_lock", None)
-        if shared_worker_lock is None:
-            msg = (
-                "Missing `shared_worker_lock` argument from executor. "
-                "This argument is needed for mm_processor_cache_type='shm'."
-            )
-
-            mm_config = vllm_config.model_config.multimodal_config
-            if mm_config and mm_config.mm_processor_cache_type == "shm":
-                raise ValueError(msg)
-            else:
-                logger.warning_once(msg)
-
-            self.mm_receiver_cache = None
-        else:
-            self.mm_receiver_cache = (
-                MULTIMODAL_REGISTRY.worker_receiver_cache_from_config(
-                    vllm_config,
-                    shared_worker_lock,
-                )
-            )
+        self.mm_receiver_cache = worker_receiver_cache_from_config(
+            vllm_config,
+            shared_worker_lock,
+        )
 
         with set_current_vllm_config(self.vllm_config):
             # To make vLLM config available during worker initialization

@@ -24,9 +24,11 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.fa_utils import flash_attn_supports_mla
 from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup
 from vllm.v1.attention.backends.mla.sparse_utils import (
+    align_blocks_to_rows,
     flat_kv_row_view,
     triton_convert_req_index_to_global_index,
 )
+from vllm.v1.attention.ops.metadata import compute_token_to_req_indices
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
 
@@ -40,8 +42,12 @@ class FlashAttnMLASparseBackend(AttentionBackend):
     ]
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [64]
+    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+        return [MultipleOf(64)]
+
+    @classmethod
+    def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
+        return align_blocks_to_rows(spec)
 
     @staticmethod
     def get_name() -> str:
@@ -132,8 +138,18 @@ class FlashAttnMLASparseMetadataBuilder(
         self._init_reorder_batch_threshold(threshold, supports_spec_as_decode=True)
         self.supports_draft_decode_metadata_update = self.dcp_world_size == 1
 
-    def update_draft_decode_metadata(self, _metadata: SparseMLACommonMetadata) -> None:
-        pass
+    def update_draft_decode_metadata(self, metadata: SparseMLACommonMetadata) -> None:
+        num_tokens = metadata.num_decode_tokens
+        if num_tokens == 0:
+            return
+        # Everything else is a view of runner buffers; the per-token request
+        # map is a builder buffer that build() filled for the captured batch.
+        compute_token_to_req_indices(
+            metadata.query_start_loc,
+            metadata.req_id_per_token,
+            num_tokens,
+            num_tokens,
+        )
 
 
 class FlashAttnMLASparseImpl(SparseMLACommonImpl[FlashAttnMLASparseMetadata]):
@@ -211,10 +227,11 @@ class FlashAttnMLASparseImpl(SparseMLACommonImpl[FlashAttnMLASparseMetadata]):
             outputs = []
             if num_decode_tokens:
                 physical_topk, valid_counts = (
-                    index_group.convert_decode_logical_to_physical_topk(
+                    index_group.convert_logical_to_physical_topk(
                         self.index_group_index,
                         topk_indices[:num_decode_tokens],
                         attn_metadata,
+                        block_stride_rows=None,
                         return_valid_counts=True,
                     )
                 )
@@ -328,8 +345,16 @@ class FlashAttnMLASparseImpl(SparseMLACommonImpl[FlashAttnMLASparseMetadata]):
         )
 
         cu_seqlens_q = self.cu_seqlens_q_buffer[: q_rope.shape[0] + 1]
-        k_cache = kv_rows[:, self.kv_lora_rank :].unsqueeze(1).unsqueeze(1)
         v_cache = kv_rows[:, : self.kv_lora_rank].unsqueeze(1).unsqueeze(1)
+        if self.qk_rope_head_dim == 0:
+            # FA3's QV path requires the 64-wide Q/K specialization. For NoPE
+            # MLA, zero Q preserves QV-only attention scores while providing a
+            # valid TMA shape.
+            _FA3_QV_HEAD_DIM = 64
+            q_rope = q_nope.new_zeros(*q_nope.shape[:-1], _FA3_QV_HEAD_DIM)
+            k_cache = v_cache[..., :_FA3_QV_HEAD_DIM]
+        else:
+            k_cache = kv_rows[:, self.kv_lora_rank :].unsqueeze(1).unsqueeze(1)
 
         out = flash_attn_varlen_func(
             q=q_rope,

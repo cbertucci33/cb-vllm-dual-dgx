@@ -7,6 +7,7 @@ Ported from SGLang's MiMoV2OmniProcessor / MiMoVLProcessor implementations.
 """
 
 import contextlib
+import inspect
 import logging
 import math
 from collections import OrderedDict
@@ -115,10 +116,13 @@ class MiMoVLInputSample:
     audio_inputs: list[torch.Tensor]
     second_per_grid_ts: list[float] = field(default_factory=list)
     video_start_times: list[float] = field(default_factory=list)
+    video_grid_timestamps: list[torch.Tensor] = field(default_factory=list)
     audio_token_lens: list[int] = field(default_factory=list)
     va_audio_inputs: list[torch.Tensor] = field(default_factory=list)
     video_audio_n_segs: list[int] = field(default_factory=list)
     video_audio_seg_lens: list[int] = field(default_factory=list)
+    video_audio_frame_counts: list[int] = field(default_factory=list)
+    video_audio_start_offsets: list[int] = field(default_factory=list)
     position_ids: torch.Tensor | None = None
     rope_deltas: torch.Tensor | None = None
     extra: dict = field(default_factory=dict)
@@ -136,6 +140,8 @@ def _format_timestamp(ts: float) -> str:
 def _smart_resize(
     h: int, w: int, factor: int, min_px: int, max_px: int
 ) -> tuple[int, int]:
+    if h <= 0 or w <= 0 or factor <= 0:
+        raise ValueError("MiMo resize requires positive dimensions and patch geometry")
     if min(h, w) < factor:
         if h < w:
             h, w = factor, int(w * factor / h)
@@ -153,6 +159,15 @@ def _smart_resize(
         beta = math.sqrt(min_px / (h * w))
         h_bar = math.ceil(h * beta / factor) * factor
         w_bar = math.ceil(w * beta / factor) * factor
+    if (
+        h_bar <= 0
+        or w_bar <= 0
+        or not min_px <= h_bar * w_bar <= max_px
+        or max(h_bar, w_bar) / min(h_bar, w_bar) > 200
+    ):
+        raise ValueError(
+            "MiMo patch-aligned resize cannot satisfy declared pixel bounds"
+        )
     return int(h_bar), int(w_bar)
 
 
@@ -166,6 +181,18 @@ def _standardize(images: torch.Tensor) -> torch.Tensor:
     return (images - mean) / std
 
 
+def _admit_processor_bytes(nbytes: int, device, label: str) -> None:
+    from vllm.utils.mem_utils import check_startup_memory
+
+    is_host = device is None or torch.device(device).type == "cpu"
+    check_startup_memory(
+        host_bytes=nbytes if is_host else 0,
+        device_bytes=0 if is_host else nbytes,
+        device=device,
+        label=label,
+    )
+
+
 def _transform_batch(
     frames: torch.Tensor,
     factor: int,
@@ -173,6 +200,16 @@ def _transform_batch(
     max_px: int,
     device: torch.device | None = None,
 ) -> tuple[torch.Tensor, int, int]:
+    count, channels, height, width = frames.shape
+    h_out, w_out = _smart_resize(height, width, factor, min_px, max_px)
+    resized_bytes = count * channels * h_out * w_out * 4
+    input_float_bytes = frames.numel() * 4
+    _admit_processor_bytes(
+        max(input_float_bytes + resized_bytes, resized_bytes * 3)
+        + (frames.nbytes if device is not None and frames.device != device else 0),
+        device or frames.device,
+        "MiMo video float, resize and standardization intermediates",
+    )
     if device is not None:
         frames = frames.to(device)
     _, _, h, w = frames.shape
@@ -190,6 +227,24 @@ def _transform_single(
     max_px: int,
     device: torch.device | None = None,
 ) -> tuple[torch.Tensor, int, int]:
+    if isinstance(img, torch.Tensor):
+        channels, height, width = img.shape
+        input_bytes = img.numel() * 4
+        target_device = device or img.device
+    elif isinstance(img, Image.Image):
+        width, height = img.size
+        channels = 3
+        input_bytes = width * height * channels * (1 + 4)
+        target_device = device
+    else:
+        raise TypeError(f"Expected Tensor or PIL.Image, got {type(img)}")
+    h_out, w_out = _smart_resize(height, width, factor, min_px, max_px)
+    resized_bytes = channels * h_out * w_out * 4
+    _admit_processor_bytes(
+        max(input_bytes + resized_bytes, resized_bytes * 3),
+        target_device,
+        "MiMo image float, resize and standardization intermediates",
+    )
     if isinstance(img, torch.Tensor):
         t = img.float()
         _, h, w = t.shape
@@ -300,6 +355,23 @@ class MiMoVLProcessor:
         self.video_end_token_id = video_end_token_id
         self.pad_token_id = pad_token_id
 
+        if any(
+            value <= 0
+            for value in (
+                patch_size,
+                merge_size,
+                temporal_patch_size,
+                temporal_compression_ratio,
+                audio_sampling_rate,
+                audio_hop_length,
+                audio_kernel_size,
+                audio_stride_size,
+                audio_avg_pooler,
+                audio_group_size,
+                audio_channels,
+            )
+        ):
+            raise ValueError("MiMo processor geometry and rates must be positive")
         self.patch_size = patch_size
         self.merge_size = merge_size
         self.temporal_patch_size = temporal_patch_size
@@ -351,6 +423,23 @@ class MiMoVLProcessor:
             "fps or num_frames must be set"
         )
 
+        for lower, upper in (
+            (image_min_pixels, image_max_pixels),
+            (video_min_pixels, video_max_pixels),
+        ):
+            if (
+                not isinstance(lower, int)
+                or not isinstance(upper, int)
+                or lower <= 0
+                or upper < lower
+            ):
+                raise ValueError("MiMo pixel bounds must be positive and ordered")
+        if video_total_max_pixels <= 0:
+            raise ValueError("MiMo total video pixel budget must be positive")
+        if max_frames is not None and (
+            not isinstance(max_frames, int) or max_frames <= 0
+        ):
+            raise ValueError("MiMo max_frames must be positive")
         self._img_kw = {"min_pixels": image_min_pixels, "max_pixels": image_max_pixels}
         self._vid_kw = {
             "min_pixels": video_min_pixels,
@@ -374,23 +463,31 @@ class MiMoVLProcessor:
         return self._mel_spectrogram
 
     def _resolve_img_kw(self, img: ImageInput) -> dict:
-        return {
-            "min_px": (
-                img.min_pixels
-                if img.min_pixels is not None
-                else self._img_kw["min_pixels"]
-            ),
-            "max_px": (
-                img.max_pixels
-                if img.max_pixels is not None
-                else self._img_kw["max_pixels"]
-            ),
-        }
+        minimum = (
+            img.min_pixels if img.min_pixels is not None else self._img_kw["min_pixels"]
+        )
+        maximum = (
+            img.max_pixels if img.max_pixels is not None else self._img_kw["max_pixels"]
+        )
+        if (
+            not isinstance(minimum, int)
+            or not isinstance(maximum, int)
+            or minimum <= 0
+            or maximum < minimum
+            or maximum > self._img_kw["max_pixels"]
+        ):
+            raise ValueError(
+                "Image pixel overrides exceed declared MiMo profile bounds"
+            )
+        return {"min_px": minimum, "max_px": maximum}
 
     def _resolve_vid_kw(self, vid: VideoInput) -> dict:
         kw: dict = {}
         for k in ("min_pixels", "max_pixels", "total_max_pixels"):
-            kw[k] = getattr(vid, k) or self._vid_kw[k]
+            value = getattr(vid, k)
+            kw[k] = self._vid_kw[k] if value is None else value
+            if kw[k] <= 0:
+                raise ValueError(f"MiMo video {k} must be positive")
         if vid.num_frames is not None:
             kw["num_frames"] = vid.num_frames
         elif vid.fps is not None:
@@ -411,6 +508,9 @@ class MiMoVLProcessor:
             raise ValueError(
                 "No video sampling strategy specified (fps or num_frames)."
             )
+        kw["max_frames"] = (
+            self._vid_kw["max_frames"] if vid.max_frames is None else vid.max_frames
+        )
         return kw
 
     def preprocess_audio(self, audio: Any) -> tuple[torch.Tensor, int]:
@@ -423,6 +523,20 @@ class MiMoVLProcessor:
             )
         waveform, original_sr = audio
 
+        target_samples = math.ceil(
+            waveform.shape[-1] * self.audio_sampling_rate / original_sr
+        )
+        channels = waveform.numel() // waveform.shape[-1]
+        frames = 1 + target_samples // self._mel_spec_kwargs["hop_length"]
+        frequencies = self._mel_spec_kwargs["n_fft"] // 2 + 1
+        sample_bytes = waveform.element_size()
+        _admit_processor_bytes(
+            target_samples * channels * sample_bytes
+            + frames * frequencies * (2 * sample_bytes + sample_bytes)
+            + frames * self.audio_n_mels * sample_bytes * 3,
+            waveform.device,
+            "MiMo audio resampled waveform, STFT, mel, clip and log outputs",
+        )
         if original_sr != self.audio_sampling_rate:
             if original_sr not in self._resamplers:
                 if len(self._resamplers) >= self._resamplers_max:
@@ -456,6 +570,21 @@ class MiMoVLProcessor:
         )
         return tensor
 
+    def video_pixel_budget(self, num_frames: int, kw: dict | None = None) -> int:
+        kw = self._vid_kw if kw is None else kw
+        if num_frames <= 0:
+            raise ValueError("MiMo video requires at least one decoded frame")
+        return max(
+            kw["min_pixels"],
+            min(
+                kw["total_max_pixels"]
+                * self.temporal_patch_size
+                * self.temporal_compression_ratio
+                // num_frames,
+                kw["max_pixels"],
+            ),
+        )
+
     def process_video(
         self, video_input: VideoInput
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
@@ -468,6 +597,27 @@ class MiMoVLProcessor:
                 "Decode the video before calling the processor."
             )
         frames, timestamps = video
+        if (
+            video_input.fps is not None
+            or video_input.num_frames is not None
+            or video_input.min_frames is not None
+            or video_input.do_include_last_frame
+        ):
+            raise ValueError(
+                "Decoded-video sampling must be applied by the media pipeline"
+            )
+        for key in ("min_pixels", "max_pixels", "total_max_pixels"):
+            if kw[key] > self._vid_kw[key if key != "min_pixels" else "max_pixels"]:
+                raise ValueError(
+                    f"Per-item video {key} exceeds profiled processor bounds"
+                )
+        declared_frames = self._vid_kw["max_frames"]
+        if (
+            video_input.max_frames is not None
+            and declared_frames is not None
+            and video_input.max_frames > declared_frames
+        ):
+            raise ValueError("Per-item max_frames exceeds profiled processor bounds")
 
         fps = (
             1.0
@@ -494,13 +644,24 @@ class MiMoVLProcessor:
 
         tp = self.temporal_patch_size * self.temporal_compression_ratio
         n = frames.shape[0]
-        total_px = kw["total_max_pixels"]
-        max_px = max(
-            kw["min_pixels"], min(total_px * tp // max(n, 1), kw["max_pixels"])
-        )
+        max_frames = kw.get("max_frames", self._vid_kw["max_frames"])
+        if max_frames is not None and n > max_frames:
+            raise ValueError(
+                f"Decoded MiMo video has {n} frames, exceeding configured "
+                f"max_frames={max_frames}; adjust the declared processor policy"
+            )
+        max_px = self.video_pixel_budget(n, kw)
 
         if n % tp != 0:
             pad = tp - n % tp
+            _admit_processor_bytes(
+                frames.nbytes
+                + 2 * pad * frames[0].nbytes
+                + timestamps.nbytes
+                + 2 * pad * timestamps.element_size(),
+                frames.device,
+                "MiMo temporal video padding",
+            )
             frames = torch.cat(
                 [frames, frames[-1:].repeat(pad, *([1] * (frames.ndim - 1)))],
                 dim=0,
@@ -548,6 +709,12 @@ class MiMoVLProcessor:
     def _flatten_visual(
         self, visual: torch.Tensor, kind: str
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        copies = self.temporal_patch_size if kind == "image" else 1
+        _admit_processor_bytes(
+            visual.nbytes * copies * 2,
+            visual.device,
+            "MiMo temporal repeat and contiguous vision patches",
+        )
         if kind == "image":
             h, w = visual.shape[-2:]
             patches = visual.unsqueeze(0).repeat(self.temporal_patch_size, 1, 1, 1)
@@ -598,9 +765,12 @@ class MiMoVLProcessor:
         audio_token_lens: list[int] = []
         second_per_grid_ts: list[float] = []
         video_start_times: list[float] = []
+        video_grid_timestamps: list[torch.Tensor] = []
         va_audio_inputs: list[torch.Tensor] = []
         video_audio_n_segs: list[int] = []
         video_audio_seg_lens: list[int] = []
+        video_audio_frame_counts: list[int] = []
+        video_audio_start_offsets: list[int] = []
 
         # Pre-decode videos in parallel
         vid_info = [
@@ -659,7 +829,11 @@ class MiMoVLProcessor:
                     self.temporal_patch_size / meta["fps_sampled"]
                 )
                 video_start_times.append(float(ts[0]))
+                video_grid_timestamps.append(
+                    ts[:: self.temporal_patch_size * self.temporal_compression_ratio]
+                )
                 video_audio_n_segs.append(0)
+                video_audio_start_offsets.append(0)
 
                 stride = self.temporal_patch_size * self.temporal_compression_ratio
                 ts_texts = [_format_timestamp(float(x)) for x in ts[::stride]]
@@ -698,6 +872,9 @@ class MiMoVLProcessor:
                     self.temporal_patch_size / meta["fps_sampled"]
                 )
                 video_start_times.append(float(ts[0]))
+                video_grid_timestamps.append(
+                    ts[:: self.temporal_patch_size * self.temporal_compression_ratio]
+                )
                 processed_audio = self.process_audio(content.content)
                 tok_per_sec = self.audio_input_id_per_second / self.audio_group_size
 
@@ -714,6 +891,7 @@ class MiMoVLProcessor:
                     # Pre-tokenized: not expected in vLLM, but handle defensively
                     total_atok = processed_audio.shape[0]
                     _va_is_tokenized = True
+                    va_audio_inputs.append(processed_audio)
 
                 n_per_grid = h * w // (self.merge_size**2)
                 stride = self.temporal_patch_size * self.temporal_compression_ratio
@@ -766,7 +944,9 @@ class MiMoVLProcessor:
 
                 # Track n_segs (= num groups) and per-group audio token counts
                 video_audio_n_segs.append(len(groups))
+                video_audio_start_offsets.append(int(float(grid_ts[0]) * tok_per_sec))
                 for group in groups:
+                    video_audio_frame_counts.append(len(group))
                     group_seg_len = sum(u[4] for _, u in group)
                     video_audio_seg_lens.append(group_seg_len)
 
@@ -822,10 +1002,13 @@ class MiMoVLProcessor:
             audio_inputs=audio_inputs,
             second_per_grid_ts=second_per_grid_ts,
             video_start_times=video_start_times,
+            video_grid_timestamps=video_grid_timestamps,
             audio_token_lens=audio_token_lens,
             va_audio_inputs=va_audio_inputs,
             video_audio_n_segs=video_audio_n_segs,
             video_audio_seg_lens=video_audio_seg_lens,
+            video_audio_frame_counts=video_audio_frame_counts,
+            video_audio_start_offsets=video_audio_start_offsets,
             position_ids=position_ids,
             rope_deltas=rope_deltas,
             extra=extra,
@@ -905,6 +1088,11 @@ class MiMoOmniProcessor(ProcessorMixin):
         rope_type: str = "rope",
     ) -> None:
         self.tokenizer = tokenizer
+        self._constructor_kwargs = {
+            name: value
+            for name, value in locals().items()
+            if name not in ("self", "tokenizer", "__class__")
+        }
 
         unit = patch_size * merge_size
         self.mimo_processor = MiMoVLProcessor(
@@ -930,11 +1118,21 @@ class MiMoOmniProcessor(ProcessorMixin):
             audio_group_size=audio_group_size,
             audio_input_id_per_second=audio_input_id_per_second,
             audio_zeroemb_idx=audio_zeroemb_idx,
-            image_min_pixels=image_min_pixels or (4 * unit * unit),
-            image_max_pixels=image_max_pixels or (4096 * unit * unit),
-            video_min_pixels=video_min_pixels or (4 * unit * unit),
-            video_max_pixels=video_max_pixels or (4096 * unit * unit),
-            video_total_max_pixels=video_total_max_pixels or (16384 * unit * unit),
+            image_min_pixels=(4 * unit * unit)
+            if image_min_pixels is None
+            else image_min_pixels,
+            image_max_pixels=(4096 * unit * unit)
+            if image_max_pixels is None
+            else image_max_pixels,
+            video_min_pixels=(4 * unit * unit)
+            if video_min_pixels is None
+            else video_min_pixels,
+            video_max_pixels=(4096 * unit * unit)
+            if video_max_pixels is None
+            else video_max_pixels,
+            video_total_max_pixels=(16384 * unit * unit)
+            if video_total_max_pixels is None
+            else video_total_max_pixels,
             fps=fps,
             num_frames=num_frames,
             max_frames=max_frames,
@@ -952,11 +1150,96 @@ class MiMoOmniProcessor(ProcessorMixin):
             rope_type=rope_type,
         )
 
+    def with_overrides(self, kwargs: dict[str, Any]) -> "MiMoOmniProcessor":
+        if not kwargs:
+            return self
+        overrides = dict(kwargs)
+        for modality, nested_name in (
+            ("image", "images_kwargs"),
+            ("video", "videos_kwargs"),
+            ("audio", "audio_kwargs"),
+        ):
+            nested = dict(overrides.pop(nested_name, {}))
+            nested_size = nested.pop("size", None)
+            if nested_size is not None:
+                for key, alias in (
+                    ("shortest_edge", "min_pixels"),
+                    ("longest_edge", "max_pixels"),
+                ):
+                    if key in nested_size:
+                        if alias in nested and nested[alias] != nested_size[key]:
+                            raise ValueError(f"Conflicting MiMo {nested_name} size")
+                        nested[alias] = nested_size[key]
+                if set(nested_size) - {"shortest_edge", "longest_edge"}:
+                    raise ValueError(f"Unsupported MiMo {nested_name} size")
+            for key, value in nested.items():
+                if key in ("min_pixels", "max_pixels", "total_max_pixels"):
+                    key = f"{modality}_{key}"
+                if key in overrides and overrides[key] != value:
+                    raise ValueError(f"Conflicting MiMo processor override: {key}")
+                overrides[key] = value
+        size = overrides.pop("size", None)
+        if size is not None:
+            unknown = set(size) - {"shortest_edge", "longest_edge"}
+            if unknown:
+                raise ValueError(f"Unsupported MiMo size fields: {sorted(unknown)}")
+            for key, alias in (
+                ("shortest_edge", "min_pixels"),
+                ("longest_edge", "max_pixels"),
+            ):
+                if key in size:
+                    if alias in overrides and overrides[alias] != size[key]:
+                        raise ValueError(
+                            f"Conflicting MiMo processor override: {alias}"
+                        )
+                    overrides[alias] = size[key]
+        for alias in ("min_pixels", "max_pixels"):
+            if alias in overrides:
+                value = overrides.pop(alias)
+                for modality in ("image", "video"):
+                    name = f"{modality}_{alias}"
+                    if name in overrides and overrides[name] != value:
+                        raise ValueError(f"Conflicting MiMo processor override: {name}")
+                    overrides[name] = value
+        sampling = {"fps", "num_frames", "min_frames"}
+        if any(
+            name in overrides and overrides[name] != self._constructor_kwargs[name]
+            for name in sampling
+        ):
+            raise ValueError(
+                "Decoded-video sampling overrides belong in media_io_kwargs, "
+                "not mm_processor_kwargs"
+            )
+        accepted = set(inspect.signature(type(self).__init__).parameters) - {
+            "self",
+            "tokenizer",
+        }
+        unknown = set(overrides) - accepted
+        if unknown:
+            raise ValueError(f"Unsupported MiMo processor overrides: {sorted(unknown)}")
+        # Checkpoint geometry is not a resizable preprocessing option.
+        structural = {
+            "patch_size",
+            "merge_size",
+            "temporal_patch_size",
+            "temporal_compression_ratio",
+            "audio_channels",
+            "audio_group_size",
+            "audio_kernel_size",
+            "audio_stride_size",
+            "audio_avg_pooler",
+        }
+        for name in structural & overrides.keys():
+            if overrides[name] != self._constructor_kwargs[name]:
+                raise ValueError(f"MiMo checkpoint geometry cannot override {name}")
+        return type(self)(self.tokenizer, **(self._constructor_kwargs | overrides))
+
     @classmethod
     def from_hf_config(
         cls,
         tokenizer: Any,
         hf_config: Any,
+        **kwargs: Any,
     ) -> "MiMoOmniProcessor":
         """Instantiate directly from an HF model config object."""
         vc = hf_config.vision_config
@@ -986,24 +1269,39 @@ class MiMoOmniProcessor(ProcessorMixin):
             rope_type = "mrope"
 
         unit = patch_size * merge_size
-        return cls(
+        processor = cls(
             tokenizer,
             patch_size=patch_size,
             merge_size=merge_size,
             temporal_patch_size=temporal_patch_size,
-            image_min_pixels=pc.get("image_min_pixels") or (4 * unit * unit),
-            image_max_pixels=pc.get("image_max_pixels") or (4096 * unit * unit),
-            video_min_pixels=pc.get("video_min_pixels") or (4 * unit * unit),
-            video_max_pixels=pc.get("video_max_pixels") or (4096 * unit * unit),
+            temporal_compression_ratio=pc.get("temporal_compression_ratio", 1),
+            image_min_pixels=pc.get("image_min_pixels", 4 * unit * unit),
+            image_max_pixels=pc.get("image_max_pixels", 4096 * unit * unit),
+            video_min_pixels=pc.get("video_min_pixels", 4 * unit * unit),
+            video_max_pixels=pc.get("video_max_pixels", 4096 * unit * unit),
             video_total_max_pixels=(
-                pc.get("video_total_max_pixels") or (16384 * unit * unit)
+                pc.get("video_total_max_pixels", 16384 * unit * unit)
             ),
-            fps=pc.get("fps") or 2.0,
+            fps=pc.get("fps", 2.0),
             num_frames=pc.get("num_frames"),
-            max_frames=pc.get("max_frames") or 256,
-            min_frames=pc.get("min_frames") or 8,
+            max_frames=pc.get("max_frames", 256),
+            min_frames=pc.get("min_frames", 8),
             video_audio_interleave_length=pc.get("video_audio_interleave_length", 0),
             audio_sampling_rate=audio_sr or 24000,
+            audio_nfft=pc.get("audio_nfft", 960),
+            audio_hop_length=pc.get("audio_hop_length", 240),
+            audio_window_size=pc.get("audio_window_size", 960),
+            audio_fmin=pc.get("audio_fmin", 0.0),
+            audio_fmax=pc.get("audio_fmax"),
+            audio_n_mels=pc.get("audio_n_mels", 128),
+            audio_segment_size=pc.get("audio_segment_size", 6000),
+            audio_kernel_size=pc.get("audio_kernel_size", 3),
+            audio_stride_size=pc.get("audio_stride_size", 2),
+            audio_avg_pooler=pc.get("audio_avg_pooler", 2),
+            audio_channels=pc.get("audio_channels", 8),
+            audio_group_size=pc.get("audio_group_size", 4),
+            audio_input_id_per_second=pc.get("audio_input_id_per_second", 25.0),
+            audio_zeroemb_idx=pc.get("audio_zeroemb_idx", 4096),
             image_token_id=pc.get("image_token_id"),
             video_token_id=pc.get("video_token_id"),
             audio_token_id=pc.get("audio_token_id"),
@@ -1015,6 +1313,7 @@ class MiMoOmniProcessor(ProcessorMixin):
             video_end_token_id=pc.get("video_end_token_id"),
             rope_type=rope_type,
         )
+        return processor.with_overrides(kwargs)
 
     @property
     def image_token(self) -> str:
@@ -1071,6 +1370,8 @@ class MiMoOmniProcessor(ProcessorMixin):
                     tuples (pre-decoded).
             audio: list of ``str`` (path/url/base64), ``bytes``,
                    ``(waveform_1D, sample_rate)`` tuples, or ``np.ndarray``.
+            video_audio: audio track extracted from ``videos``, in the same
+                   formats accepted by ``audio``.
             return_tensors: Passed to :class:`BatchFeature`.
 
         Returns:
@@ -1079,7 +1380,17 @@ class MiMoOmniProcessor(ProcessorMixin):
             - ``pixel_values`` + ``image_grid_thw``
             - ``pixel_values_videos`` + ``video_grid_thw`` + ``second_per_grid_ts``
             - ``audio_features``
+
         """
+        if kwargs:
+            return self.with_overrides(kwargs)(
+                text=text,
+                images=images,
+                videos=videos,
+                audio=audio,
+                video_audio=video_audio,
+                return_tensors=return_tensors,
+            )
         if isinstance(text, list):
             text = text[0] if len(text) == 1 else "\n".join(text)
 
@@ -1127,6 +1438,8 @@ class MiMoOmniProcessor(ProcessorMixin):
                             with contextlib.suppress(StopIteration):
                                 vid_item = next(va_it)
                                 vid_type = "video_audio"
+                        if isinstance(vid_item, VideoAudioInput):
+                            vid_type = "video_audio"
                         if vid_item is not None:
                             if vid_type == "video":
                                 contents.append(
@@ -1158,7 +1471,16 @@ class MiMoOmniProcessor(ProcessorMixin):
             for img in imgs:
                 contents.append(Content(type="image", content=ImageInput(image=img)))
             for vid in vids:
-                contents.append(Content(type="video", content=VideoInput(video=vid)))
+                contents.append(
+                    Content(
+                        type="video_audio"
+                        if isinstance(vid, VideoAudioInput)
+                        else "video",
+                        content=vid
+                        if isinstance(vid, VideoAudioInput)
+                        else VideoInput(video=vid),
+                    )
+                )
             for aud in auds:
                 contents.append(Content(type="audio", content=AudioInput(audio=aud)))
             for va_item in va_items:
@@ -1174,16 +1496,28 @@ class MiMoOmniProcessor(ProcessorMixin):
         data: dict = {"input_ids": sample.input_ids.unsqueeze(0)}
 
         if sample.pixel_values:
+            _admit_processor_bytes(
+                sum(tensor.nbytes for tensor in sample.pixel_values),
+                sample.pixel_values[0].device,
+                "MiMo pixel_values batching",
+            )
             data["pixel_values"] = torch.cat(sample.pixel_values, dim=0)
             data["image_grid_thw"] = torch.stack(sample.image_thw_grids)
 
         if sample.pixel_values_videos:
+            _admit_processor_bytes(
+                sum(tensor.nbytes for tensor in sample.pixel_values_videos),
+                sample.pixel_values_videos[0].device,
+                "MiMo pixel_values_videos batching",
+            )
             data["pixel_values_videos"] = torch.cat(sample.pixel_values_videos, dim=0)
             data["video_grid_thw"] = torch.stack(sample.video_thw_grids)
             if sample.second_per_grid_ts:
                 data["second_per_grid_ts"] = torch.tensor(
                     sample.second_per_grid_ts, dtype=torch.float32
                 )
+            if sample.video_grid_timestamps:
+                data["video_grid_timestamps"] = sample.video_grid_timestamps
             if sample.video_start_times:
                 data["video_start_times"] = torch.tensor(
                     sample.video_start_times, dtype=torch.float32
@@ -1199,6 +1533,7 @@ class MiMoOmniProcessor(ProcessorMixin):
             max_segs = max(n_segs_list) if n_segs_list else 0
             if max_segs > 0:
                 seg_lens_2d = torch.zeros(len(n_segs_list), max_segs, dtype=torch.long)
+                frame_counts_2d = torch.zeros_like(seg_lens_2d)
                 flat_cursor = 0
                 for vi, n in enumerate(n_segs_list):
                     if n > 0:
@@ -1206,8 +1541,19 @@ class MiMoOmniProcessor(ProcessorMixin):
                             sample.video_audio_seg_lens[flat_cursor : flat_cursor + n],
                             dtype=torch.long,
                         )
+                        frame_counts_2d[vi, :n] = torch.tensor(
+                            sample.video_audio_frame_counts[
+                                flat_cursor : flat_cursor + n
+                            ],
+                            dtype=torch.long,
+                        )
                         flat_cursor += n
                 data["video_audio_seg_lens"] = seg_lens_2d
+                data["video_audio_frame_counts"] = frame_counts_2d
+                data["video_audio_start_offsets"] = torch.tensor(
+                    sample.video_audio_start_offsets,
+                    dtype=torch.long,
+                )
 
         # audio_features is a list of variable-length mel-spec tensors; pop it
         # before BatchFeature conversion to avoid "batched tensors of the same
@@ -1227,5 +1573,11 @@ class MiMoOmniProcessor(ProcessorMixin):
             bf["audio_features"] = audio_features
         # va_audio_features: list of mel-spec tensors (one per video_audio item)
         if sample.va_audio_inputs:
-            bf["va_audio_features"] = sample.va_audio_inputs
+            audio_iter = iter(sample.va_audio_inputs)
+            bf["va_audio_features"] = [
+                next(audio_iter)
+                if count
+                else torch.empty((0, self.mimo_processor.audio_n_mels))
+                for count in sample.video_audio_n_segs
+            ]
         return bf

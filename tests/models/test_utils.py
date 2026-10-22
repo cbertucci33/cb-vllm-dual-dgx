@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import regex as re
 import torch
 
+from vllm.config import VllmConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -13,6 +16,8 @@ from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
     _merge_multimodal_embeddings,
+    get_draft_quant_config,
+    normalize_rank_sliced_weight_names,
 )
 from vllm.platforms import current_platform
 
@@ -205,6 +210,84 @@ def test_auto_loader_normalizes_rank_sliced_weight_names():
     assert torch.all(mod.weight == 3.0)
 
 
+@pytest.mark.cpu_test
+def test_rank_sliced_name_normalizer_supports_handwritten_loaders():
+    class RankSlicedConfig:
+        @staticmethod
+        def normalize_rank_sliced_weight_name(name: str) -> str | None:
+            if name.endswith(".rank0.trellis"):
+                return name.replace(".rank0.trellis", ".trellis")
+            if name.endswith(".rank1.trellis"):
+                return None
+            return name
+
+    local = torch.tensor([1.0])
+    remote = torch.tensor([2.0])
+    dense = torch.tensor([3.0])
+    normalized = list(
+        normalize_rank_sliced_weight_names(
+            [
+                ("experts.0.rank0.trellis", local),
+                ("experts.0.rank1.trellis", remote),
+                ("dense.weight", dense),
+            ],
+            RankSlicedConfig(),
+        )
+    )
+
+    assert normalized == [
+        ("experts.0.trellis", local),
+        ("dense.weight", dense),
+    ]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("quant_name", ["exl3", "fp8"])
+def test_draft_quant_config_hydrates_only_exl3_rank_sliced_metadata(
+    monkeypatch, quant_name
+):
+    rank_sliced = {"format": "exl3-trellis"}
+    draft_hf = SimpleNamespace(hybrid_tr3_tail=None)
+    target_hf = SimpleNamespace(hybrid_tr3_tail=rank_sliced)
+    draft_config = SimpleNamespace(
+        hf_config=draft_hf,
+        model="draft",
+        quantization=quant_name,
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(draft_model_config=draft_config),
+        load_config=object(),
+        model_config=SimpleNamespace(hf_config=target_hf),
+    )
+
+    class QuantConfig:
+        def get_name(self):
+            return quant_name
+
+    quant_config = QuantConfig()
+    received_model_configs = []
+
+    def get_quantization_config(model_config, _load_config):
+        received_model_configs.append(model_config)
+        if quant_name == "exl3":
+            assert model_config.hf_config.hybrid_tr3_tail == rank_sliced
+        return quant_config
+
+    monkeypatch.setattr(
+        VllmConfig,
+        "get_quantization_config",
+        staticmethod(get_quantization_config),
+    )
+
+    assert get_draft_quant_config(vllm_config) is quant_config
+    if quant_name == "exl3":
+        assert received_model_configs[0] is not draft_config
+        assert received_model_configs[0].hf_config is not draft_hf
+        assert draft_hf.hybrid_tr3_tail is None
+    else:
+        assert received_model_configs == [draft_config]
+
+
 class raise_if_cuda_sync:
     def __enter__(self):
         self.previous_debug_mode = torch.cuda.get_sync_debug_mode()
@@ -253,3 +336,25 @@ def test_get_rename_mapper_keeps_only_renames():
     for name in ("drop_regex.w", "drop_substr.w", "drop_prefix.w", "w.drop_suffix"):
         assert mapper._map_name(name) is None
         assert renames._map_name(name) == name
+
+
+def test_weights_mapper_stacks_one_weight_into_several_shards():
+    """One checkpoint tensor can feed more than one shard of a stacked
+    parameter, and a dropped name stays dropped rather than reappearing as a
+    shard of the stacked one."""
+    mapper = WeightsMapper(
+        orig_to_new_substr={"layers.1.k_proj.": None},
+        orig_to_new_stacked={".k_proj.": (".qkv_proj.", ["k", "v"])},
+    )
+    weight = torch.ones(2)
+    weights = [(f"layers.{i}.k_proj.weight", weight) for i in (0, 1)]
+
+    mapped = list(mapper.apply(weights))
+
+    assert [(name, w.shard_id) for name, w in mapped] == [
+        ("layers.0.qkv_proj.weight", "k"),
+        ("layers.0.qkv_proj.weight", "v"),
+    ]
+    # Each shard needs its own tensor object, but they alias one allocation.
+    assert mapped[0][1] is not mapped[1][1]
+    assert mapped[0][1].data_ptr() == mapped[1][1].data_ptr() == weight.data_ptr()

@@ -1,0 +1,63 @@
+commit 4de5d68214a067fc9fd980fbdfa058a4602d8aa0
+Author: cb <cb@node-2.ht.home>
+Date:   Tue Oct 13 17:01:07 2026 -0500
+
+    Keep EXL3 split-K workspace in FP32
+    
+    Co-authored-by: OpenAI Codex <codex@openai.com>
+
+diff --git a/tests/quantization/test_exl3.py b/tests/quantization/test_exl3.py
+index 432afc486a..766c6d29cc 100644
+--- a/tests/quantization/test_exl3.py
++++ b/tests/quantization/test_exl3.py
+@@ -164,6 +164,27 @@ def test_expert_only_rank_sliced_metadata_does_not_require_dense_quant_file(
+     assert config.tensor_storage == {}
+ 
+ 
++def test_exl3_gemm_uses_fp32_workspace_and_returns_fp16(monkeypatch):
++    observed = {}
++
++    class FakeExtension:
++        def exl3_gemm(self, x, trellis, output, *args):
++            observed["workspace_dtype"] = output.dtype
++            output.fill_(1.0001)
++
++    monkeypatch.setattr(exl3_module, "_load_exl3_ext", lambda: FakeExtension())
++    x = torch.ones((2, 32), dtype=torch.float16)
++    trellis = torch.empty((1, 4), dtype=torch.int16)
++
++    output = exl3_module._exl3_gemm._init_fn(
++        x, trellis, torch.empty(32), torch.empty(64), False, False
++    )
++
++    assert observed["workspace_dtype"] == torch.float32
++    assert output.dtype == torch.float16
++    assert torch.equal(output, torch.full_like(output, 1.0001))
++
++
+ def test_dense_exl3_quantization_does_not_force_eager_execution(monkeypatch):
+     config = Exl3Config(tensor_storage=_dense_storage())
+     config.rank_sliced_metadata = _rank_sliced_metadata()
+diff --git a/vllm/model_executor/layers/quantization/exl3.py b/vllm/model_executor/layers/quantization/exl3.py
+index 0592a7eaf4..ca31191e07 100644
+--- a/vllm/model_executor/layers/quantization/exl3.py
++++ b/vllm/model_executor/layers/quantization/exl3.py
+@@ -276,7 +276,7 @@ def _exl3_gemm(
+     ext = _load_exl3_ext()
+     output = torch.empty(
+         (x.shape[0], trellis.shape[1] * 16),
+-        dtype=torch.float16,
++        dtype=torch.float32,
+         device=x.device,
+     )
+     x_had = torch.empty_like(x)
+@@ -292,7 +292,8 @@ def _exl3_gemm(
+         mul1,
+         0,
+     )
+-    return output
++    # Keep split-K partial sums in FP32; cast once at the helper boundary.
++    return output.to(torch.float16)
+ 
+ 
+ @_exl3_gemm.register_fake

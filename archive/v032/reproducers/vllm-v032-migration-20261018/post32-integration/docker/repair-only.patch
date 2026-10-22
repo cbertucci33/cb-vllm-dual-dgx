@@ -1,0 +1,56 @@
+diff --git a/.dockerignore b/.dockerignore
+index 787990a308..55bd4b5552 100644
+--- a/.dockerignore
++++ b/.dockerignore
+@@ -37,8 +37,8 @@ __pycache__/
+ !/build/patches/flashinfer-sm120-memory-order.patch
+ !/build/patches/transformers-glm5next-temporal-budget.patch
+ !/build/patches/b12x-cutlass-dsl.patch
+-!/build/patches/instanttensor-0.2.1-cleanup.patch
+-!/build/patches/instanttensor-0.2.1-startup-safety.patch
++!/build/patches/instanttensor-0.2.2-cleanup.patch
++!/build/patches/instanttensor-0.2.2-startup-safety.patch
+ !/build/patches/exllamav3-startup-safety.patch
+ !/build/profiles/
+ !/build/profiles/*
+diff --git a/tests/build/test_verify_runtime.py b/tests/build/test_verify_runtime.py
+index 56dfcd630a..ee92fd6297 100644
+--- a/tests/build/test_verify_runtime.py
++++ b/tests/build/test_verify_runtime.py
+@@ -267,3 +267,36 @@ def test_sparse_mla_verifier_requires_public_export() -> None:
+     exports.remove("flashinfer_trtllm_batch_decode_with_kv_cache_mla")
+     with pytest.raises(RuntimeError, match="must retain scoped autotuning"):
+         verify_runtime.verify_flashinfer_sparse_mla_wrapper(source, exports)
++
++
++@pytest.mark.parametrize("repair", ["cleanup", "startup-safety"])
++def test_instanttensor_patch_payload_is_allowlisted_in_runner_context(repair) -> None:
++    root = _MODULE_PATH.parents[1]
++    dockerfile = (root / "build" / "Dockerfile.runner").read_text()
++    assert "COPY build/patches/ /opt/vllm-runner/patches/" in dockerfile
++    version_command = next(
++        line
++        for line in dockerfile.splitlines()
++        if "build_instanttensor.py --version " in line
++    )
++    version = version_command.partition("--version ")[2].split()[0]
++    builder = (root / "build" / "build_instanttensor.py").read_text()
++    assert f'f"instanttensor-{{args.version}}-{repair}.patch"' in builder
++    payload = f"build/patches/instanttensor-{version}-{repair}.patch"
++    assert (root / payload).is_file()
++    rules = [
++        line.strip()
++        for line in (root / ".dockerignore").read_text().splitlines()
++        if line.strip() and not line.lstrip().startswith("#")
++    ]
++    # Both parent directories must be reopened before the literal payload
++    # exception: the runner copies this allowlisted directory, not host files.
++    build_open = rules.index("!/build/")
++    patches_open = rules.index("!/build/patches/")
++    patches_excluded = rules.index("/build/patches/*")
++    assert build_open < patches_open < patches_excluded
++    assert f"!/{payload}" in rules, f"Docker context excludes required {payload}"
++    payload_open = rules.index(f"!/{payload}")
++    assert patches_excluded < payload_open
++    assert f"/{payload}" not in rules[payload_open + 1 :]
++    assert not any("instanttensor-0.2.1-" in rule for rule in rules)

@@ -1,0 +1,138 @@
+--- a/flashinfer/mla/_core.py
++++ b/flashinfer/mla/_core.py
+@@ -689,25 +689,26 @@
+     return out
+ 
+ 
+-def _check_sm120_sparse_v32_kv_cache(kv_cache: torch.Tensor) -> torch.Tensor:
++def _check_sm120_sparse_v32_kv_cache(
++    kv_cache: torch.Tensor, *, glm53_nope: bool = False
++) -> torch.Tensor:
+     if kv_cache.dtype != torch.uint8:
+         raise ValueError(
+             "SM120 sparse MLA v32/GLM backend expects packed uint8 kv_cache, "
+             f"got {kv_cache.dtype}"
+         )
+-    if kv_cache.ndim == 3:
+-        if kv_cache.size(-1) != 656:
+-            raise ValueError(
+-                "SM120 sparse MLA v32/GLM expects packed kv_cache last dim 656, "
++    # GLM NoPE stores 512 FP8 values and four FP32 scales, with no RoPE tail.
++    # Decode also accepts padded GLM rows; the native prefill binding retains
++    # its dense-row check. RoPE models keep their exact 656-byte public ABI.
++    row_bytes = kv_cache.size(-1) if kv_cache.ndim else 0
++    valid_width = row_bytes >= 528 if glm53_nope else row_bytes == 656
++    if kv_cache.ndim in (3, 4):
++        if not valid_width or (kv_cache.ndim == 4 and kv_cache.size(1) != 1):
++            expected = ">=528" if glm53_nope else "656"
++            raise ValueError(
++                "SM120 sparse MLA expects packed uint8 HND cache "
++                f"[pages, 1, page_size, {expected}] or [pages, page_size, {expected}], "
+                 f"got {tuple(kv_cache.shape)}"
+-            )
+-        return kv_cache
+-    if kv_cache.ndim == 4:
+-        if kv_cache.size(1) != 1 or kv_cache.size(-1) != 656:
+-            raise ValueError(
+-                "SM120 sparse MLA v32/GLM expects public HND kv_cache shape "
+-                "[num_pages, 1, page_size, 656] or 3D shorthand "
+-                f"[num_pages, page_size, 656], got {tuple(kv_cache.shape)}"
+             )
+         return kv_cache
+     raise ValueError(f"Expected kv_cache.ndim == 3 or 4, got {kv_cache.ndim}")
+@@ -824,7 +825,7 @@
+             f"{expected_block_tables_shape}, got {tuple(block_tables.shape)}"
+         )
+ 
+-    kv_cache = _check_sm120_sparse_v32_kv_cache(kv_cache)
++    kv_cache = _check_sm120_sparse_v32_kv_cache(kv_cache, glm53_nope=glm53_nope)
+     topk_length = _normalize_sm120_sparse_v32_topk_length(
+         seq_lens,
+         batch_size=batch_size,
+--- a/flashinfer/mla/_sparse_mla_sm120.py
++++ b/flashinfer/mla/_sparse_mla_sm120.py
+@@ -335,7 +335,7 @@
+             topks=frozenset({_DECODE_GLM53_NOPE_TOPK}),
+             min_topk=1,
+             max_num_heads=_DECODE_MAX_HEADS,
+-            bytes_per_token=_BPT_DSV3_2,
++            bytes_per_token=528,
+         ),
+         "dots3_swa": SparseMLASm120DecodeConfig(
+             d_qk=1088,
+@@ -503,7 +503,9 @@
+ 
+ 
+ def _bytes_per_token_for_model_type(model_type: int) -> int:
+-    if model_type in (_MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA, _MODEL_TYPE_GLM53_NOPE):
++    if model_type == _MODEL_TYPE_GLM53_NOPE:
++        return 512 + 4 * 4  # FP8 latent + four inline FP32 scales; no RoPE.
++    if model_type in (_MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA):
+         return _BPT_DSV3_2
+     if model_type == _MODEL_TYPE_DSV4:
+         return _BPT_DSV4
+--- a/flashinfer/mla/_sparse_mla_sm120_cpb.py
++++ b/flashinfer/mla/_sparse_mla_sm120_cpb.py
+@@ -86,7 +86,7 @@
+ _SCHEMA_VERSION = 1
+ # Only current-schema files load; any other version counts as absent and the
+ # families recalibrate on the next tuning-mode pass.
+-_BYTES_PER_TOKEN = {"dsv4": 584, "dsv3_2": 656, "glm53_nope": 656, "dots3_swa": 1160}
++_BYTES_PER_TOKEN = {"dsv4": 584, "dsv3_2": 656, "glm53_nope": 528, "dots3_swa": 1160}
+ _D_QK = {"dsv4": 512, "dsv3_2": 576, "glm53_nope": 512, "dots3_swa": 1088}
+ _D_V = {"dsv4": 512, "dsv3_2": 512, "glm53_nope": 512, "dots3_swa": 1024}
+ # Kernel candidate-tile width per family: DOTS3_SWA decodes at BI=32 (its
+--- a/flashinfer/mla/_sparse_mla_sm120_plan.py
++++ b/flashinfer/mla/_sparse_mla_sm120_plan.py
+@@ -71,7 +71,7 @@
+ _MODEL_TYPE_GLM53_NOPE = 3
+ _MODEL_TYPE_DOTS3_SWA = 4
+ # The V32 kernel family: the 656B/token inline-scale cache ABI. GLM53_NOPE is
+-# the rope-free member (d_qk=512; bytes [528:656) are reserved padding).
++# the rope-free member (d_qk=512; compact 528-byte rows, no RoPE tail).
+ # swapAB is instantiated for all V32 model types.
+ _V32_MODEL_TYPES = frozenset(
+     {_MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA, _MODEL_TYPE_GLM53_NOPE}
+--- a/include/flashinfer/attention/sparse_mla_sm120/model/kv_cache_traits.cuh
++++ b/include/flashinfer/attention/sparse_mla_sm120/model/kv_cache_traits.cuh
+@@ -107,13 +107,13 @@
+   static constexpr int NUM_SCALES = D_NOPE / QUANT_TILE;
+   static constexpr ScaleFormat SCALE_FORMAT = ScaleFormat::ARBITRARY_FP32;
+ 
+-  // vLLM's fp8_ds_mla cache ABI remains 656 bytes/token. The first 528
+-  // bytes contain the 512 FP8 latent values plus four inline FP32 scales;
+-  // the trailing 128 bytes are reserved padding and must never be treated as
+-  // RoPE data by this specialization.
++  // Compact NoPE rows contain 512 FP8 values and four inline FP32 scales.
++  // There is no RoPE tail. Prefill uses this dense stride; decode receives
++  // the actual row stride separately and can also consume padded rows.
+   static constexpr bool SCALE_INLINE = true;
+   static constexpr int SCALE_BYTES_PER_TOKEN = NUM_SCALES * sizeof(float);
+-  static constexpr int KV_GMEM_STRIDE = 656;
++  static constexpr int KV_GMEM_STRIDE = D_NOPE + SCALE_BYTES_PER_TOKEN;
++  static_assert(KV_GMEM_STRIDE == bytes_per_token(ModelType::GLM53_NOPE));
+   static constexpr int KV_SCALE_GMEM_OFFSET = D_NOPE;
+   static constexpr int KV_ROPE_GMEM_OFFSET = D_NOPE + SCALE_BYTES_PER_TOKEN;
+   static constexpr int KV_SMEM_STRIDE = D_NOPE + SCALE_BYTES_PER_TOKEN;
+--- a/include/flashinfer/attention/sparse_mla_sm120/model/model_type.h
++++ b/include/flashinfer/attention/sparse_mla_sm120/model/model_type.h
+@@ -35,7 +35,7 @@
+ //   DSV4:    d_nope=448, UE8M0 scale footer, 584B/token
+ //   GLM_NSA: d_nope=512, d_rope=64, arbitrary FP32 scale inline, 656B/token
+ //   GLM53_NOPE: d_nope=512, d_rope=0, arbitrary FP32 scale inline,
+-//               656B/token (the final 128 bytes are reserved cache padding)
++//               528B/token (512 FP8 values + four inline FP32 scales)
+ //   DOTS3_SWA: d_nope=1024, d_rope=64, UE8M0 scale footer, 1160B/token
+ //
+ // DOTS3_SWA is the sliding-window family: its candidate list is a 513-token
+@@ -49,8 +49,9 @@
+   switch (mt) {
+     case ModelType::DSV3_2:
+     case ModelType::GLM_NSA:
++      return 656;
+     case ModelType::GLM53_NOPE:
+-      return 656;
++      return 528;
+     case ModelType::DSV4:
+       return 584;
+     case ModelType::DOTS3_SWA:

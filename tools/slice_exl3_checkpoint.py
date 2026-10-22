@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Create a tensor-parallel rank-sliced MCG EXL3 checkpoint.
 
 The converter preserves the source checkpoint and writes a new sibling tree.

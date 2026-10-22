@@ -1,0 +1,614 @@
+--- 9707345/vllm/entrypoints/openai/responses/context.py
++++ 766e012/vllm/entrypoints/openai/responses/context.py
+@@ -6,6 +6,7 @@
+ import json
+ import logging
+ from abc import ABC, abstractmethod
++from collections.abc import Callable
+ from contextlib import AsyncExitStack
+ from dataclasses import replace
+ from typing import TYPE_CHECKING, Any, Final, Union
+@@ -21,11 +22,7 @@
+ from openai_harmony import Author, Message, Role, TextContent
+ 
+ from vllm import envs
+-from vllm.entrypoints.chat_utils import (
+-    ChatTemplateContentFormatOption,
+-)
+-from vllm.entrypoints.generate.base.protocol import FunctionCall
+-from vllm.entrypoints.mcp.tool import Tool
++from vllm.entrypoints.mcp.tool import Tool, mcp_result_to_tool_output
+ from vllm.entrypoints.mcp.tool_server import ToolServer
+ from vllm.entrypoints.openai.parser.harmony_utils import render_for_completion
+ from vllm.entrypoints.openai.responses.protocol import (
+@@ -36,14 +33,23 @@
+ from vllm.entrypoints.openai.responses.utils import (
+     build_response_output_items,
+     construct_tool_dicts,
++    serialize_tool_outputs,
++)
++from vllm.entrypoints.serve.utils.tool_calls_utils import (
++    maybe_filter_parallel_tool_calls,
+ )
+ from vllm.outputs import RequestOutput
+ from vllm.parser.abstract_parser import Parser
++from vllm.renderers.chat_utils import (
++    ChatTemplateContentFormatOption,
++)
+ from vllm.tokenizers import TokenizerLike
+ from vllm.utils import random_uuid
+ 
+ if TYPE_CHECKING:
+     from mcp.client import ClientSession
++
++    from vllm.v1.metrics.stats import RequestStateStats
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -102,6 +108,11 @@
+ 
+ class ConversationContext(ABC):
+     response_parser: Parser | None = None
++    request_metrics: "RequestStateStats | None" = None
++    # Built-in tools can trigger additional model generations. In that case,
++    # the stored engine timestamps cover only one turn, while token usage is
++    # accumulated across all turns.
++    request_metrics_cover_all_generation_turns: bool = True
+ 
+     @abstractmethod
+     def append_output(self, output: RequestOutput) -> None:
+@@ -141,9 +152,7 @@
+ def _create_json_parse_error_messages(
+     last_msg: Message, e: json.JSONDecodeError
+ ) -> list[Message]:
+-    """
+-    Creates an error message when json parse failed.
+-    """
++    """Creates an error message when json parse failed."""
+     error_msg = (
+         f"Error parsing tool arguments as JSON: {str(e)}. "
+         "Please ensure the tool call arguments are valid JSON and try again."
+@@ -160,8 +169,25 @@
+     ]
+ 
+ 
++def _create_parsable_json_parse_error_messages(
++    last_msg: ResponseFunctionToolCall, error: json.JSONDecodeError
++) -> list[ResponseInputOutputItem]:
++    return [
++        ResponseFunctionToolCallOutputItem(
++            id=f"fco_{random_uuid()}",
++            type="function_call_output",
++            call_id=last_msg.call_id,
++            output=(
++                f"Error parsing tool arguments as JSON: {error}. "
++                "Please ensure the tool call arguments are valid JSON and try again."
++            ),
++            status="completed",
++        )
++    ]
++
++
+ class SimpleContext(ConversationContext):
+-    """This is a context that cannot handle MCP tool calls"""
++    """This is a context that cannot handle MCP tool calls."""
+ 
+     def __init__(
+         self,
+@@ -187,10 +213,14 @@
+         self._accumulated_text: str = ""
+         self._accumulated_token_ids: list[int] = []
+         self._accumulated_logprobs: list = []
++        # Items already sent as output_item.done events; the final
++        # streaming response reuses them instead of reparsing.
++        self.streamed_output_items: list[ResponseOutputItem] | None = None
+ 
+         self.num_prompt_tokens = 0
+         self.num_output_tokens = 0
+         self.num_cached_tokens = 0
++        self.num_cache_creation_tokens = 0
+         # todo num_reasoning_tokens is not implemented yet.
+         self.num_reasoning_tokens = 0
+         # not implemented yet for SimpleContext
+@@ -206,6 +236,8 @@
+             raise ValueError("SimpleContext only supports RequestOutput.")
+         self.num_prompt_tokens = len(output.prompt_token_ids or [])
+         self.num_cached_tokens = output.num_cached_tokens or 0
++        if output.num_cache_creation_tokens is not None:
++            self.num_cache_creation_tokens = output.num_cache_creation_tokens
+         self.num_output_tokens += len(output.outputs[0].token_ids or [])
+         if output.kv_transfer_params is not None:
+             self.kv_transfer_params = output.kv_transfer_params
+@@ -298,15 +330,17 @@
+         chat_template_content_format: ChatTemplateContentFormatOption,
+         response_parser: Parser | None = None,
+         enable_auto_tools: bool = False,
++        parser_factory: Callable[[], Parser | None] | None = None,
+     ):
+         self.num_prompt_tokens = 0
+         self.num_output_tokens = 0
+         self.num_cached_tokens = 0
++        self.num_cache_creation_tokens = 0
+         self.num_reasoning_tokens = 0
+         # not implemented yet for ParsableContext
+         self.all_turn_metrics: list[TurnMetrics] = []
+ 
+-        self.response_messages: list[ResponseInputOutputItem] = response_messages
++        self.response_messages: list[ResponseInputOutputItem] = list(response_messages)
+         self.num_init_messages = len(response_messages)
+         self.finish_reason: str | None = None
+         self.enable_auto_tools = enable_auto_tools
+@@ -315,6 +349,13 @@
+             parser_cls(tokenizer, request.tools) if parser_cls is not None else None
+         )
+         self.parser_cls = parser_cls
++        self._parser_factory = parser_factory
++        self.last_output: RequestOutput | None = None
++        self.last_tool_outputs: list[ResponseInputOutputItem] = []
++        self._stream_turn_token_ids: list[int] = []
++        self._stream_turn_text: list[str] = []
++        self.active_tool_call: ResponseFunctionToolCall | None = None
++        self._dispatched_builtin_call_ids: set[str] = set()
+         self.request = request
+ 
+         self.available_tools = available_tools or []
+@@ -332,8 +373,10 @@
+         self.ec_transfer_params: dict[str, Any] | None = None
+ 
+     def append_output(self, output: RequestOutput) -> None:
++        self.last_output = output
+         self.num_prompt_tokens = len(output.prompt_token_ids or [])
+         self.num_cached_tokens = output.num_cached_tokens or 0
++        self.num_cache_creation_tokens += output.num_cache_creation_tokens or 0
+         self.num_output_tokens += len(output.outputs[0].token_ids or [])
+         if output.kv_transfer_params is not None:
+             self.kv_transfer_params = output.kv_transfer_params
+@@ -343,6 +386,13 @@
+ 
+         completion = output.outputs[0]
+         self.finish_reason = completion.finish_reason
++        if self.request.stream:
++            # The serving processor consumes deltas once and returns its exact
++            # completed items, preserving the IDs already sent to the client.
++            self._stream_turn_token_ids.extend(completion.token_ids or [])
++            if self.request.enable_response_messages:
++                self._stream_turn_text.append(completion.text)
++            return
+ 
+         if self.response_parser is not None:
+             reasoning, content, tool_calls = self.response_parser.parse(
+@@ -351,14 +401,19 @@
+                 enable_auto_tools=self.enable_auto_tools,
+                 model_output_token_ids=completion.token_ids,
+             )
+-            if not self.request.include_reasoning:
+-                reasoning = None
++            # Each round is a separate generation, so count it on its own ids.
++            self.num_reasoning_tokens += self.response_parser.count_reasoning_tokens(
++                completion.token_ids or []
++            )
+             self.response_messages.extend(
+                 build_response_output_items(
+                     reasoning=reasoning,
+                     content=content,
+-                    tool_calls=tool_calls,
++                    tool_calls=maybe_filter_parallel_tool_calls(
++                        tool_calls or [], self.request
++                    ),
+                     tools=self.request.tools,
++                    finish_reason=completion.finish_reason,
+                 )
+             )
+         elif completion.text:
+@@ -405,40 +460,110 @@
+                 )
+             )
+ 
++    def finish_streaming_turn(self, items: list[ResponseOutputItem]) -> None:
++        self.response_messages.extend(items)
++        if self.response_parser is not None:
++            self.num_reasoning_tokens += self.response_parser.count_reasoning_tokens(
++                self._stream_turn_token_ids
++            )
++        if self.request.enable_response_messages and self.last_output is not None:
++            prompt = ResponseRawMessageAndToken(
++                message=self.last_output.prompt or "",
++                tokens=self.last_output.prompt_token_ids or [],
++            )
++            if not self.input_messages:
++                self.input_messages.append(prompt)
++            else:
++                self.output_messages.append(prompt)
++            self.output_messages.append(
++                ResponseRawMessageAndToken(
++                    message="".join(self._stream_turn_text),
++                    tokens=list(self._stream_turn_token_ids),
++                )
++            )
++        self._stream_turn_token_ids.clear()
++        self._stream_turn_text.clear()
++
++    def start_new_turn(self) -> None:
++        if self._parser_factory is not None:
++            self.response_parser = self._parser_factory()
++        elif self.request.stream and self.parser_cls is not None:
++            # Standalone contexts use the same constructor as their first turn.
++            assert self.response_parser is not None
++            self.response_parser = self.parser_cls(
++                self.response_parser.model_tokenizer, self.request.tools
++            )
++        self.last_output = None
++
+     def append_tool_output(self, output: list[ResponseInputOutputItem]) -> None:
+         self.response_messages.extend(output)
++        if self.request.stream:
++            self.last_tool_outputs = output
++
++    def _builtin_session_name(self, name: str) -> str | None:
++        if name in ("code_interpreter", "python"):
++            session = "python"
++        elif name == "web_search_preview":
++            session = "browser"
++        elif name.startswith("container"):
++            session = "container"
++        else:
++            return None
++        return session if session in self.available_tools else None
++
++    def _pending_builtin_calls(self) -> list[ResponseFunctionToolCall]:
++        answered = {
++            item.call_id
++            for item in self.response_messages
++            if isinstance(item, ResponseFunctionToolCallOutputItem)
++        }
++        return [
++            item
++            for item in self.response_messages[self.num_init_messages :]
++            if isinstance(item, ResponseFunctionToolCall)
++            and item.call_id not in answered
++            and item.call_id not in self._dispatched_builtin_call_ids
++            and self._builtin_session_name(item.name) is not None
++        ]
+ 
+     def need_builtin_tool_call(self) -> bool:
+-        """Return true if the last message is a builtin tool call
+-        that the request has enabled."""
+-        last_message = self.response_messages[-1]
+-        if last_message.type != "function_call":
+-            return False
+-        if last_message.name in ("code_interpreter", "python"):
+-            return "python" in self.available_tools
+-        if last_message.name == "web_search_preview":
+-            return "browser" in self.available_tools
+-        if last_message.name.startswith("container"):
+-            return "container" in self.available_tools
+-        return False
++        return bool(self._pending_builtin_calls())
++
++    async def _call_local_tool(
++        self, tool: Tool, call: ResponseFunctionToolCall
++    ) -> list[ResponseInputOutputItem]:
++        previous = self.active_tool_call
++        self.active_tool_call = call
++        try:
++            return await tool.get_result_parsable_context(self)
++        finally:
++            self.active_tool_call = previous
+ 
+     async def call_python_tool(
+-        self, tool_session: Union["ClientSession", Tool], last_msg: FunctionCall
++        self,
++        tool_session: Union["ClientSession", Tool],
++        last_msg: ResponseFunctionToolCall,
+     ) -> list[ResponseInputOutputItem]:
+         self.called_tools.add("python")
++        if envs.VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY:
++            try:
++                args = json.loads(last_msg.arguments)
++            except json.JSONDecodeError as e:
++                return _create_parsable_json_parse_error_messages(last_msg, e)
++        else:
++            args = json.loads(last_msg.arguments)
+         if isinstance(tool_session, Tool):
+-            return await tool_session.get_result_parsable_context(self)
+-        args = json.loads(last_msg.arguments)
++            return await self._call_local_tool(tool_session, last_msg)
+         param = {
+             "code": args["code"],
+         }
+         result = await tool_session.call_tool("python", param)
+-        result_str = result.content[0].text
++        result_str = mcp_result_to_tool_output(result)
+ 
+         message = ResponseFunctionToolCallOutputItem(
+             id=f"mcpo_{random_uuid()}",
+             type="function_call_output",
+-            call_id=f"call_{random_uuid()}",
++            call_id=last_msg.call_id,
+             output=result_str,
+             status="completed",
+         )
+@@ -446,25 +571,27 @@
+         return [message]
+ 
+     async def call_search_tool(
+-        self, tool_session: Union["ClientSession", Tool], last_msg: FunctionCall
++        self,
++        tool_session: Union["ClientSession", Tool],
++        last_msg: ResponseFunctionToolCall,
+     ) -> list[ResponseInputOutputItem]:
+         self.called_tools.add("browser")
+         if isinstance(tool_session, Tool):
+-            return await tool_session.get_result_parsable_context(self)
++            return await self._call_local_tool(tool_session, last_msg)
+         if envs.VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY:
+             try:
+                 args = json.loads(last_msg.arguments)
+             except json.JSONDecodeError as e:
+-                return _create_json_parse_error_messages(last_msg, e)
++                return _create_parsable_json_parse_error_messages(last_msg, e)
+         else:
+             args = json.loads(last_msg.arguments)
+         result = await tool_session.call_tool("search", args)
+-        result_str = result.content[0].text
++        result_str = mcp_result_to_tool_output(result)
+ 
+         message = ResponseFunctionToolCallOutputItem(
+             id=f"fco_{random_uuid()}",
+             type="function_call_output",
+-            call_id=f"call_{random_uuid()}",
++            call_id=last_msg.call_id,
+             output=result_str,
+             status="completed",
+         )
+@@ -472,10 +599,11 @@
+         return [message]
+ 
+     async def call_container_tool(
+-        self, tool_session: Union["ClientSession", Tool], last_msg: Message
+-    ) -> list[Message]:
+-        """
+-        Call container tool. Expect this to be run in a stateful docker
++        self,
++        tool_session: Union["ClientSession", Tool],
++        last_msg: ResponseFunctionToolCall,
++    ) -> list[ResponseInputOutputItem]:
++        """Call container tool. Expect this to be run in a stateful docker
+         with command line terminal.
+         The official container tool would at least
+         expect the following format:
+@@ -492,22 +620,22 @@
+         """
+         self.called_tools.add("container")
+         if isinstance(tool_session, Tool):
+-            return await tool_session.get_result_parsable_context(self)
++            return await self._call_local_tool(tool_session, last_msg)
+         # tool_name = last_msg.recipient.split(".")[1].split(" ")[0]
+         if envs.VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY:
+             try:
+                 args = json.loads(last_msg.arguments)
+             except json.JSONDecodeError as e:
+-                return _create_json_parse_error_messages(last_msg, e)
++                return _create_parsable_json_parse_error_messages(last_msg, e)
+         else:
+             args = json.loads(last_msg.arguments)
+         result = await tool_session.call_tool("exec", args)
+-        result_str = result.content[0].text
++        result_str = mcp_result_to_tool_output(result)
+ 
+         message = ResponseFunctionToolCallOutputItem(
+             id=f"fco_{random_uuid()}",
+             type="function_call_output",
+-            call_id=f"call_{random_uuid()}",
++            call_id=last_msg.call_id,
+             output=result_str,
+             status="completed",
+         )
+@@ -515,44 +643,59 @@
+         return [message]
+ 
+     async def call_tool(self) -> list[ResponseInputOutputItem]:
+-        if not self.response_messages:
+-            return []
+-        last_msg = self.response_messages[-1]
+-        # change this to a mcp_ function call
+-        last_msg.id = f"{MCP_PREFIX}{random_uuid()}"
+-        self.response_messages[-1] = last_msg
+-        if last_msg.name == "code_interpreter":
+-            return await self.call_python_tool(self._tool_sessions["python"], last_msg)
+-        elif last_msg.name == "web_search_preview":
+-            return await self.call_search_tool(self._tool_sessions["browser"], last_msg)
+-        elif last_msg.name.startswith("container"):
+-            return await self.call_container_tool(
+-                self._tool_sessions["container"], last_msg
+-            )
+-        return []
++        outputs: list[ResponseInputOutputItem] = []
++        for call in self._pending_builtin_calls():
++            if call.call_id in self._dispatched_builtin_call_ids:
++                continue
++            session = self._builtin_session_name(call.name)
++            assert session is not None
++            # Stateful tools retain model order. Claim dispatch before awaiting,
++            # so cancellation cannot silently cause the same call to run twice.
++            self._dispatched_builtin_call_ids.add(call.call_id)
++            tool = self._tool_sessions[session]
++            if session == "python":
++                result = await self.call_python_tool(tool, call)
++            elif session == "browser":
++                result = await self.call_search_tool(tool, call)
++            else:
++                result = await self.call_container_tool(tool, call)
++            outputs.extend(result)
++        return outputs
+ 
+     def make_response_output_items(self) -> list[ResponseOutputItem]:
+-        response_messages = self.response_messages[self.num_init_messages :]
+-        output_messages: list[ResponseOutputItem] = []
+-        for message in response_messages:
+-            if not isinstance(message, ResponseFunctionToolCallOutputItem):
+-                output_messages.append(message)
+-            else:
+-                if len(output_messages) == 0:
+-                    raise ValueError(
+-                        "Cannot have a FunctionToolCallOutput before FunctionToolCall."
+-                    )
+-                if isinstance(output_messages[-1], ResponseFunctionToolCall):
+-                    output_messages[-1] = McpCall(
+-                        id=f"{MCP_PREFIX}{random_uuid()}",
+-                        arguments=output_messages[-1].arguments,
+-                        name=output_messages[-1].name,
+-                        server_label=output_messages[-1].name,
++        messages = self.response_messages[self.num_init_messages :]
++        calls = {
++            item.call_id: item
++            for item in messages
++            if isinstance(item, ResponseFunctionToolCall)
++        }
++        results: dict[str, list[Any]] = {}
++        for item in messages:
++            if isinstance(item, ResponseFunctionToolCallOutputItem):
++                if item.call_id not in calls:
++                    raise ValueError("Tool output has no matching function call.")
++                results.setdefault(item.call_id, []).append(item.output)
++        output: list[ResponseOutputItem] = []
++        for item in messages:
++            if item.type == "reasoning" and not self.request.include_reasoning:
++                continue
++            if isinstance(item, ResponseFunctionToolCallOutputItem):
++                continue
++            if isinstance(item, ResponseFunctionToolCall) and item.call_id in results:
++                output.append(
++                    McpCall(
++                        id=f"{MCP_PREFIX}{item.call_id}",
++                        arguments=item.arguments,
++                        name=item.name,
++                        server_label=item.name,
+                         type="mcp_call",
+                         status="completed",
+-                        output=message.output,
++                        output=serialize_tool_outputs(results[item.call_id]),
+                     )
+-        return output_messages
++                )
++            else:
++                output.append(item)
++        return output
+ 
+     def render_for_completion(self):
+         raise NotImplementedError("Should not be called.")
+@@ -565,6 +708,7 @@
+         mcp_tools: dict[str, Mcp],
+     ):
+         if tool_server:
++            initialized_session = False
+             for tool_name in self.available_tools:
+                 if tool_name in self._tool_sessions:
+                     continue
+@@ -577,10 +721,12 @@
+                     tool_server.new_session(tool_name, request_id, headers)
+                 )
+                 self._tool_sessions[tool_name] = tool_session
++                initialized_session = True
++            if initialized_session:
+                 exit_stack.push_async_exit(self.cleanup_session)
+ 
+     async def cleanup_session(self, *args, **kwargs) -> None:
+-        """Can be used as coro to used in __aexit__"""
++        """Can be used as coro to used in __aexit__."""
+ 
+         async def cleanup_tool_session(tool_session):
+             if not isinstance(tool_session, Tool):
+@@ -605,12 +751,14 @@
+         available_tools: list[str],
+         function_tool_names: frozenset[str],
+         response_parser: Parser | None = None,
++        request: ResponsesRequest | None = None,
+     ):
+         from vllm.parser.harmony import HarmonyParser, Segment
+ 
+         assert isinstance(response_parser, HarmonyParser)
+ 
+         self._messages = messages
++        self.request = request
+         self.response_parser: HarmonyParser = response_parser
+         self.finish_reason: str | None = None
+         self.available_tools = available_tools
+@@ -622,11 +770,17 @@
+         self.num_prompt_tokens = 0
+         self.num_output_tokens = 0
+         self.num_cached_tokens = 0
++        self.num_cache_creation_tokens = 0
+         self.num_reasoning_tokens = 0
+         self.num_tool_output_tokens = 0
+ 
+         self.last_append_segments: list[Segment] = []
+         self.last_append_flush_status: bool = False
++        # Each completed message with the items sent for it in
++        # output_item.done events, so the final response can reuse their ids.
++        self.streamed_items_by_message: list[
++            tuple[Message, list[ResponseOutputItem]]
++        ] = []
+ 
+         # Turn tracking - replaces multiple individual tracking variables
+         self.current_turn_metrics = TurnMetrics()
+@@ -690,6 +844,7 @@
+ 
+         Args:
+             output: The RequestOutput containing prompt token information
++
+         """
+         if output.prompt_token_ids is not None:
+             this_turn_input_tokens = len(output.prompt_token_ids)
+@@ -738,6 +893,8 @@
+             self.num_cached_tokens += num_cached_token
+             self.current_turn_metrics.cached_input_tokens = num_cached_token
+ 
++        self.num_cache_creation_tokens += output.num_cache_creation_tokens or 0
++
+     def _update_decode_token_usage(self, output: RequestOutput) -> int:
+         """Update token usage statistics for the decode phase of generation.
+ 
+@@ -754,6 +911,7 @@
+ 
+         Returns:
+             int: Number of output tokens processed in this call
++
+         """
+         updated_output_token_count = 0
+         if output.outputs:
+@@ -863,6 +1021,7 @@
+         mcp_tools: dict[str, Mcp],
+     ):
+         if tool_server:
++            initialized_session = False
+             for tool_name in self.available_tools:
+                 if tool_name not in self._tool_sessions:
+                     tool_type = _map_tool_name_to_tool_type(tool_name)
+@@ -873,13 +1032,14 @@
+                         tool_server.new_session(tool_name, request_id, headers)
+                     )
+                     self._tool_sessions[tool_name] = tool_session
+-                    exit_stack.push_async_exit(self.cleanup_session)
++                    initialized_session = True
++            if initialized_session:
++                exit_stack.push_async_exit(self.cleanup_session)
+ 
+     async def call_container_tool(
+         self, tool_session: Union["ClientSession", Tool], last_msg: Message
+     ) -> list[Message]:
+-        """
+-        Call container tool. Expect this to be run in a stateful docker
++        """Call container tool. Expect this to be run in a stateful docker
+         with command line terminal.
+         The official container tool would at least
+         expect the following format:
+@@ -919,7 +1079,7 @@
+         ]
+ 
+     async def cleanup_session(self, *args, **kwargs) -> None:
+-        """Can be used as coro to used in __aexit__"""
++        """Can be used as coro to used in __aexit__."""
+ 
+         async def cleanup_tool_session(tool_session):
+             if not isinstance(tool_session, Tool):

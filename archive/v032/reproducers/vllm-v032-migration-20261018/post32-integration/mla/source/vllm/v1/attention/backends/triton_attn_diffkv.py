@@ -1,0 +1,214 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Triton attention backend with different K/V head dimensions (DiffKV).
+
+The KV cache layout is identical to ``FlashAttentionDiffKVBackend``: K and V
+are packed along the last dim in the logical shape
+``[num_blocks, num_kv_heads, block_size, head_size_qk + head_size_v]``.
+"""
+
+from typing import ClassVar
+
+import torch
+
+from vllm.config.cache import CacheDType
+from vllm.logger import init_logger
+from vllm.utils.torch_utils import is_quantized_kv_cache
+from vllm.v1.attention.backend import AttentionLayer, AttentionType
+from vllm.v1.attention.backends.triton_attn import (
+    TritonAttentionBackend,
+    TritonAttentionImpl,
+    TritonAttentionMetadata,
+    TritonAttentionMetadataBuilder,
+)
+from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+    triton_reshape_and_cache_flash_diffkv,
+)
+from vllm.v1.attention.ops.triton_unified_attention_diffkv import (
+    unified_attention_diffkv,
+)
+
+logger = init_logger(__name__)
+
+
+class TritonAttentionDiffKVMetadataBuilder(TritonAttentionMetadataBuilder):
+    """The shared builder allocates scratch from the cache group's V width."""
+
+
+class TritonAttentionDiffKVBackend(TritonAttentionBackend):
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+    ]
+
+    @staticmethod
+    def get_name() -> str:
+        return "TRITON_ATTN_DIFFKV"
+
+    @staticmethod
+    def get_impl_cls() -> type["TritonAttentionDiffKVImpl"]:
+        return TritonAttentionDiffKVImpl
+
+    @staticmethod
+    def get_builder_cls() -> type["TritonAttentionDiffKVMetadataBuilder"]:
+        return TritonAttentionDiffKVMetadataBuilder
+
+    @classmethod
+    def supports_head_size(cls, head_size: int) -> bool:
+        # DiffKV K head sizes (e.g. 192 for MiMo-V2.5) need to be allowed.
+        return head_size >= 32
+
+    @classmethod
+    def supports_non_causal(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_mm_prefix(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_rswa(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_attn_type(cls, attn_type: str) -> bool:
+        # DiffKV only implements decoder self-attention.  Unlike the parent
+        # TritonAttentionBackend (which advertises all types), encoder
+        # attention is not supported, so gate it here at backend selection.
+        return attn_type == AttentionType.DECODER
+
+
+class TritonAttentionDiffKVImpl(TritonAttentionImpl):
+    """Triton attention impl for the DiffKV packed KV cache layout."""
+
+    def __init__(self, *args, head_size_v: int = 128, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.head_size_v = head_size_v
+        if (
+            is_quantized_kv_cache(self.kv_cache_dtype)
+            and self.kv_cache_dtype
+            not in TritonAttentionDiffKVBackend.supported_kv_cache_dtypes
+        ):
+            raise NotImplementedError(
+                "TritonAttentionDiffKVBackend supports only fp8/fp8_e4m3 quantized "
+                f"KV cache (got kv_cache_dtype={self.kv_cache_dtype!r})."
+            )
+        if self.chunk_lookback > -1:
+            raise NotImplementedError(
+                "TritonAttentionDiffKVBackend does not support chunked "
+                "attention with lookback."
+            )
+
+    def do_kv_cache_update(
+        self,
+        layer: AttentionLayer,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        # Cache is logical (B, H, N, C); the diffkv reshape kernel expects
+        # (B, N, H, C).
+        triton_reshape_and_cache_flash_diffkv(
+            key,
+            value,
+            kv_cache.transpose(1, 2),
+            slot_mapping,
+            self.kv_cache_dtype,
+            layer._k_scale,
+            layer._v_scale,
+        )
+
+    def fused_rope_kvcache_supported(self):
+        # The fused rope+cache path assumes the standard 2-tensor layout.
+        return False
+
+    def forward(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+        output_scale: torch.Tensor | None = None,
+        output_block_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Forward pass.
+
+        Shapes:
+            query:    [num_tokens, num_heads, head_size_qk]
+            key:      [num_tokens, num_kv_heads, head_size_qk]
+            value:    [num_tokens, num_kv_heads, head_size_v]
+            kv_cache: [num_blocks, num_kv_heads, block_size,
+                       head_size_qk + head_size_v]
+            output:   [num_tokens, num_heads, head_size_v]
+        """
+        if output_scale is not None or output_block_scale is not None:
+            raise NotImplementedError(
+                "fused output quantization is not supported for "
+                "TritonAttentionDiffKVImpl"
+            )
+
+        if attn_metadata is None:
+            return output.fill_(0)
+
+        assert attn_metadata.use_cascade is False, (
+            "Cascade attention not supported for TritonAttentionDiffKVImpl"
+        )
+
+        if attn_metadata.causal is not True:
+            raise NotImplementedError("DiffKV requires causal attention metadata")
+        if (
+            attn_metadata.mm_prefix_range is not None
+            or attn_metadata.mm_prefix_range_tensor is not None
+            or attn_metadata.rswa_prefix_lens is not None
+            or attn_metadata.rswa_window is not None
+        ):
+            raise NotImplementedError(
+                "DiffKV cannot ignore MM-prefix or R-SWA attention metadata"
+            )
+
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        head_size_qk = self.head_size
+        head_size_v = self.head_size_v
+
+        # Triton DiffKV kernels consume (B, N, H, D) cache views.
+        kv_cache = kv_cache.transpose(1, 2)
+        quantized = is_quantized_kv_cache(self.kv_cache_dtype)
+        if quantized:
+            kv_cache = kv_cache.view(self.fp8_dtype)
+        key_cache = kv_cache[..., :head_size_qk]
+        value_cache = kv_cache[..., head_size_qk : head_size_qk + head_size_v]
+
+        unified_attention_diffkv(
+            q=query[:num_actual_tokens],
+            k=key_cache,
+            v=value_cache,
+            out=output[:num_actual_tokens],
+            cu_seqlens_q=attn_metadata.query_start_loc,
+            seqused_k=attn_metadata.seq_lens,
+            softmax_scale=self.scale,
+            q_descale=(
+                layer._q_scale if quantized and query.dtype == self.fp8_dtype else None
+            ),
+            k_descale=layer._k_scale if quantized else None,
+            v_descale=layer._v_scale if quantized else None,
+            causal=True,
+            alibi_slopes=self.alibi_slopes,
+            use_alibi_sqrt=self.use_alibi_sqrt,
+            window_size=self.sliding_window,
+            block_table=attn_metadata.block_table,
+            softcap=self.logits_soft_cap,
+            sinks=self.sinks,
+            max_seqlen_q=attn_metadata.max_query_len,
+            seq_threshold_3D=attn_metadata.seq_threshold_3D,
+            num_par_softmax_segments=attn_metadata.num_par_softmax_segments,
+            softmax_segm_output=attn_metadata.softmax_segm_output,
+            softmax_segm_max=attn_metadata.softmax_segm_max,
+            softmax_segm_expsum=attn_metadata.softmax_segm_expsum,
+        )
+        return output

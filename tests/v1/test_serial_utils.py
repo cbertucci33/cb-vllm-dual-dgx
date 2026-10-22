@@ -22,6 +22,39 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 pytestmark = pytest.mark.cpu_test
 
 
+def test_decode_without_shared_memory_can_disable_tensor_pinning():
+    tensor = torch.arange(1024, dtype=torch.int32)
+    bufs = [bytearray(buf) for buf in MsgpackEncoder().encode(tensor)]
+    decoded = MsgpackDecoder(torch.Tensor, share_mem=False, pin_tensors=False).decode(
+        bufs
+    )
+    for buf in bufs:
+        buf[:] = bytes(len(buf))
+    assert torch.equal(decoded, tensor)
+    assert not decoded.is_pinned()
+
+
+def test_decode_without_shared_memory_preserves_default_tensor_pinning(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    pin_calls = 0
+
+    def fake_pin_memory(tensor: torch.Tensor) -> torch.Tensor:
+        nonlocal pin_calls
+        pin_calls += 1
+        return tensor.clone()
+
+    monkeypatch.setattr("vllm.v1.serial_utils.PIN_MEMORY", True)
+    monkeypatch.setattr(torch.Tensor, "pin_memory", fake_pin_memory)
+
+    tensor = torch.arange(1024, dtype=torch.int32)
+    bufs = [bytearray(buf) for buf in MsgpackEncoder().encode(tensor)]
+    decoded = MsgpackDecoder(torch.Tensor, share_mem=False).decode(bufs)
+
+    assert torch.equal(decoded, tensor)
+    assert pin_calls == 1
+
+
 class UnrecognizedType(UserDict):
     def __init__(self, an_int: int):
         super().__init__()
@@ -44,7 +77,6 @@ class MyType:
 
 def test_encode_decode(monkeypatch: pytest.MonkeyPatch):
     """Test encode/decode loop with zero-copy tensors."""
-
     with monkeypatch.context() as m:
         m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
@@ -100,17 +132,6 @@ def test_encode_decode(monkeypatch: pytest.MonkeyPatch):
 
 class MyRequest(msgspec.Struct):
     mm: list[MultiModalKwargsItems] | None
-
-
-def test_decode_without_shared_memory():
-    """Decoded tensors must not alias or pin the received buffers."""
-    tensor = torch.arange(1024, dtype=torch.int32)
-    bufs = [bytearray(buf) for buf in MsgpackEncoder().encode(tensor)]
-    decoded = MsgpackDecoder(torch.Tensor, share_mem=False).decode(bufs)
-    for buf in bufs:
-        buf[:] = bytes(len(buf))
-    assert torch.equal(decoded, tensor)
-    assert not decoded.is_pinned()
 
 
 def test_multimodal_kwargs():
@@ -262,7 +283,6 @@ def test_custom_class_serialization_allowed_with_pickle(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """Test that serializing a custom class succeeds when allow_pickle=True."""
-
     with monkeypatch.context() as m:
         m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
         encoder = MsgpackEncoder()

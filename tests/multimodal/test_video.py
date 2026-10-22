@@ -7,12 +7,13 @@ import sys
 import threading
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
 import pytest
 import torch
-from transformers import AutoVideoProcessor
+from transformers import AutoVideoProcessor, Qwen3VLVideoProcessor
 from transformers.video_utils import VideoMetadata
 
 from vllm.assets.base import get_vllm_public_assets
@@ -20,6 +21,7 @@ from vllm.models.minimax_m3.common.mm_preprocess import MiniMaxM3VideoBackend
 from vllm.multimodal.video import (
     PYNVVIDEOCODEC_VIDEO_BACKEND,
     VIDEO_LOADER_REGISTRY,
+    ClefOmniVideoBackend,
     DynamicVideoBackend,
     Glm5NextVideoBackend,
     GLM46VVideoBackend,
@@ -32,8 +34,10 @@ from vllm.multimodal.video import (
     VideoSourceMetadata,
     VideoTargetMetadata,
     get_video_loader_backend_for_processor,
+    glm5next_sample_frame_indices,
 )
 from vllm.multimodal.video_decoders import decode_video, resolve_video_backend_kwargs
+from vllm.multimodal.video_decoders.opencv import OpenCVVideoBackendMixin
 from vllm.multimodal.video_decoders.pynvvideocodec import (
     PYNVVIDEOCODEC_DECODER_CACHE_SIZE,
     PyNvVideoCodecDecoderSlot,
@@ -83,24 +87,28 @@ def _fresh_decoder_pool():
 @VIDEO_LOADER_REGISTRY.register("test_video_loader_1")
 class TestVideoLoader1(VideoLoader):
     @classmethod
-    def load_bytes(cls, data: bytes, num_frames: int = -1) -> npt.NDArray:
-        return FAKE_OUTPUT_1
+    def load_bytes(
+        cls, data: bytes, num_frames: int = -1, **kwargs
+    ) -> tuple[npt.NDArray, dict[str, Any]]:
+        return FAKE_OUTPUT_1, {}
 
 
 @VIDEO_LOADER_REGISTRY.register("test_video_loader_2")
 class TestVideoLoader2(VideoLoader):
     @classmethod
-    def load_bytes(cls, data: bytes, num_frames: int = -1) -> npt.NDArray:
-        return FAKE_OUTPUT_2
+    def load_bytes(
+        cls, data: bytes, num_frames: int = -1, **kwargs
+    ) -> tuple[npt.NDArray, dict[str, Any]]:
+        return FAKE_OUTPUT_2, {}
 
 
 def test_video_loader_registry():
     custom_loader_1 = VIDEO_LOADER_REGISTRY.load("test_video_loader_1")
-    output_1 = custom_loader_1.load_bytes(b"test")
+    output_1, _ = custom_loader_1.load_bytes(b"test")
     np.testing.assert_array_equal(output_1, FAKE_OUTPUT_1)
 
     custom_loader_2 = VIDEO_LOADER_REGISTRY.load("test_video_loader_2")
-    output_2 = custom_loader_2.load_bytes(b"test")
+    output_2, _ = custom_loader_2.load_bytes(b"test")
     np.testing.assert_array_equal(output_2, FAKE_OUTPUT_2)
 
 
@@ -596,7 +604,9 @@ def test_pynvvideocodec_h200_recovers_after_unsupported_8k():
         _pynv_decoder_pool.max_slots = old_max
 
 
-def test_pynvvideocodec_cross_subclass_shares_single_pool():
+def test_pynvvideocodec_cross_subclass_shares_single_pool(
+    monkeypatch: pytest.MonkeyPatch,
+):
     """Regression test for GHSA-j682-9xp5-rrf3.
 
     Multiple subclasses of PyNvVideoCodecVideoBackendMixin must share the
@@ -623,11 +633,12 @@ def test_pynvvideocodec_cross_subclass_shares_single_pool():
     with _fresh_decoder_pool() as pool:
         pool.max_slots = 2
 
-        orig_create = PyNvVideoCodecVideoBackendMixin._create_decoder_slot
-        PyNvVideoCodecVideoBackendMixin._create_decoder_slot = classmethod(
-            fake_create_slot
-        )
-        try:
+        with monkeypatch.context() as m:
+            m.setattr(
+                PyNvVideoCodecVideoBackendMixin,
+                "_create_decoder_slot",
+                classmethod(fake_create_slot),
+            )
             with ExitStack() as stack:
                 stack.enter_context(MixinSubclassA._borrow_decoder_slot())
                 stack.enter_context(MixinSubclassB._borrow_decoder_slot())
@@ -652,8 +663,6 @@ def test_pynvvideocodec_cross_subclass_shares_single_pool():
 
             assert create_count == 2
             assert len(pool.slots) == 2
-        finally:
-            PyNvVideoCodecVideoBackendMixin._create_decoder_slot = orig_create
 
 
 @pytest.mark.parametrize("hw_decoders", [0, -1, 1.5, True, "2"])
@@ -662,7 +671,7 @@ def test_pynvvideocodec_rejects_invalid_hw_decoders(hw_decoders: object):
         VideoBackend.load_bytes(
             b"fake video",
             backend=PYNVVIDEOCODEC_VIDEO_BACKEND,
-            hw_decoders=hw_decoders,  # type: ignore[arg-type]
+            hw_decoders=hw_decoders,
         )
 
 
@@ -722,6 +731,36 @@ def test_cosmos3_edge_uses_qwen3_vl_video_backend():
 
     assert backend == "qwen3_vl"
     assert isinstance(VIDEO_LOADER_REGISTRY.load(backend), Qwen3VLVideoBackend)
+
+
+def test_qwen3_vl_unknown_source_fps_matches_hf(
+    dummy_video_path, monkeypatch: pytest.MonkeyPatch
+):
+    """An unknown source fps (reported as 0) samples like HF's fps=None, and
+    the metadata carries the fps HF assumes, which the frame timestamps use."""
+    get_video_metadata = OpenCVVideoBackendMixin.get_video_metadata
+
+    def unknown_fps(cap) -> VideoSourceMetadata:
+        return get_video_metadata(cap)._replace(original_fps=0.0, duration=0.0)
+
+    monkeypatch.setattr(
+        OpenCVVideoBackendMixin, "get_video_metadata", staticmethod(unknown_fps)
+    )
+    _, metadata = Qwen3VLVideoBackend.load_bytes(
+        dummy_video_path.read_bytes(), fps=2, backend="opencv"
+    )
+
+    total_frames = metadata["total_num_frames"]
+    hf_metadata = VideoMetadata(total_num_frames=total_frames, fps=None)
+    hf_indices = Qwen3VLVideoProcessor().sample_frames(hf_metadata, fps=2).tolist()
+    assert metadata["frames_indices"] == hf_indices
+    assert metadata["fps"] == hf_metadata.fps
+
+    source = VideoSourceMetadata(total_frames, original_fps=0.0, duration=0.0)
+    target = VideoTargetMetadata(num_frames=-1, fps=2, max_duration=300)
+    assert (
+        Qwen3VLVideoBackend.compute_frames_index_to_sample(source, target) == hf_indices
+    )
 
 
 @pytest.mark.parametrize(
@@ -799,6 +838,7 @@ def test_video_processor_from_model_repo(
     )
 
     backend = get_video_loader_backend_for_processor(video_processor)
+    assert backend is not None
     loader = VIDEO_LOADER_REGISTRY.load(backend)
     assert isinstance(loader, expected_loader_cls), (
         f"{model_repo!r}: backend={backend!r} loaded "
@@ -842,8 +882,7 @@ def test_video_processor_from_model_repo(
 
 
 def test_video_backend_handles_broken_frames(monkeypatch: pytest.MonkeyPatch):
-    """
-    Regression test for handling videos with broken frames.
+    """Regression test for handling videos with broken frames.
     This test uses a pre-corrupted video file (assets/corrupted.mp4) that
     contains broken frames to verify the video loader handles
     them gracefully without crashing and returns accurate metadata.
@@ -882,8 +921,7 @@ def test_video_backend_handles_broken_frames(monkeypatch: pytest.MonkeyPatch):
 def test_video_backend_handles_edit_list_trimmed_video(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """
-    An mp4 edit list (e.g. from a lossless ``ffmpeg -ss ... -c copy`` cut)
+    """An mp4 edit list (e.g. from a lossless ``ffmpeg -ss ... -c copy`` cut)
     hides the decode lead-in: the header still counts every physical sample
     while sequential decode only yields the visible frames. Sampling over the
     header count used to collapse such videos to the few indices below the
@@ -923,8 +961,7 @@ def test_video_backend_handles_edit_list_trimmed_video(
 
 
 def test_video_recovery_simulated_failures(monkeypatch: pytest.MonkeyPatch):
-    """
-    Test that frame recovery correctly uses the next valid frame when
+    """Test that frame recovery correctly uses the next valid frame when
     target frames fail to load.
 
     Uses corrupted.mp4 and mocks VideoCapture.grab() to fail on specific
@@ -1019,8 +1056,7 @@ def test_video_recovery_simulated_failures(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_video_recovery_with_corrupted_file(monkeypatch: pytest.MonkeyPatch):
-    """
-    Test frame recovery with an actual corrupted video file using sparse sampling.
+    """Test frame recovery with an actual corrupted video file using sparse sampling.
 
     This test uses corrupted.mp4 which has genuine H.264 codec errors on
     frame 17. With num_frames=8, the target frames are [0, 3, 7, 10, 14, 17, 21, 25].
@@ -1088,8 +1124,7 @@ def test_video_recovery_with_corrupted_file(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_video_recovery_dynamic_backend(monkeypatch: pytest.MonkeyPatch):
-    """
-    Test that frame_recovery works with the dynamic video backend.
+    """Test that frame_recovery works with the dynamic video backend.
 
     The dynamic backend samples frames based on fps/duration rather than
     loading all frames. This test verifies recovery works in that context.
@@ -1589,10 +1624,6 @@ def test_glm5next_backend_indices_match_sampler(
 ):
     """The loader must select exactly the frames the processor's sampler
     would, with target.fps mapping onto the raw-fps override."""
-    from vllm.transformers_utils.processors.glm5next import (
-        glm_sample_frame_indices,
-    )
-
     source = VideoSourceMetadata(
         total_frames_num=total_frames, original_fps=original_fps, duration=duration
     )
@@ -1602,7 +1633,7 @@ def test_glm5next_backend_indices_match_sampler(
         source, target, max_frames=max_frames
     )
 
-    assert indices == glm_sample_frame_indices(
+    assert indices == glm5next_sample_frame_indices(
         total_frames,
         original_fps,
         duration,
@@ -1630,8 +1661,8 @@ def test_glm5next_backend_metadata_contract():
     assert metadata["fps"] == 30.0
     assert metadata["duration"] == 30.0
 
-    # A fully-selected source keeps do_sample_frames=True so the processor's
-    # sampler takes over on the complete frame set.
+    # A fully-selected source can safely be sampled again: the vLLM processor
+    # adapter and loader use this same shared sampler.
     full = list(range(48))
     assert (
         Glm5NextVideoBackend.create_hf_metadata(
@@ -1690,16 +1721,12 @@ def test_glm5next_backend_codec_parity(tmp_path, backend):
     if backend == "torchcodec":
         pytest.importorskip("torchcodec")
 
-    from vllm.transformers_utils.processors.glm5next import (
-        glm_sample_frame_indices,
-    )
-
     total_frames, fps = 120, 10
     path = _write_gray_video(tmp_path, total_frames, fps)
     # Dense default sampling (gap 5) and a sparse max_frames cap (gap 20).
     for max_frames in (None, 6):
         kwargs = {} if max_frames is None else {"max_frames": max_frames}
-        expected = glm_sample_frame_indices(
+        expected = glm5next_sample_frame_indices(
             total_frames, float(fps), 12.0, max_frame_count=max_frames
         )
 
@@ -1722,11 +1749,7 @@ def test_glm5next_backend_decodes_only_sampled_frames(tmp_path):
     total_frames, fps = 60, 10
     path = _write_gray_video(tmp_path, total_frames, fps)
 
-    from vllm.transformers_utils.processors.glm5next import (
-        glm_sample_frame_indices,
-    )
-
-    expected = glm_sample_frame_indices(total_frames, float(fps), 6.0)
+    expected = Glm5NextVideoBackend._sample_frame_indices(total_frames, float(fps), 6.0)
 
     frames, metadata = Glm5NextVideoBackend.load_bytes(path.read_bytes())
 
@@ -1790,3 +1813,18 @@ def test_glm5next_read_frames_dense_walk_matches_stock(tmp_path):
         assert abs(round(float(np.asarray(frame).mean())) - idx) <= 1
     # One initial seek, then pure walking -- no re-seek churn.
     assert cap.seeks == 1
+
+
+def test_clef_omni_backend_samples_reference_frames(tmp_path):
+    """Clef-Omni samples the first frame at or after each 0.5 s boundary
+    (the reference's 2 fps timestamp sampling), not uniform strides."""
+    pytest.importorskip("cv2")
+
+    # 2 s at 30 fps: the reference reads frames 0, 15, 30 and 45, where
+    # uniform sampling would read 0, 19, 39 and 59.
+    path = _write_gray_video(tmp_path, total_frames=60, fps=30)
+    frames, metadata = ClefOmniVideoBackend.load_bytes(path.read_bytes())
+    assert metadata["frames_indices"] == [0, 15, 30, 45]
+    assert metadata["do_sample_frames"] is False
+    for frame, idx in zip(frames, [0, 15, 30, 45]):
+        assert abs(round(float(np.asarray(frame).mean())) - idx) <= 1

@@ -4,6 +4,8 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig, replace
 from vllm.model_executor.model_loader import get_model
+from vllm.model_executor.model_loader.utils import get_draft_load_config
+from vllm.model_executor.models.utils import get_draft_quant_config
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
     _should_share,
     get_target_lm_head,
@@ -12,9 +14,7 @@ from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
 from vllm.v1.worker.gpu.spec_decode.utils import get_pp_safe_draft_load_config
 
 
-def load_dflash_model(
-    target_model: nn.Module, vllm_config: VllmConfig
-) -> tuple[nn.Module, VllmConfig]:
+def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
     from vllm.compilation.backends import set_model_tag
     from vllm.model_executor.models.qwen3_dflash import (
         dflash_has_any_non_causal,
@@ -27,10 +27,15 @@ def load_dflash_model(
     # a non-causal layer onto a causal-only backend would fail.
     draft_vllm_config = replace(
         vllm_config,
+        # initialize_model applies the draft class mapping in-place. Never
+        # give it the target quantization object (also retained by target layers).
+        quant_config=get_draft_quant_config(vllm_config),
         attention_config=replace(
             vllm_config.attention_config,
             use_non_causal=dflash_has_any_non_causal(draft_model_config.hf_config),
             backend=speculative_config.attention_backend,
+            # Target group overrides must not override the draft backend.
+            backend_per_kind={},
         ),
         cache_config=(
             replace(
@@ -40,7 +45,7 @@ def load_dflash_model(
             if speculative_config.kv_cache_dtype is not None
             else vllm_config.cache_config
         ),
-        load_config=get_pp_safe_draft_load_config(vllm_config.load_config),
+        load_config=get_pp_safe_draft_load_config(get_draft_load_config(vllm_config)),
     )
     with set_model_tag("dflash_head"):
         dflash_model = get_model(
@@ -62,8 +67,12 @@ def load_dflash_model(
 
     target_lm_head = get_target_lm_head(target_model, target_language_model)
     draft_lm_head = getattr(dflash_model, "lm_head", None)
-    if target_lm_head is not None and _should_share(
-        dflash_model, "has_own_lm_head", draft_lm_head, target_lm_head
+    if (
+        target_lm_head is not None
+        and not getattr(dflash_model.config, "has_own_lm_head", False)
+        and _should_share(
+            dflash_model, "has_own_lm_head", draft_lm_head, target_lm_head
+        )
     ):
         if draft_lm_head is not None:
             del dflash_model.lm_head
@@ -73,4 +82,4 @@ def load_dflash_model(
     if maybe_init_fp8_draft_head is not None:
         maybe_init_fp8_draft_head()
 
-    return dflash_model, draft_vllm_config
+    return dflash_model

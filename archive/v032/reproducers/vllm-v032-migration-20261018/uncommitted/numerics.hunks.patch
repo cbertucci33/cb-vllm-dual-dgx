@@ -1,0 +1,692 @@
+diff --git a/csrc/libtorch_stable/moe/grouped_topk_kernels.cu b/csrc/libtorch_stable/moe/grouped_topk_kernels.cu
+index 852b2b468a..ee5eb1fb22 100644
+--- a/csrc/libtorch_stable/moe/grouped_topk_kernels.cu
++++ b/csrc/libtorch_stable/moe/grouped_topk_kernels.cu
+@@ -411 +411,4 @@ __device__ inline float sigmoid_accurate(float x) {
+-  return 0.5f * tanhf(0.5f * x) + 0.5f;
++  // Avoid cancellation at negative saturation and overflow in either tail.
++  float const exp_neg_abs = expf(-fabsf(x));
++  return x >= 0.0f ? 1.0f / (1.0f + exp_neg_abs)
++                   : exp_neg_abs / (1.0f + exp_neg_abs);
+@@ -616 +619 @@ __global__ void grouped_topk_fused_kernel(
+-  float topk_sum = 1e-20f;
++  float topk_sum = 0.0f;
+@@ -618 +621 @@ __global__ void grouped_topk_fused_kernel(
+-    topk_sum += cg::reduce(tile, lane_unbiased, cg::plus<float>());
++    topk_sum = cg::reduce(tile, lane_unbiased, cg::plus<float>());
+@@ -622,2 +625,4 @@ __global__ void grouped_topk_fused_kernel(
+-  if (renormalize) {
+-    scale /= topk_sum;
++  if constexpr (SF != SCORING_SIGMOID) {
++    if (renormalize) {
++      scale /= topk_sum + 1e-20f;
++    }
+@@ -628 +633,9 @@ __global__ void grouped_topk_fused_kernel(
+-    topk_values[lane_id] = lane_unbiased * scale;
++    if constexpr (SF == SCORING_SIGMOID) {
++      // Divide before scaling: the reciprocal of a tiny sum can overflow.
++      topk_values[lane_id] =
++          renormalize && topk_sum != 0.0f
++              ? (lane_unbiased / topk_sum) * scale
++              : lane_unbiased * scale;
++    } else {
++      topk_values[lane_id] = lane_unbiased * scale;
++    }
+@@ -837 +850,8 @@ __global__ void grouped_topk_fused_small_expert_count_kernel(
+-      finalScore /= (redNorm + 1e-20);
++      if constexpr (SF == SCORING_SIGMOID) {
++        finalScore = redNorm != 0.0f
++                         ? (scoreNorm / redNorm) *
++                               static_cast<float>(routedScalingFactor)
++                         : finalScore;
++      } else {
++        finalScore /= (redNorm + 1e-20);
++      }
+@@ -888 +908 @@ __device__ __forceinline__ void preprocess_score(T input, BiasT correction_bias,
+-template <typename IdxT>
++template <ScoringFunc SF, typename IdxT>
+@@ -907,3 +927,10 @@ __device__ __forceinline__ void write_outputs(
+-      float scale = routed_scaling_factor;
+-      if (renormalize) {
+-        scale /= sum + 1e-20F;
++      if constexpr (SF == SCORING_SIGMOID) {
++        output = renormalize && sum != 0.0F
++                     ? (lane_unbiased / sum) * routed_scaling_factor
++                     : lane_unbiased * routed_scaling_factor;
++      } else {
++        float scale = routed_scaling_factor;
++        if (renormalize) {
++          scale /= sum + 1e-20F;
++        }
++        output = lane_unbiased * scale;
+@@ -911 +937,0 @@ __device__ __forceinline__ void write_outputs(
+-      output = lane_unbiased * scale;
+@@ -1033,3 +1059,3 @@ __global__ void __launch_bounds__(BlockDim)
+-    write_outputs(warp, lane_score, lane_unbiased, lane_expert, lane, token,
+-                  topk_i32, topk_values, topk_indices, renormalize,
+-                  routed_scaling_factor);
++    write_outputs<SF>(warp, lane_score, lane_unbiased, lane_expert, lane, token,
++                      topk_i32, topk_values, topk_indices, renormalize,
++                      routed_scaling_factor);
+@@ -1061,3 +1087,3 @@ __global__ void __launch_bounds__(BlockDim)
+-    write_outputs(warp, lane_score, lane_unbiased, lane_expert, lane, token,
+-                  topk_i32, topk_values, topk_indices, renormalize,
+-                  routed_scaling_factor);
++    write_outputs<SF>(warp, lane_score, lane_unbiased, lane_expert, lane, token,
++                      topk_i32, topk_values, topk_indices, renormalize,
++                      routed_scaling_factor);
+@@ -1165 +1191,3 @@ __global__ void __launch_bounds__(WarpTopKLaunchConfig<MaxNumExperts>::BlockDim)
+-      lane_unbiased = lane_score - cuda_cast<float, BiasT>(bias[lane_expert]);
++      // Bias affects selection only; rounded addition is not invertible.
++      lane_unbiased =
++          apply_scoring<SF>(cuda_cast<float, T>(token_scores[lane_expert]));
+@@ -1167,3 +1195,3 @@ __global__ void __launch_bounds__(WarpTopKLaunchConfig<MaxNumExperts>::BlockDim)
+-    write_outputs(warp, lane_score, lane_unbiased, lane_expert, lane, token,
+-                  topk_i32, topk_values, topk_indices, renormalize,
+-                  routed_scaling_factor);
++    write_outputs<SF>(warp, lane_score, lane_unbiased, lane_expert, lane, token,
++                      topk_i32, topk_values, topk_indices, renormalize,
++                      routed_scaling_factor);
+diff --git a/tests/kernels/moe/test_grouped_topk.py b/tests/kernels/moe/test_grouped_topk.py
+index 2004feae65..98dbd9a6a2 100644
+--- a/tests/kernels/moe/test_grouped_topk.py
++++ b/tests/kernels/moe/test_grouped_topk.py
+@@ -23,0 +24,3 @@ from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
++from vllm.model_executor.layers.fused_moe.router.router_factory import (
++    create_fused_moe_router,
++)
+@@ -62 +65,2 @@ def _single_group_reference(
+-        scores = 0.5 * torch.tanh(0.5 * logits.float()) + 0.5
++        # Independent logistic oracle, rounded only at the FP32 score boundary.
++        scores = logits.double().sigmoid().float()
+@@ -70 +74,6 @@ def _single_group_reference(
+-        values /= values.sum(dim=-1, keepdim=True) + 1e-20
++        total = values.double().sum(dim=-1, keepdim=True)
++        if scoring_func == "softmax":
++            total += 1e-20
++        else:
++            total = torch.where(total == 0, torch.ones_like(total), total)
++        values = (values.double() / total).float()
+@@ -401,0 +411,325 @@ def test_grouped_topk_single_group_nonfinite_scores(
++
++
++# Observed top-eight correction biases, not a full checkpoint tensor. Other
++# experts use a lower synthetic bias. This preserves the real selected IDs and
++# rounded-addition witness without requiring private model artifacts in CI.
++_MODEL_ROUTER_CASES = [
++    pytest.param(
++        256,
++        1.0,
++        [91, 137, 252, 221, 156, 62, 204, 19],
++        [
++            2.183300733566284,
++            2.1645851135253906,
++            2.115870714187622,
++            2.0943751335144043,
++            2.0889148712158203,
++            2.0862226486206055,
++            2.080620765686035,
++            2.0785624980926514,
++        ],
++        0.0,
++        id="mimo-256-top8",
++    ),
++    pytest.param(
++        288,
++        2.5,
++        [47, 153, 140, 19, 142, 197, 134, 205],
++        [
++            7.786213397979736,
++            7.785406589508057,
++            7.78521203994751,
++            7.7845025062561035,
++            7.783807277679443,
++            7.783804416656494,
++            7.783605575561523,
++            7.783412456512451,
++        ],
++        7.416070938110352,
++        id="glm-288-top8-scale2.5",
++    ),
++]
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="NVIDIA CUDA required")
++@pytest.mark.parametrize(
++    "num_experts,scale,selected_ids,selected_biases,other_bias", _MODEL_ROUTER_CASES
++)
++@pytest.mark.parametrize("num_rows", [1, 8, 1024, 1025, 16384])
++def test_model_grouped_topk_preserves_scores_before_bias(
++    num_experts, scale, selected_ids, selected_biases, other_bias, num_rows
++):
++    """G03/F01: actual top8 block/warp tiers retain scores erased by bias addition.
++
++    Equal -17 logits keep this independent of G04: even the old tanh score is
++    positive here, and retaining it yields exactly the same normalized weights.
++    16384 is the inspected GLM batched-token/prefill capacity, not a context cap.
++    """
++    logits = torch.full(
++        (num_rows, num_experts), -17.0, dtype=torch.float32, device="cuda"
++    )
++    bias = torch.full((num_experts,), other_bias, dtype=torch.float32, device="cuda")
++    bias[selected_ids] = torch.tensor(
++        selected_biases, dtype=torch.float32, device="cuda"
++    )
++    expected_values, expected_ids = _single_group_reference(
++        logits,
++        bias,
++        8,
++        scoring_func="sigmoid",
++        renormalize=True,
++        routed_scaling_factor=scale,
++    )
++    actual_values, actual_ids = _run_single_group_topk(
++        logits,
++        bias,
++        8,
++        scoring_func="sigmoid",
++        renormalize=True,
++        routed_scaling_factor=scale,
++    )
++    torch.testing.assert_close(
++        expected_ids[0], torch.tensor(selected_ids, dtype=torch.int32, device="cuda")
++    )
++    torch.testing.assert_close(actual_ids, expected_ids, rtol=0, atol=0)
++    torch.testing.assert_close(actual_values, expected_values, rtol=2e-6, atol=0)
++    torch.testing.assert_close(
++        actual_values.sum(-1), torch.full((num_rows,), scale, device="cuda")
++    )
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="NVIDIA CUDA required")
++@pytest.mark.parametrize("num_experts,scale", [(256, 1.0), (288, 2.5)])
++@pytest.mark.parametrize("num_rows", [1, 1024, 1025])
++@pytest.mark.parametrize("input_dtype", [torch.float32, torch.bfloat16, torch.float16])
++@pytest.mark.parametrize("renormalize", [False, True])
++@pytest.mark.parametrize("tail_logit", [-20.0, -80.0])
++def test_model_grouped_topk_sigmoid_negative_tail(
++    num_experts, scale, num_rows, input_dtype, renormalize, tail_logit
++):
++    """G04/F02: zero bias isolates tanh loss and epsilon-dominated normalization."""
++    logits = torch.full(
++        (num_rows, num_experts), tail_logit - 20, dtype=input_dtype, device="cuda"
++    )
++    logits[:, :8] = tail_logit - torch.arange(8, device="cuda") * 0.25
++    bias = torch.zeros(num_experts, dtype=torch.float32, device="cuda")
++    expected_values, expected_ids = _single_group_reference(
++        logits,
++        bias,
++        8,
++        scoring_func="sigmoid",
++        renormalize=renormalize,
++        routed_scaling_factor=scale,
++    )
++    actual_values, actual_ids = _run_single_group_topk(
++        logits,
++        bias,
++        8,
++        scoring_func="sigmoid",
++        renormalize=renormalize,
++        routed_scaling_factor=scale,
++    )
++    torch.testing.assert_close(actual_ids, expected_ids, rtol=0, atol=0)
++    torch.testing.assert_close(actual_values, expected_values, rtol=2e-6, atol=0)
++    if renormalize:
++        torch.testing.assert_close(
++            actual_values.sum(-1), torch.full((num_rows,), scale, device="cuda")
++        )
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="NVIDIA CUDA required")
++@pytest.mark.parametrize("num_experts", [128, 256, 288, 512, 768])
++@pytest.mark.parametrize("renormalize", [False, True])
++def test_grouped_topk_softmax_preserves_precomputed_scores(num_experts, renormalize):
++    """The modified warp also consumes original precomputed softmax scores."""
++    logits = torch.zeros((1025, num_experts), dtype=torch.float32, device="cuda")
++    logits[:, :8] = -17.0
++    bias = torch.zeros(num_experts, dtype=torch.float32, device="cuda")
++    bias[:8] = 2.0
++    expected_values, expected_ids = _single_group_reference(
++        logits,
++        bias,
++        8,
++        scoring_func="softmax",
++        renormalize=renormalize,
++        routed_scaling_factor=2.5,
++    )
++    actual_values, actual_ids = _run_single_group_topk(
++        logits,
++        bias,
++        8,
++        scoring_func="softmax",
++        renormalize=renormalize,
++        routed_scaling_factor=2.5,
++    )
++    torch.testing.assert_close(actual_ids, expected_ids, rtol=0, atol=0)
++    torch.testing.assert_close(actual_values, expected_values, rtol=2e-6, atol=0)
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="NVIDIA CUDA required")
++@pytest.mark.parametrize(
++    "num_experts,num_groups,topk_groups",
++    [
++        (256, 8, 4),  # small-expert grouped kernel
++        (512, 8, 4),  # generic grouped kernel
++        (1152, 1, 1),  # single-group fallback beyond the specialized tiers
++    ],
++)
++@pytest.mark.parametrize("tail_logit", [-20.0, -80.0])
++def test_grouped_topk_other_sigmoid_consumers_negative_tail(
++    num_experts, num_groups, topk_groups, tail_logit
++):
++    """All generic consumers of the shared helper retain finite negative tails."""
++    logits = torch.full(
++        (1, num_experts), tail_logit, dtype=torch.float32, device="cuda"
++    )
++    bias = torch.arange(num_experts, device="cuda", dtype=torch.float32) / num_experts
++    scores = logits.double().sigmoid().float()
++    selection = scores + bias
++    group_scores = selection.view(1, num_groups, -1).topk(2, dim=-1).values.sum(-1)
++    groups = group_scores.argsort(descending=True, stable=True)[:, :topk_groups]
++    mask = torch.zeros_like(group_scores, dtype=torch.bool).scatter_(1, groups, True)
++    selection = selection.masked_fill(
++        ~mask.repeat_interleave(num_experts // num_groups, dim=1), -torch.inf
++    )
++    expected_ids = selection.argsort(descending=True, stable=True)[:, :8]
++    expected_values = scores.gather(1, expected_ids)
++    expected_values = 2.5 * expected_values / expected_values.sum(-1, keepdim=True)
++    actual_values, actual_ids = fused_grouped_topk(
++        hidden_states=logits[:, :0],
++        gating_output=logits,
++        topk=8,
++        renormalize=True,
++        e_score_correction_bias=bias,
++        num_expert_group=num_groups,
++        topk_group=topk_groups,
++        scoring_func="sigmoid",
++        routed_scaling_factor=2.5,
++    )
++    torch.testing.assert_close(actual_ids, expected_ids.to(torch.int32), rtol=0, atol=0)
++    torch.testing.assert_close(actual_values, expected_values, rtol=2e-6, atol=0)
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="NVIDIA CUDA required")
++@pytest.mark.parametrize("num_experts,scale", [(256, 1.0), (288, 2.5)])
++@pytest.mark.parametrize("num_rows", [1, 1025])
++@pytest.mark.parametrize(
++    "case", ["ties", "invalid_logits", "invalid_bias", "all_invalid", "zero_scores"]
++)
++def test_model_grouped_topk_preserves_selection_edge_contracts(
++    num_experts, scale, num_rows, case
++):
++    """Both model tiers keep stable ties and the existing finite-input masks."""
++    logits = torch.zeros((num_rows, num_experts), dtype=torch.float32, device="cuda")
++    bias = torch.zeros(num_experts, dtype=torch.float32, device="cuda")
++    first_valid = 0
++    if case == "invalid_logits":
++        logits[:, :3] = torch.tensor([torch.nan, torch.inf, -torch.inf], device="cuda")
++        first_valid = 3
++    elif case == "invalid_bias":
++        bias[:3] = torch.tensor([torch.nan, torch.inf, -torch.inf], device="cuda")
++        first_valid = 3
++    elif case == "all_invalid":
++        logits.fill_(torch.nan)
++    elif case == "zero_scores":
++        logits.fill_(-1000.0)
++    actual_values, actual_ids = _run_single_group_topk(
++        logits,
++        bias,
++        8,
++        scoring_func="sigmoid",
++        renormalize=True,
++        routed_scaling_factor=scale,
++    )
++    expected_ids = torch.arange(
++        first_valid, first_valid + 8, dtype=torch.int32, device="cuda"
++    )[None].expand(num_rows, -1)
++    # Preserve the existing all-invalid fallback, including its unscaled value.
++    expected_weight = (1.0 if case == "all_invalid" else scale) / 8
++    if case == "zero_scores":
++        expected_weight = 0.0
++    expected_values = torch.full((num_rows, 8), expected_weight, device="cuda")
++    torch.testing.assert_close(actual_ids, expected_ids, rtol=0, atol=0)
++    torch.testing.assert_close(actual_values, expected_values, rtol=2e-6, atol=0)
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="NVIDIA CUDA required")
++@pytest.mark.parametrize(
++    "num_experts,scale,selected_ids,selected_biases,other_bias", _MODEL_ROUTER_CASES
++)
++def test_model_grouped_router_factory_reaches_original_score_contract(
++    monkeypatch, num_experts, scale, selected_ids, selected_biases, other_bias
++):
++    """Exercise actual factory, router, wrapper and native op, not a substitute topk."""
++    monkeypatch.setenv("VLLM_USE_FUSED_MOE_GROUPED_TOPK", "1")
++    logits = torch.full((1025, num_experts), -20.0, dtype=torch.float32, device="cuda")
++    bias = torch.full((num_experts,), other_bias, dtype=torch.float32, device="cuda")
++    bias[selected_ids] = torch.tensor(
++        selected_biases, dtype=torch.float32, device="cuda"
++    )
++    router = create_fused_moe_router(
++        top_k=8,
++        global_num_experts=num_experts,
++        renormalize=True,
++        use_grouped_topk=True,
++        num_expert_group=1,
++        topk_group=1,
++        scoring_func="sigmoid",
++        routed_scaling_factor=scale,
++        e_score_correction_bias=bias,
++    )
++    assert isinstance(router, GroupedTopKRouter)
++    expected_values, expected_ids = _single_group_reference(
++        logits,
++        bias,
++        8,
++        scoring_func="sigmoid",
++        renormalize=True,
++        routed_scaling_factor=scale,
++    )
++    actual_values, actual_ids = router.select_experts(
++        hidden_states=logits[:, :0],
++        router_logits=logits,
++        topk_indices_dtype=torch.int64,
++    )
++    assert actual_ids.dtype == torch.int64
++    assert actual_values.dtype == torch.float32
++    torch.testing.assert_close(actual_ids, expected_ids.long(), rtol=0, atol=0)
++    torch.testing.assert_close(actual_values, expected_values, rtol=2e-6, atol=0)
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="NVIDIA CUDA required")
++@pytest.mark.parametrize("num_experts", [513, 768])
++@pytest.mark.parametrize("num_rows", [1024, 1025])
++@pytest.mark.parametrize(
++    "logit,selection_bias",
++    [(-17.0, 2.0), (-20.0, 0.0), (-80.0, 0.0)],
++    ids=["bias-cancellation", "sigmoid-tail", "tiny-normalizer"],
++)
++def test_grouped_topk_sigmoid_lane_owned_block_and_warp(
++    num_experts, num_rows, logit, selection_bias
++):
++    """Tier768/top16 uses hierarchical block then lane-owned warp, not tuned896."""
++    logits = torch.full(
++        (num_rows, num_experts), logit, dtype=torch.float32, device="cuda"
++    )
++    bias = torch.zeros(num_experts, dtype=torch.float32, device="cuda")
++    bias[:16] = selection_bias
++    expected_values, expected_ids = _single_group_reference(
++        logits,
++        bias,
++        16,
++        scoring_func="sigmoid",
++        renormalize=True,
++        routed_scaling_factor=2.5,
++    )
++    actual_values, actual_ids = _run_single_group_topk(
++        logits,
++        bias,
++        16,
++        scoring_func="sigmoid",
++        renormalize=True,
++        routed_scaling_factor=2.5,
++    )
++    torch.testing.assert_close(actual_ids, expected_ids, rtol=0, atol=0)
++    torch.testing.assert_close(actual_values, expected_values, rtol=2e-6, atol=0)
+diff --git a/tests/models/glm5next/test_kda_recurrent.py b/tests/models/glm5next/test_kda_recurrent.py
+index 1658e43ff3..bef4873488 100644
+--- a/tests/models/glm5next/test_kda_recurrent.py
++++ b/tests/models/glm5next/test_kda_recurrent.py
+@@ -257 +257 @@ def test_fused_recurrent_kda_accepted_count_cannot_select_row_padding():
+-    """Accepted counts are bounded by logical T, not a padded row stride."""
++    """Accepted counts cannot select storage outside the logical state table."""
+@@ -266,2 +266,5 @@ def test_fused_recurrent_kda_accepted_count_cannot_select_row_padding():
+-    state_indices = state_indices_storage[:1]
+-    assert state_indices.shape[1] == query_len + 1
++    # The third storage column is padding only because it is excluded from
++    # the logical view. A visible third column is valid even for a 2-token query.
++    state_indices = state_indices_storage[:1, :query_len]
++    assert state_indices.shape[1] == query_len
++    assert state_indices.stride(0) == query_len + 1
+@@ -488,0 +492,83 @@ def test_prefill_checkpoint_resumes_suffix(monkeypatch, dim_first, num_spec, off
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="NVIDIA CUDA required")
++@pytest.mark.parametrize("query_len", range(9))
++@pytest.mark.parametrize("capture", [False, True], ids=["eager", "full-graph"])
++@torch.inference_mode()
++def test_kda_previous_accepted_state_is_independent_of_current_query(
++    query_len, capture
++):
++    """G02 regression, intentionally fails until the deferred state-width repair.
++
++    All eight previous accepted counts share a current query width from 0..8.
++    Eight visible state columns with a nine-column row stride distinguish the
++    previous state-table width from both current T and physical row padding.
++    """
++    torch.manual_seed(2026)
++    num_seqs, heads, dim, state_width = 8, 2, 128, 8
++    total = num_seqs * query_len
++    qkv = torch.randn(1, total, heads, 3 * dim, dtype=torch.bfloat16, device="cuda")
++    q, k, v = (x.contiguous() for x in qkv.split(dim, dim=-1))
++    storage = torch.arange(
++        1, num_seqs * (state_width + 1) + 1, dtype=torch.int32, device="cuda"
++    ).view(num_seqs, state_width + 1)
++    indices = storage[:, :state_width]
++    initial = (
++        torch.randn(
++            storage.numel() + 1, heads, dim, dim, device="cuda", dtype=torch.float32
++        )
++        * 0.1
++    )
++    state = initial.clone()
++    inputs = dict(
++        q=q,
++        k=k,
++        v=v,
++        g=torch.randn_like(q),
++        beta=torch.randn(1, total, heads, device="cuda", dtype=torch.bfloat16),
++        a_log=torch.randn(heads, device="cuda", dtype=torch.float32) * 0.1,
++        g_bias=torch.randn(heads * dim, device="cuda", dtype=torch.float32) * 0.1,
++        cu_seqlens=torch.arange(num_seqs + 1, device="cuda", dtype=torch.int32)
++        * query_len,
++        ssm_state_indices=indices,
++        num_accepted_tokens=torch.arange(1, 9, device="cuda", dtype=torch.int32),
++        out=torch.full_like(q, torch.nan),
++    )
++    expected = torch.empty_like(q, dtype=torch.float32)
++    expected_state = initial.clone()
++    for seq in range(num_seqs):
++        selected = indices[seq, seq]
++        recurrent = initial[selected].clone()
++        for t in range(query_len):
++            tok = slice(seq * query_len + t, seq * query_len + t + 1)
++            expected[0, tok], recurrent = naive_recurrent_kda(
++                q[0, tok],
++                k[0, tok],
++                v[0, tok],
++                inputs["g"][0, tok],
++                inputs["beta"][0, tok],
++                inputs["a_log"],
++                inputs["g_bias"].view(heads, dim),
++                recurrent,
++            )
++            expected_state[indices[seq, t]] = recurrent
++
++    if capture:
++        stream = torch.cuda.Stream()
++        stream.wait_stream(torch.cuda.current_stream())
++        with torch.cuda.stream(stream):
++            run_kernel(inputs, state)
++        torch.cuda.current_stream().wait_stream(stream)
++        state.copy_(initial)
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph):
++            actual = run_kernel(inputs, state)
++        for _ in range(2):
++            state.copy_(initial)
++            graph.replay()
++            torch.testing.assert_close(actual.float(), expected, rtol=1e-2, atol=1e-3)
++            torch.testing.assert_close(state, expected_state, rtol=1e-5, atol=1e-5)
++    else:
++        actual = run_kernel(inputs, state)
++        torch.testing.assert_close(actual.float(), expected, rtol=1e-2, atol=1e-3)
++        torch.testing.assert_close(state, expected_state, rtol=1e-5, atol=1e-5)
+diff --git a/tests/quantization/test_exl3_prefill_plan.py b/tests/quantization/test_exl3_prefill_plan.py
+index 469b6cb652..51f350a92d 100644
+--- a/tests/quantization/test_exl3_prefill_plan.py
++++ b/tests/quantization/test_exl3_prefill_plan.py
+@@ -4 +4 @@
+-"""CPU contract tests for rank-sliced EXL3 through Sparkinfer Trellis.
++"""Planning and native numerical contracts for rank-sliced EXL3 through Trellis.
+@@ -11,0 +12 @@ import os
++import struct
+@@ -18 +19,3 @@ import vllm.model_executor.layers.quantization.exl3 as exl3_module
+-from vllm.model_executor.layers.quantization.exl3 import Exl3MoEMethod
++from vllm.model_executor.layers.fused_moe import MoEActivation, RoutedExperts
++from vllm.model_executor.layers.quantization.exl3 import Exl3Config, Exl3MoEMethod
++from vllm.platforms import current_platform
+@@ -143,3 +146,7 @@ def test_rank_sliced_dispatch_uses_trellis_for_decode_and_prefill():
+-        assert [
+-            (plan.caps["max_tokens"], m) for plan, m in h.api.bound
+-        ] == [(32, 1), (32, 2), (32, 16), (32, 32), (MAX_BATCHED, 200)]
++        assert [(plan.caps["max_tokens"], m) for plan, m in h.api.bound] == [
++            (32, 1),
++            (32, 2),
++            (32, 16),
++            (32, 32),
++            (MAX_BATCHED, 200),
++        ]
+@@ -171,0 +179,132 @@ def test_rank_sliced_rejects_a_parity_window_override():
++
++
++# MCG decoding of an all-zero packed word: (0 * MCG & MASK) ^ 0x3B603B60
++# gives two identical fp16 numbers which the decoder adds in fp16. Every
++# trellis history/window is zero, so every decoded matrix entry is this value.
++_ZERO_MCG_WEIGHT = 2 * struct.unpack("<e", struct.pack("<H", 0x3B60))[0]
++
++
++def _zero_mcg_full_rotation_reference(x, up_sign, limit):
++    """Independent dense oracle for the real zero-word full-rotation weights.
++
++    Keep inverse rotation/projection scales before logical SwiGLU clamping,
++    and down-input rotation after it. Match the native fp16 GEMM boundaries,
++    without rounding the reconstructed logical gate/up before activation.
++    """
++    rows = torch.arange(128, device=x.device, dtype=torch.int64)
++    parity = torch.zeros((128, 128), device=x.device, dtype=torch.int64)
++    for bit in range(7):
++        parity ^= ((rows[:, None] & rows[None, :]) >> bit) & 1
++    hadamard = (1 - 2 * parity).float() / 128**0.5
++    weight = torch.full(
++        (128, 128), _ZERO_MCG_WEIGHT, dtype=torch.float32, device=x.device
++    )
++    rotated = (x.half().float() @ hadamard).half()
++    projected = (rotated.float() @ weight).half()
++    gate = projected.float() @ hadamard
++    up = gate * up_sign
++    if limit is not None:
++        gate = gate.clamp(max=limit)
++        up = up.clamp(min=-limit, max=limit)
++    activated = gate * gate.double().sigmoid().float() * up
++    down_input = (activated @ hadamard).half()
++    down = (down_input.float() @ weight).half()
++    return (down.float() @ hadamard).to(x.dtype)
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="NVIDIA CUDA required")
++@pytest.mark.parametrize("limit", [10.0, None], ids=["glm-limit10", "no-limit"])
++@pytest.mark.parametrize("up_sign", [1.0, -1.0], ids=["positive-up", "negative-up"])
++@pytest.mark.parametrize("num_rows", [1, 32, 33])
++@torch.inference_mode()
++def test_rank_sliced_real_rotated_swiglu_limit_and_graph_replay(
++    monkeypatch, limit, up_sign, num_rows
++):
++    """G01 regression: real planned native math, expected to fail until G01 repair.
++
++    This is not the fake planning harness above: real packed quantized weights
++    flow through RoutedExperts.forward_modular, Exl3.apply, Caps, plan, bind and
++    run. The owning limit is supplied by an actual GLM text config. Construct
++    only the small routed layer, not a distributed/full-model engine.
++    """
++    from transformers import Glm5NextTextConfig
++
++    if torch.cuda.get_device_capability()[0] != 12:
++        pytest.skip("full-rotation Trellis requires SM120/SM121")
++    for name in (
++        "VLLM_EXL3_TRELLIS_MIN_M",
++        "VLLM_EXL3_TRELLIS_MAX_M",
++        "VLLM_EXL3_TRELLIS_BLOCK_M",
++        "VLLM_EXL3_PREFILL_BLOCK_M",
++    ):
++        monkeypatch.delenv(name, raising=False)
++    api = exl3_module._load_sparkinfer_trellis()
++    device = torch.device("cuda", torch.cuda.current_device())
++    model_config = Glm5NextTextConfig(swiglu_limit=limit)
++    config = Exl3Config(bits=3.0)
++    config.rank_sliced_metadata = {"tp": 2}
++    method = object.__new__(Exl3MoEMethod)
++    method.quant_config = config
++    method.moe_kernel = None
++    w13 = torch.zeros((2, 1, 8, 8, 48), device=device, dtype=torch.int16)
++    w2 = torch.zeros((1, 8, 8, 48), device=device, dtype=torch.int16)
++    edge = torch.ones((1, 128), device=device, dtype=torch.float16)
++    rotations = torch.ones((1, 384), device=device, dtype=torch.float16)
++    rotations[:, 128:256] = up_sign
++    weights = api.prepare_weights(
++        w13,
++        w2,
++        gate_suh=edge,
++        up_suh=edge,
++        intermediate_rotations=rotations,
++        down_svh=edge,
++        codebook="mcg",
++        mcg=0xCBAC1FED,
++        tile_config=(64, 128, 64, 128),
++    )
++    layers = []
++    for is_draft in (False, True):
++        layer = object.__new__(RoutedExperts)
++        torch.nn.Module.__init__(layer)
++        layer.quant_method = method
++        layer.activation = MoEActivation.SILU
++        layer._expert_map = None
++        layer.apply_router_weight_on_input = False
++        layer.swiglu_limit = model_config.swiglu_limit
++        layer.exl3_is_draft = is_draft
++        layer.exl3_max_num_batched_tokens = 64
++        layer.exl3_hidden_size = layer.exl3_intermediate_size_per_partition = 128
++        layer.local_num_experts = 1
++        layer.exl3_trellis_tile_config = (64, 128, 64, 128)
++        layer.exl3_trellis_weights = weights
++        layers.append(layer)
++    x = torch.zeros((num_rows, 128), device=device, dtype=torch.bfloat16)
++    # Include positive gate overflow, either up overflow sign, negative gates
++    # and in-range values. The first row overflows even at decode m=1.
++    amplitudes = torch.tensor([20.0, -20.0, 5.0, -5.0], device=device)
++    x[:, 0] = amplitudes[torch.arange(num_rows, device=device) % 4] / (
++        128 * _ZERO_MCG_WEIGHT
++    )
++    ids = torch.zeros((num_rows, 1), device=device, dtype=torch.int64)
++    routing = torch.ones((num_rows, 1), device=device, dtype=torch.float32)
++    expected = _zero_mcg_full_rotation_reference(x, up_sign, limit)
++    try:
++        runtimes = [method._rank_sliced_runtime(layer, x, ids) for layer in layers]
++        assert runtimes[0] is not runtimes[1]
++        for arena in ("trellis_scratch", "prefill_scratch"):
++            assert runtimes[0][arena].data_ptr() != runtimes[1][arena].data_ptr()
++        for layer, runtime in zip(layers, runtimes):
++            assert runtime["trellis_plan"].caps.max_tokens == 32
++            assert runtime["prefill_plan"].caps.max_tokens == 64
++            assert runtime["trellis_plan"].fused_launch.full_rotation
++            assert runtime["prefill_plan"].fused_launch.full_rotation
++            actual = layer.forward_modular(x, routing, ids, None, None)
++            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-3)
++            graph = torch.cuda.CUDAGraph()
++            with torch.cuda.graph(graph):
++                captured = layer.forward_modular(x, routing, ids, None, None)
++            for _ in range(2):
++                graph.replay()
++                torch.testing.assert_close(captured, expected, rtol=2e-2, atol=2e-3)
++    finally:
++        method.release_runtime_resources()

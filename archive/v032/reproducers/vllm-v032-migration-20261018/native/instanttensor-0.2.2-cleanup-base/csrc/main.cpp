@@ -1,0 +1,249 @@
+#include <instant_tensor/loader.hpp>
+#include <instant_tensor/dlpack_utils.hpp>
+
+namespace instanttensor {
+
+struct RPCHandle {
+    int latest_req_id;
+    SPSCQueue<RPCRequest>* input_queue;
+    std::shared_ptr<SPSCQueue<RPCResponse>> output_queue;
+};
+
+class LoaderManager {
+public:
+    unordered_map<int, RPCHandle> loader_handle_to_queue;
+    int loader_id_iter = 0;
+    int device_idx = 0;
+
+    int call(int remote_handle, int opcode, std::any args) {
+        auto& handle = this->loader_handle_to_queue[remote_handle];
+        ++handle.latest_req_id;
+        int req_id = handle.latest_req_id;
+        handle.input_queue->push(RPCRequest{req_id, opcode, std::move(args)});
+        return req_id;
+    }
+
+    std::any get_result(int remote_handle, int req_id) {
+        // NOTE: assume the requests are returned in order, otherwise we need to use a map to store the requests and responses
+        auto& handle = this->loader_handle_to_queue[remote_handle];
+        RPCResponse response;
+        handle.output_queue->pop(response);
+        while (response.id != req_id) {
+            handle.output_queue->pop(response);
+        }
+        if (response.result.type() == typeid(std::exception_ptr)) {
+            std::rethrow_exception(std::any_cast<std::exception_ptr>(response.result));
+        }
+        return response.result;
+    }
+
+    int open(const vector<string> &filenames,
+            int device_idx,
+            size_t process_group,
+            size_t buffer_size,
+            size_t chunk_size,
+            size_t concurrency,
+            size_t io_depth,
+            Backend backend,
+            const vector<pair<size_t, size_t>>& tensor_offsets,
+            const vector<bool>& tensor_keep)
+    {
+        this->device_idx = device_idx;
+
+        int loader_handle = loader_id_iter++;
+        // Keep the response queue alive until CLOSE's caller has consumed its reply.
+        SPSCQueue<RPCRequest> *input_queue = new SPSCQueue<RPCRequest>();
+        auto output_queue = std::make_shared<SPSCQueue<RPCResponse>>();
+        this->loader_handle_to_queue[loader_handle] = RPCHandle{0, input_queue, output_queue};
+        std::thread loader_thread(run_loader, std::unique_ptr<SPSCQueue<RPCRequest>>(input_queue), output_queue);
+        loader_thread.detach();
+
+        ncclComm_t nccl_group_communicator = nullptr;
+        int rank = 0;
+        int world_size = 1;
+        if(!cuda_binding::init()) {
+            print_and_throw(std::runtime_error(
+                "cuda_binding: CUDA not found in process. "
+                "Ensure torch (or another CUDA user) has been imported and CUDA is loaded."));
+        }
+        if(process_group != 0) {
+            if (!nccl_binding::init()) {
+                print_and_throw(std::runtime_error(
+                    "nccl_binding: process_group non-zero but NCCL not found in process. "
+                    "Ensure torch (or another NCCL user) has been imported and NCCL is loaded."));
+            }
+            nccl_group_communicator = reinterpret_cast<ncclComm_t>(process_group);
+            NCCL_CHECK(ncclCommUserRank(nccl_group_communicator, &rank));
+            NCCL_CHECK(ncclCommCount(nccl_group_communicator, &world_size));
+        }
+
+        int req_id = this->call(loader_handle, OPEN, std::make_any<OpenArgs>(filenames, device_idx, nccl_group_communicator, rank, world_size, buffer_size, chunk_size, concurrency, io_depth, backend, tensor_offsets, tensor_keep));
+        this->get_result(loader_handle, req_id);
+        return loader_handle;
+    }
+
+    void close(int loader_handle) {
+        int req_id = this->call(loader_handle, CLOSE, std::make_any<CloseArgs>());
+        try {
+            this->get_result(loader_handle, req_id);
+        } catch (...) {
+            this->loader_handle_to_queue.erase(loader_handle);
+            throw;
+        }
+        this->loader_handle_to_queue.erase(loader_handle);
+    }
+
+    py::object get_dl_tensor(int loader_handle, int tensor_index, size_t size) {
+        int req_id = this->call(loader_handle, GET_TENSOR_PTR, std::make_any<GetTensorArgs>(tensor_index));
+        std::any data_ptr_any = this->get_result(loader_handle, req_id);
+        void *data_ptr = std::any_cast<void*>(data_ptr_any);
+        vector<int64_t> shape = {(int64_t)size};
+        string dtype = "int8";
+        auto ret = pack_dlpack((uint64_t)data_ptr, shape, dtype, this->device_idx);
+
+        return ret;
+    }
+};
+
+
+unique_ptr<LoaderManager> manager;
+
+int open(const vector<string> &filenames,
+        int device_idx,
+        size_t process_group,
+        size_t buffer_size,
+        size_t chunk_size,
+        size_t concurrency,
+        size_t io_depth,
+        int backend,
+        const vector<pair<size_t, size_t>>& tensor_offsets,
+        const vector<bool>& tensor_keep)
+{
+    if(!manager) {
+        manager = std::make_unique<LoaderManager>();
+    }
+    Backend backend_enum = static_cast<Backend>(backend);
+    return manager->open(filenames, device_idx, process_group, buffer_size, chunk_size, concurrency, io_depth, backend_enum, tensor_offsets, tensor_keep);
+}
+
+void close(int loader_handle) {
+    if(!manager) {
+        print_and_throw(std::runtime_error("Internal error: manager is not initialized"));
+    }
+    manager->close(loader_handle);
+}
+
+py::object get_dl_tensor(int loader_handle, int tensor_index, size_t size) {
+    if(!manager) {
+        print_and_throw(std::runtime_error("Internal error: manager is not initialized"));
+    }
+    return manager->get_dl_tensor(loader_handle, tensor_index, size);
+}
+
+// Clean global cuda-related objects before python exit and cudaDeviceReset() is called
+// to avoid cuda error when the program exits. This is registered by atexit.register() in safe_open_impl.py.
+void cleanup() {
+    instanttensor::cufile_context_initializer.reset();
+    instanttensor::host_buffer_cache.reset();
+    instanttensor::munmaper.reset();
+}
+
+BackendStatus backend_status(int backend) {
+    Backend backend_enum = static_cast<Backend>(backend);
+    if(!is_valid_backend(backend_enum)) {
+        return {false, "The requested backend is not recognized.", ""};
+    }
+    if(backend_enum == Backend::CUFILE) {
+        bool available = Loader::cufile_available();
+        return {
+            available,
+            available ? "" : "cuFile is not available on this system.",
+            "",
+        };
+    }
+    else if(backend_enum == Backend::URING || backend_enum == Backend::URING_BUFFERED) {
+        return Loader::uring_status();
+    }
+    else {
+        return {true, "", ""};
+    }
+}
+
+bool backend_available(int backend) {
+    return backend_status(backend).available;
+}
+
+} // namespace instanttensor
+
+
+PYBIND11_MODULE(_C, m) {
+    m.doc() = "InstantTensor C++ extension module";
+    m.attr("MAX_IO_DEPTH") = pybind11::int_(instanttensor::MAX_IO_DEPTH);
+    m.attr("MAX_CHUNK_SIZE") = pybind11::int_(instanttensor::MAX_CHUNK_SIZE);
+
+    m.def("backend_values", []() {
+              pybind11::dict values;
+              for (auto backend : {
+                       instanttensor::Backend::AIO,
+                       instanttensor::Backend::AIO_BUFFERED,
+                       instanttensor::Backend::URING,
+                       instanttensor::Backend::URING_BUFFERED,
+                       instanttensor::Backend::CUFILE,
+                       instanttensor::Backend::MMAP,
+                   }) {
+                  values[pybind11::str(instanttensor::backend_to_string(backend))]
+                      = static_cast<int>(backend);
+              }
+              return values;
+          },
+          "Return backend names and their native integer values");
+
+    m.def("required_buffer_size_for_io",
+          &instanttensor::required_buffer_size_for_io,
+          "Return the logical device-buffer size required by the I/O window",
+          pybind11::arg("chunk_size"),
+          pybind11::arg("io_depth"),
+          pybind11::arg("world_size"));
+
+    m.def("open", &instanttensor::open,
+          "Open a safetensors file for loading",
+          pybind11::arg("filenames"),
+          pybind11::arg("device_idx"),
+          pybind11::arg("process_group"),
+          pybind11::arg("buffer_size"),
+          pybind11::arg("chunk_size"),
+          pybind11::arg("concurrency"),
+          pybind11::arg("io_depth"),
+          pybind11::arg("backend"),
+          pybind11::arg("tensor_offsets"),
+          pybind11::arg("tensor_keep") = std::vector<bool>{});
+
+    m.def("close", &instanttensor::close,
+          "Close the loader handle and cleanup resources",
+          pybind11::arg("loader_handle"));
+
+    m.def("get_dl_tensor", &instanttensor::get_dl_tensor,
+          "Get a tensor by index from the opened file",
+          pybind11::arg("loader_handle"),
+          pybind11::arg("tensor_index"),
+          pybind11::arg("size"));
+
+    m.def("file_in_memory", &instanttensor::file_in_memory,
+          "Check if the file is in memory",
+          pybind11::arg("filenames"));
+
+    m.def("cleanup", &instanttensor::cleanup,
+          "Clean up global cuda-related objects before python exit and cudaDeviceReset() is called");
+
+    m.def("backend_available", &instanttensor::backend_available,
+          "Check if the backend is available",
+          pybind11::arg("backend"));
+
+    m.def("backend_status", [](int backend) {
+              auto status = instanttensor::backend_status(backend);
+              return pybind11::make_tuple(
+                  status.available, status.reason, status.warning);
+          },
+          "Return backend availability, rejection reason, and warning",
+          pybind11::arg("backend"));
+}

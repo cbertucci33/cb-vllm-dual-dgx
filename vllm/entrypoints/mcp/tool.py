@@ -23,8 +23,7 @@ MIN_GPT_OSS_VERSION = "0.0.7"
 
 
 def validate_gpt_oss_install():
-    """
-    Check if the gpt-oss is installed and its version is at least 0.0.7.
+    """Check if the gpt-oss is installed and its version is at least 0.0.7.
     If not, raise an ImportError.
     """
     from importlib.metadata import PackageNotFoundError, version
@@ -44,6 +43,50 @@ def validate_gpt_oss_install():
             f"gpt_oss >= {MIN_GPT_OSS_VERSION} is required, "
             f"but {pkg_version} is installed."
         ) from None
+
+
+def mcp_result_to_tool_output(result: Any) -> str | list[dict[str, Any]]:
+    """Preserve MCP results for parsable-model tool continuation."""
+    parts: list[dict[str, Any]] = []
+    for part in result.content:
+        part_type = getattr(part, "type", "text")
+        if part_type == "text":
+            parts.append({"type": "input_text", "text": part.text})
+        elif part_type == "image":
+            parts.append(
+                {
+                    "type": "input_image",
+                    "detail": "auto",
+                    "image_url": f"data:{part.mime_type};base64,{part.data}",
+                }
+            )
+        else:
+            # Resources and other MCP blocks have no direct Responses content
+            # equivalent. Preserve their typed payload instead of dropping it.
+            parts.append(
+                {
+                    "type": "input_text",
+                    "text": json.dumps(
+                        part.model_dump(mode="json", by_alias=True, exclude_none=True),
+                        ensure_ascii=False,
+                    ),
+                }
+            )
+    metadata: dict[str, Any] = {}
+    if getattr(result, "structured_content", None) is not None:
+        metadata["structuredContent"] = result.structured_content
+    if getattr(result, "is_error", False):
+        metadata["isError"] = True
+    if metadata:
+        parts.append(
+            {
+                "type": "input_text",
+                "text": json.dumps(metadata, ensure_ascii=False),
+            }
+        )
+    if all(part["type"] == "input_text" for part in parts):
+        return "".join(part["text"] for part in parts)
+    return parts
 
 
 class Tool(ABC):
@@ -91,7 +134,28 @@ class HarmonyBrowserTool(Tool):
         return tool_output_msgs
 
     async def get_result_parsable_context(self, context: "ConversationContext") -> Any:
-        raise NotImplementedError("Not implemented yet")
+        from vllm.entrypoints.openai.responses.context import ParsableContext
+
+        assert isinstance(context, ParsableContext)
+        call = context.active_tool_call or context.response_messages[-1]
+        message = Message(
+            author=Author(role=Role.ASSISTANT),
+            content=[TextContent(text=call.arguments)],
+            channel="analysis",
+            recipient="browser.search",
+        )
+        outputs = []
+        async for result in self.browser_tool.process(message):
+            outputs.append(
+                ResponseFunctionToolCallOutputItem(
+                    id=f"fco_{random_uuid()}",
+                    type="function_call_output",
+                    call_id=call.call_id,
+                    output="".join(part.text for part in result.content),
+                    status="completed",
+                )
+            )
+        return outputs
 
     @property
     def tool_config(self) -> Any:
@@ -151,15 +215,14 @@ class HarmonyPythonTool(Tool):
         return tool_output_msgs
 
     async def get_result_parsable_context(self, context: "ConversationContext") -> Any:
-        """
-        This function converts parsable context types to harmony and
+        """This function converts parsable context types to harmony and
         back so we can use GPTOSS demo python tool
         """
         from vllm.entrypoints.openai.responses.context import ParsableContext
 
         assert isinstance(context, ParsableContext)
 
-        last_msg = context.response_messages[-1]
+        last_msg = context.active_tool_call or context.response_messages[-1]
         args = json.loads(last_msg.arguments)
 
         last_msg_harmony = Message(
@@ -175,8 +238,8 @@ class HarmonyPythonTool(Tool):
             processed = ResponseFunctionToolCallOutputItem(
                 id=f"fco_{random_uuid()}",
                 type="function_call_output",
-                call_id=f"call_{random_uuid()}",
-                output=msg.content[0].text,
+                call_id=last_msg.call_id,
+                output="".join(part.text for part in msg.content),
                 status="completed",
             )
             tool_output_msgs.append(processed)

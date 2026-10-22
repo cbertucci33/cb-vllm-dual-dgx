@@ -1,0 +1,292 @@
+--- /dev/null
++++ b/csrc/instant_tensor/cleanup.hpp
+@@ -0,0 +1,25 @@
++#pragma once
++#include <exception>
++#include <cstdio>
++
++namespace instanttensor {
++class CleanupErrors {
++    std::exception_ptr first;
++public:
++    template <typename Action>
++    void attempt(Action action) {
++        try { action(); }
++        catch (...) {
++            if (!first) first = std::current_exception();
++            else {
++                try { throw; }
++                catch (const std::exception& error) {
++                    std::fprintf(stderr, "Additional cleanup error: %s\n", error.what());
++                }
++                catch (...) { std::fprintf(stderr, "Additional cleanup error\n"); }
++            }
++        }
++    }
++    void rethrow() const { if (first) std::rethrow_exception(first); }
++};
++} // namespace instanttensor
+--- a/csrc/instant_tensor/loader.hpp
++++ b/csrc/instant_tensor/loader.hpp
+@@ -71,6 +71,7 @@
+ 
+     alignas(64)
+     atomic<bool> stop = false;
++    bool threads_joined = false;
+     atomic<chunk_id_t> chunk_reading = -1;
+     atomic<chunk_id_t> chunk_read = -1;
+     std::exception_ptr fatal_error;
+--- a/csrc/loader_common.cpp
++++ b/csrc/loader_common.cpp
+@@ -1,4 +1,5 @@
+ #include <instant_tensor/loader.hpp>
++#include <instant_tensor/cleanup.hpp>
+ 
+ 
+ namespace instanttensor {
+@@ -49,24 +50,26 @@
+ }
+ 
+ void Loader::close_file() {
++    CleanupErrors errors;
+     for(size_t i = 0; i < this->file_info.size(); i++) {
+         FileInfo& f = this->file_info[i];
+         if (this->backend == Backend::MMAP) {
+-            this->close_file_inmem(f);
++            errors.attempt([&] { this->close_file_inmem(f); });
+         } else if (this->backend == Backend::CUFILE) {
+-            this->close_file_cufile(f);
++            errors.attempt([&] { this->close_file_cufile(f); });
+         } else if (this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
+-            this->close_file_uring(f);
++            errors.attempt([&] { this->close_file_uring(f); });
+         } else if (this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
+-            this->close_file_aio(f);
++            errors.attempt([&] { this->close_file_aio(f); });
+         }
+     }
+     if(this->backend == Backend::AIO || this->backend == Backend::AIO_BUFFERED) {
+-        this->destroy_aio_context();
++        errors.attempt([&] { this->destroy_aio_context(); });
+     }
+     if(this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
+-        this->destroy_uring_context();
+-    }
++        errors.attempt([&] { this->destroy_uring_context(); });
++    }
++    errors.rethrow();
+ }
+ 
+ void Loader::init_buffer() {
+@@ -111,8 +114,10 @@
+ 
+             this->host_buffer_entry.size = host_buffer_size;
+             this->host_buffer_entry.deleter = [](void *ptr) {
+-                CUDA_CHECK(cudaHostUnregister(ptr));
++                CleanupErrors errors;
++                errors.attempt([&] { CUDA_CHECK(cudaHostUnregister(ptr)); });
+                 free(ptr);
++                errors.rethrow();
+             };
+         }
+         this->host_buffer = (char*)this->host_buffer_entry.ptr;
+@@ -124,25 +129,27 @@
+ }
+ 
+ void Loader::destroy_buffer() {
++    CleanupErrors errors;
+     if (this->backend == Backend::CUFILE) {
+-        this->deregister_device_buffer_cufile();
+-    }
+-
+-    CUDA_CHECK(cudaFree(this->device_buffer));
+-
+-    if (this->need_host_buffer) {
+-        // Buffer registration belongs to this loader's ring and must not outlive it.
++        errors.attempt([&] { this->deregister_device_buffer_cufile(); });
++    }
++    errors.attempt([&] { CUDA_CHECK(cudaFree(this->device_buffer)); });
++    this->device_buffer = nullptr;
++    if (this->need_host_buffer && this->host_buffer_entry.ptr) {
+         if (this->backend == Backend::URING || this->backend == Backend::URING_BUFFERED) {
+-            this->deregister_host_buffer_uring();
+-        }
+-        if (_env_cache_buffer()) {
+-            host_buffer_cache->put(std::move(this->host_buffer_entry));
+-        }
+-        else {
+-            this->host_buffer_entry.deleter(this->host_buffer_entry.ptr);
+-            this->host_buffer_entry.ptr = nullptr;
+-        }
+-    }
++            errors.attempt([&] { this->deregister_host_buffer_uring(); });
++        }
++        errors.attempt([&] {
++            if (_env_cache_buffer()) {
++                host_buffer_cache->put(std::move(this->host_buffer_entry));
++            } else {
++                this->host_buffer_entry.deleter(this->host_buffer_entry.ptr);
++            }
++        });
++        this->host_buffer_entry.ptr = nullptr;
++        this->host_buffer = nullptr;
++    }
++    errors.rethrow();
+ }
+ 
+ void Loader::init_threads() {
+@@ -250,25 +257,38 @@
+ }
+ 
+ void Loader::destroy_threads() {
++    CleanupErrors joins;
+     if (this->cuda_executor) {
+-        this->cuda_executor->join();
++        joins.attempt([&] {
++            this->cuda_executor->join();
++        });
+     }
+     if (this->io_thread) {
+-        this->io_thread->join();
++        joins.attempt([&] {
++            this->io_thread->join();
++        });
+     }
+     if (this->worker_threads) {
+-        this->worker_threads->join();
++        joins.attempt([&] {
++            this->worker_threads->join();
++        });
+     }
+     if (this->last_page_reader_thread) {
+-        this->drain_aio_submissions();
+-        this->last_page_reader_thread->join();
+-    }
++        joins.attempt([&] { this->drain_aio_submissions(); });
++        joins.attempt([&] { this->last_page_reader_thread->join(); });
++    }
++    joins.rethrow();
++    this->threads_joined = true;
++    CleanupErrors errors;
+     if (this->cuda_stream) {
+-        CUDA_CHECK(cudaStreamDestroy(this->cuda_stream));
++        errors.attempt([&] { CUDA_CHECK(cudaStreamDestroy(this->cuda_stream)); });
++        this->cuda_stream = nullptr;
+     }
+     if (this->nccl_stream) {
+-        CUDA_CHECK(cudaStreamDestroy(this->nccl_stream));
+-    }
++        errors.attempt([&] { CUDA_CHECK(cudaStreamDestroy(this->nccl_stream)); });
++        this->nccl_stream = nullptr;
++    }
++    errors.rethrow();
+ }
+ 
+ /*
+@@ -506,11 +526,14 @@
+ void Loader::close(CloseArgs args) {
+     this->stop = true;
+     auto t0 = std::chrono::high_resolution_clock::now();
+-    this->destroy_threads();
++    CleanupErrors errors;
++    errors.attempt([&] { this->destroy_threads(); });
++    // A failed join leaves buffer ownership unresolved.
++    if (!this->threads_joined) errors.rethrow();
+     auto t1 = std::chrono::high_resolution_clock::now();
+-    this->destroy_buffer();
++    errors.attempt([&] { this->destroy_buffer(); });
+     auto t2 = std::chrono::high_resolution_clock::now();
+-    this->close_file();
++    errors.attempt([&] { this->close_file(); });
+     auto t3 = std::chrono::high_resolution_clock::now();
+     // this->destroy_comm();
+     auto t4 = std::chrono::high_resolution_clock::now();
+@@ -524,6 +547,7 @@
+         debug_log("Average queue depth: IO=%.3f, IO_READY=%.3f, CUDA=%.3f",
+             this->io_stats.average_active_tasks(), counts[0], counts[1]);
+     }
++    errors.rethrow();
+ }
+ 
+ void Loader::set_fatal_error(std::exception_ptr error) {
+--- a/csrc/loader_io_inmem.cpp
++++ b/csrc/loader_io_inmem.cpp
+@@ -1,4 +1,5 @@
+ #include <instant_tensor/loader.hpp>
++#include <instant_tensor/cleanup.hpp>
+ 
+ namespace instanttensor {
+ 
+@@ -26,12 +27,13 @@
+ }
+ 
+ void Loader::close_file_inmem(FileInfo &f) {
++    CleanupErrors errors;
+     if (this->use_internal_memory_register) {
+-        CUDA_CHECK(cudaHostUnregister(f.mapped_memory));
++        errors.attempt([&] { CUDA_CHECK(cudaHostUnregister(f.mapped_memory)); });
+     }
+-    // NOTE: Since munmap is very slow, we defer it to exit time
+-    munmaper->add(f.mapped_memory, f.size);
++    errors.attempt([&] { munmaper->add(f.mapped_memory, f.size); });
+     ::close(f.fd);
++    errors.rethrow();
+ }
+ 
+ IORequest Loader::post_read_chunk_inmem(const ChunkIOParams &p) {
+--- a/csrc/main.cpp
++++ b/csrc/main.cpp
+@@ -83,7 +83,12 @@
+ 
+     void close(int loader_handle) {
+         int req_id = this->call(loader_handle, CLOSE, std::make_any<CloseArgs>());
+-        this->get_result(loader_handle, req_id);
++        try {
++            this->get_result(loader_handle, req_id);
++        } catch (...) {
++            this->loader_handle_to_queue.erase(loader_handle);
++            throw;
++        }
+         this->loader_handle_to_queue.erase(loader_handle);
+     }
+ 
+--- a/instanttensor/_impl.py
++++ b/instanttensor/_impl.py
+@@ -895,12 +895,33 @@
+         return self
+ 
+     def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
+-        stream = torch.cuda.current_stream()
+-        stream.synchronize() # make sure all the data transfer is done
++        if self._invalidated:
++            return
++        error = _exc_value if not isinstance(_exc_value, GeneratorExit) else None
++        try:
++            stream = torch.cuda.current_stream()
++            stream.synchronize()
++        except BaseException as sync_error:
++            if error is None:
++                error = sync_error
++            else:
++                error.add_note(f"InstantTensor synchronization failed: {sync_error!r}")
+         self.exit_time = time.perf_counter()
+         self._invalidated = True
+-        _C.close(self.loader_handle)
+-        self.close_time = time.perf_counter()
++        try:
++            _C.close(self.loader_handle)
++        except BaseException as close_error:
++            if error is None:
++                error = close_error
++            else:
++                error.add_note(f"InstantTensor native cleanup failed: {close_error!r}")
++        finally:
++            self.loader_handle = None
++            self.close_time = time.perf_counter()
++        if error is not None:
++            if error is not _exc_value:
++                raise error
++            return
+         total_time = self.close_time - self.init_time
+         init_time = self.sync_time - self.init_time
+         sync_time = self.meta_read_time - self.sync_time

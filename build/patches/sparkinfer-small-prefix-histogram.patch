@@ -1,0 +1,17 @@
+--- a/sparkinfer/moe/_shared/kernels/w4a16/route_pack.py
++++ b/sparkinfer/moe/_shared/kernels/w4a16/route_pack.py
+@@ -180,10 +180,10 @@
+             ids = tl.load(expert_map + safe_ids, mask=valid, other=-1).to(tl.int32)
+             valid = valid & (ids >= 0) & (ids < NUM_EXPERTS)
+ 
+-        matches = (
+-            (experts[:, None] == ids[None, :]) & expert_mask[:, None] & valid[None, :]
+-        )
+-        counts += tl.sum(matches.to(tl.int32), axis=1)
++        # Histogram only validated local expert IDs. Masked lanes use an
++        # in-range value so no invalid ID reaches the histogram lowering.
++        histogram_ids = tl.where(valid, ids, 0)
++        counts += tl.histogram(histogram_ids, BLOCK_E, mask=valid)
+ 
+     padded = ((counts + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
+     padded = tl.where(expert_mask, padded, 0)

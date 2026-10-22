@@ -1,0 +1,139 @@
+diff --git a/build/patches/sparkinfer-trellis-swiglu-limit.patch b/build/patches/sparkinfer-trellis-swiglu-limit.patch
+index 23cf0b4f17..f7473a23cc 100644
+--- a/build/patches/sparkinfer-trellis-swiglu-limit.patch
++++ b/build/patches/sparkinfer-trellis-swiglu-limit.patch
+@@ -1,8 +1,49 @@
+ diff --git a/sparkinfer/moe/_shared/kernels/w4a16/kernel.py b/sparkinfer/moe/_shared/kernels/w4a16/kernel.py
+-index 9035937..e61cafd 100644
++index 9035937..276f644 100644
+ --- a/sparkinfer/moe/_shared/kernels/w4a16/kernel.py
+ +++ b/sparkinfer/moe/_shared/kernels/w4a16/kernel.py
+-@@ -4686,10 +4686,9 @@ class W4A16FusedMoeKernel:
++@@ -173,6 +173,40 @@ def _materialize_w4a16_topk_route_f32(value, *, loc=None, ip=None):
++     )
++ 
++ 
+++@dsl_user_op
+++def _clamp_swiglu_f32(gate, up, limit, *, loc=None, ip=None):
+++    # Preserve FP32, subnormals and NaNs. A positive limit makes xorsign.abs
+++    # clamp the up magnitude while retaining its sign (SM86+, including GB10).
+++    limit_ir = cutlass.Float32(limit).ir_value(loc=loc, ip=ip)
+++    gate = cutlass.Float32(
+++        llvm.inline_asm(
+++            T.f32(),
+++            [cutlass.Float32(gate).ir_value(loc=loc, ip=ip), limit_ir],
+++            "min.NaN.f32 $0, $1, $2;",
+++            "=f,f,f",
+++            has_side_effects=False,
+++            is_align_stack=False,
+++            asm_dialect=llvm.AsmDialect.AD_ATT,
+++            loc=loc,
+++            ip=ip,
+++        )
+++    )
+++    up = cutlass.Float32(
+++        llvm.inline_asm(
+++            T.f32(),
+++            [cutlass.Float32(up).ir_value(loc=loc, ip=ip), limit_ir],
+++            "min.NaN.xorsign.abs.f32 $0, $1, $2;",
+++            "=f,f,f",
+++            has_side_effects=False,
+++            is_align_stack=False,
+++            asm_dialect=llvm.AsmDialect.AD_ATT,
+++            loc=loc,
+++            ip=ip,
+++        )
+++    )
+++    return gate, up
+++
+++
++ def _m_specialization_key(size_m: int) -> int:
++     """M bucket for branches that genuinely specialize on token count."""
++     return 1 if int(size_m) == 1 else 0
++@@ -4686,10 +4720,9 @@ class W4A16FusedMoeKernel:
+                  raise ValueError(
+                      "intermediate_rotation is only supported for trellis3_t256"
+                  )
+@@ -15,7 +56,25 @@ index 9035937..e61cafd 100644
+                  )
+              if int(intermediate_size) % 128 != 0:
+                  raise ValueError(
+-@@ -5396,6 +5395,12 @@ class W4A16FusedMoeKernel:
++@@ -4838,14 +4871,9 @@ class W4A16FusedMoeKernel:
++         up: cutlass.Float32,
++     ):
++         if cutlass.const_expr(self.has_swiglu_limit):
++-            limit = cutlass.Float32(self.swiglu_limit)
++-            neg_limit = cutlass.Float32(-self.swiglu_limit)
++-            if gate > limit:
++-                gate = limit
++-            if up > limit:
++-                up = limit
++-            if up < neg_limit:
++-                up = neg_limit
+++            gate, up = _clamp_swiglu_f32(
+++                gate, up, cutlass.Float32(self.swiglu_limit)
+++            )
++         return gate, up
++ 
++     @cute.jit
++@@ -5396,6 +5424,12 @@ class W4A16FusedMoeKernel:
+                  iu1 = uh1 * svu1
+                  iu2 = uh2 * svu2
+                  iu3 = uh3 * svu3
+@@ -28,7 +87,7 @@ index 9035937..e61cafd 100644
+                  down = isz + isz
+                  sd0 = rot_scales_flat[s_base + down + Int32(0)].to(cutlass.Float32)
+                  sd1 = rot_scales_flat[s_base + down + Int32(1)].to(cutlass.Float32)
+-@@ -5658,6 +5663,10 @@ class W4A16FusedMoeKernel:
++@@ -5658,6 +5692,10 @@ class W4A16FusedMoeKernel:
+                  iu2_1 = uh1 * svu1
+                  iu2_2 = uh2 * svu2
+                  iu2_3 = uh3 * svu3
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+index 31acc1dad8..1c155bdcad 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -563,7 +563,8 @@ class DFlashSpeculator(DraftModelSpeculator):
+         num_reqs = input_batch.num_reqs
+         num_target_tokens = input_batch.num_tokens
+         num_query_tokens = num_reqs * self.num_query_per_req
+-        max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
++        # Reduce the existing CPU tensor through a zero-copy NumPy view.
++        max_seq_len = int(input_batch.seq_lens_cpu_upper_bound.numpy()[:num_reqs].max())
+         self.draft_max_seq_len = min(
+             max_seq_len + self.num_query_per_req, self.max_model_len
+         )
+diff --git a/vllm/v1/worker/gpu/spec_decode/speculator.py b/vllm/v1/worker/gpu/spec_decode/speculator.py
+index d86a0b0351..0fe17fa00c 100644
+--- a/vllm/v1/worker/gpu/spec_decode/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/speculator.py
+@@ -331,6 +331,7 @@ class DraftModelSpeculator(BaseSpeculator):
+         causal: bool | Mapping[int, bool] = True,
+         dcp_local_seq_lens: torch.Tensor | None = None,
+         slot_mappings: torch.Tensor | None = None,
++        max_query_len: int | None = None,
+     ) -> dict[str, Any] | None:
+         num_reqs_padded = batch_desc.num_reqs or num_reqs
+         # A FULL graph replays a captured shape whose padded requests each hold
+@@ -348,7 +349,10 @@ class DraftModelSpeculator(BaseSpeculator):
+             query_start_loc_np[: num_reqs + 1]
+         )
+         query_start_loc_cpu[num_reqs:] = query_start_loc_cpu[num_reqs]
+-        max_query_len = int((query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]).max())
++        if max_query_len is None:
++            max_query_len = int(
++                (query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]).max()
++            )
+         block_tables = [
+             x[:num_reqs_padded] for x in self.block_tables.input_block_tables
+         ]
+@@ -582,6 +586,8 @@ class DraftModelSpeculator(BaseSpeculator):
+             step=step,
+             causal=causal,
+             dcp_local_seq_lens=dcp_local_seq_lens,
++            # The uniform ramp has this stride; padded entries have stride zero.
++            max_query_len=num_query_per_req if num_reqs >= 1 else 0,
+         )
+ 
+     def _update_draft_decode_metadata(

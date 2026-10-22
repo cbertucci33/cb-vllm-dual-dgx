@@ -5,8 +5,17 @@ pre-lexed terminals and plain text chunks."""
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
+
+import tokenizers
+from transformers import TokenizersBackend
+
+from vllm.tokenizers.streaming import (
+    _PartialPromptDecodeStream,
+    create_decode_stream,
+)
 
 DROP_TERMINAL = "__DROP__"
 
@@ -28,6 +37,107 @@ class PreLexedTerminal:
 LexerInput = TextChunk | PreLexedTerminal
 
 
+class _TokenTextPositions:
+    """Locate control IDs with the same native decoder as the output processor.
+
+    Token and text deltas need not end at the same position: UTF-8 decoding and
+    stop-string buffering can delay text. Keep absolute decoded positions, not
+    textual searches, so an ordinary spelling of a marker is never a boundary.
+    Only a partial visible control marker is buffered; ordinary text is emitted
+    from the supplied delta, never reconstructed or normalized here.
+    """
+
+    def __init__(self, backend, terminal_names: dict[int, str], decode_token):
+        self.backend = backend
+        self.terminal_names = terminal_names
+        self.decode_token = decode_token
+        self.reset()
+
+    def reset(self) -> None:
+        self.stream: (
+            tokenizers.decoders.DecodeStream | _PartialPromptDecodeStream | None
+        ) = None
+        self.prompt_token_ids: Sequence[int] | None = None
+        self.decoded_chars = 0
+        self.emitted_chars = 0
+        self.pending_text = ""
+        self.terminals: deque[tuple[int, int, PreLexedTerminal]] = deque()
+
+    def set_prompt(self, token_ids: Sequence[int]) -> None:
+        if self.stream is not None:
+            raise RuntimeError("Cannot change parser prompt after decoding starts")
+        self.prompt_token_ids = token_ids
+
+    def scan(self, text: str, token_ids: Sequence[int]) -> list[LexerInput]:
+        if self.stream is None:
+            if not token_ids:
+                # Text-only parser APIs still use their lexical grammar.
+                return [TextChunk(text)] if text else []
+            self.stream = create_decode_stream(
+                self.backend, self.prompt_token_ids, skip_special_tokens=False
+            )
+            self.prompt_token_ids = None
+        for token_id in token_ids:
+            try:
+                piece = self.stream.step(self.backend, token_id) or ""
+            except Exception as exc:
+                # Match FastIncrementalDetokenizer's native UTF-8 prefix
+                # recovery; do not guess positions from visible marker text.
+                if not str(exc).startswith("Invalid prefix encountered"):
+                    raise
+                self.stream = tokenizers.decoders.DecodeStream(
+                    skip_special_tokens=False
+                )
+                piece = self.stream.step(self.backend, token_id) or ""
+            self.decoded_chars += len(piece)
+            name = self.terminal_names.get(token_id)
+            if name is not None:
+                marker = self.decode_token(token_id)
+                if not marker or not piece.endswith(marker):
+                    raise ValueError("Control token has no exact decoded boundary")
+                end = self.decoded_chars
+                self.terminals.append(
+                    (end - len(marker), end, PreLexedTerminal(name, token_id, marker))
+                )
+
+        visible = self.pending_text + text
+        cursor = 0
+        base = self.emitted_chars
+        limit = base + len(visible)
+        items: list[LexerInput] = []
+        while self.terminals:
+            start, end, terminal = self.terminals[0]
+            if start >= limit:
+                break
+            if start > base + cursor:
+                items.append(TextChunk(visible[cursor : start - base]))
+                cursor = start - base
+            if end > limit:
+                break
+            if visible[start - base : end - base] != terminal.text:
+                raise ValueError("Token and text streams disagree at a control ID")
+            items.append(terminal)
+            cursor = end - base
+            self.terminals.popleft()
+        # A marker partially held by the output processor must not leak into
+        # the lexer. Everything before the next known marker is ordinary text.
+        safe_end = len(visible)
+        if self.terminals:
+            safe_end = min(safe_end, max(cursor, self.terminals[0][0] - base))
+        if safe_end > cursor:
+            items.append(TextChunk(visible[cursor:safe_end]))
+        self.emitted_chars += safe_end
+        self.pending_text = visible[safe_end:]
+        return items
+
+    def finish(self) -> list[LexerInput]:
+        # A stop may remove a suffix or the final EOS token. Do not resurrect
+        # undisplayed text or fire transitions beyond the delivered prefix.
+        self.pending_text = ""
+        self.terminals.clear()
+        return []
+
+
 class TokenIDScanner:
     """Maps special token IDs in the delta to terminals.
 
@@ -46,21 +156,43 @@ class TokenIDScanner:
         self,
         token_id_to_terminal: dict[int, str],
         tokenizer,
+        *,
+        track_token_positions: bool = False,
     ) -> None:
         self.token_id_to_terminal = token_id_to_terminal
         self.tokenizer = tokenizer
         self._token_text_cache: dict[int, str] = {}
         self._deferred_terminals: list[PreLexedTerminal] = []
         self._deferred_prefix_token_counts: list[int] = []
+        self._deferred_prefix_texts: list[str] = []
         self._deferred_trailing_token_count = 0
         self._deferred_post_text: str = ""
+        backend = getattr(tokenizer, "_tokenizer", None)
+        # Only model classes that opt in use native position tracking.
+        # Text-only/mocked tokenizers retain the existing lexical interface.
+        self._positions = (
+            _TokenTextPositions(backend, token_id_to_terminal, self._decode_token)
+            if track_token_positions and isinstance(tokenizer, TokenizersBackend)
+            else None
+        )
+
+    @property
+    def tracks_token_positions(self) -> bool:
+        return self._positions is not None
+
+    def set_prompt_token_ids(self, token_ids: Sequence[int]) -> None:
+        if self._positions is not None:
+            self._positions.set_prompt(token_ids)
 
     def reset(self) -> None:
         """Clear mutable state for reuse. Preserves the token text cache."""
         self._deferred_terminals.clear()
         self._deferred_prefix_token_counts.clear()
+        self._deferred_prefix_texts.clear()
         self._deferred_trailing_token_count = 0
         self._deferred_post_text = ""
+        if self._positions is not None:
+            self._positions.reset()
 
     def _decode_token(self, token_id: int) -> str:
         if token_id not in self._token_text_cache:
@@ -82,6 +214,8 @@ class TokenIDScanner:
         delta_text: str,
         delta_token_ids: Sequence[int],
     ) -> Sequence[LexerInput]:
+        if self._positions is not None:
+            return self._positions.scan(delta_text, delta_token_ids)
         prefix_items: list[LexerInput] = []
         effective_text = delta_text
         deferred_trailing_count = 0
@@ -128,37 +262,33 @@ class TokenIDScanner:
         decoded_token_texts = [self._decode_token(tid) for tid in delta_token_ids]
 
         results: list[LexerInput] = []
-        text_accum: list[str] = []
-        token_text_accum: list[str] = []
+        group_start = 0
+
+        def append_text_group(end: int) -> None:
+            if group_start == end:
+                return
+            group_ids = delta_token_ids[group_start:end]
+            # Individual UTF-8 byte tokens can decode as replacement characters.
+            # Decode the whole ordinary span so those bytes form the real text.
+            group_text = self.tokenizer.decode(list(group_ids))
+            results.append(
+                TextChunk(
+                    group_text,
+                    tuple(decoded_token_texts[group_start:end]),
+                    end - group_start,
+                )
+            )
 
         for idx, tid in enumerate(delta_token_ids):
             terminal = self.token_id_to_terminal.get(tid)
             if terminal is not None:
-                if text_accum:
-                    joined = "".join(text_accum)
-                    if joined:
-                        results.append(
-                            TextChunk(
-                                joined,
-                                tuple(token_text_accum),
-                                len(token_text_accum),
-                            )
-                        )
-                    text_accum.clear()
-                    token_text_accum.clear()
+                append_text_group(idx)
                 results.append(
                     PreLexedTerminal(terminal, tid, decoded_token_texts[idx])
                 )
-            else:
-                text_accum.append(decoded_token_texts[idx])
-                token_text_accum.append(decoded_token_texts[idx])
+                group_start = idx + 1
 
-        if text_accum:
-            joined = "".join(text_accum)
-            if joined:
-                results.append(
-                    TextChunk(joined, tuple(token_text_accum), len(token_text_accum))
-                )
+        append_text_group(len(delta_token_ids))
 
         if deferred_trailing_count:
             results.insert(0, TextChunk("", token_count=deferred_trailing_count))
@@ -173,19 +303,25 @@ class TokenIDScanner:
             # deferred terminals will be resolved against the actual
             # delta_text in a subsequent scan() or flushed by finish().
             prefix_token_count = 0
+            prefix_text = ""
             for r in results:
                 if isinstance(r, TextChunk):
                     prefix_token_count += r.token_count
+                    prefix_text += r.text
                 if isinstance(r, PreLexedTerminal):
                     self._deferred_terminals.append(r)
                     self._deferred_prefix_token_counts.append(prefix_token_count)
+                    self._deferred_prefix_texts.append(prefix_text)
                     prefix_token_count = 0
+                    prefix_text = ""
             self._deferred_trailing_token_count += prefix_token_count
             results = []
 
         return prefix_items + results
 
     def flush_pending(self) -> list[LexerInput]:
+        if self._positions is not None:
+            return self._positions.finish()
         if not self._deferred_terminals and not self._deferred_post_text:
             return []
         results: list[LexerInput] = []
@@ -206,6 +342,7 @@ class TokenIDScanner:
             )
         self._deferred_terminals.clear()
         self._deferred_prefix_token_counts.clear()
+        self._deferred_prefix_texts.clear()
         self._deferred_trailing_token_count = 0
         return results
 
@@ -229,9 +366,11 @@ class TokenIDScanner:
         """
         deferred = self._deferred_terminals
         prefix_token_counts = self._deferred_prefix_token_counts
+        prefix_texts = self._deferred_prefix_texts
         trailing_token_count = self._deferred_trailing_token_count
         self._deferred_terminals = []
         self._deferred_prefix_token_counts = []
+        self._deferred_prefix_texts = []
         self._deferred_trailing_token_count = 0
 
         results: list[LexerInput] = []
@@ -241,11 +380,18 @@ class TokenIDScanner:
             remaining = self._deferred_post_text + remaining
             self._deferred_post_text = ""
 
-        # Duplicate-text deferred terminals resolve left-to-right via
-        # find(); correct when each terminal text appears once in sequence.
         for idx, terminal in enumerate(deferred):
             prefix_token_count = prefix_token_counts[idx]
-            pos = remaining.find(terminal.text)
+            prefix_text = prefix_texts[idx]
+            # Keep the ordinary-token span with its deferred control ID.
+            # A spelling in earlier literal text is not that control token.
+            pos = remaining.find(prefix_text + terminal.text)
+            if pos >= 0:
+                pos += len(prefix_text)
+            elif (prefix_text + terminal.text).startswith(remaining):
+                pos = -1  # The exact token/text prefix is still held back.
+            else:
+                pos = remaining.find(terminal.text)
             if pos > 0:
                 results.append(
                     TextChunk(remaining[:pos], token_count=prefix_token_count)
@@ -264,6 +410,7 @@ class TokenIDScanner:
                     remaining = ""
                 self._deferred_terminals.append(terminal)
                 self._deferred_prefix_token_counts.append(prefix_token_count)
+                self._deferred_prefix_texts.append(prefix_text)
 
         if self._deferred_terminals:
             self._deferred_trailing_token_count = trailing_token_count
@@ -322,17 +469,11 @@ class TokenIDScanner:
         delta_text.  If a terminal's text is not found in delta_text,
         it is deferred to the next scan() call.
 
-        Anchors are resolved right-to-left with ``rfind`` so that each
-        anchor binds to the *rightmost* available occurrence of its
-        text.  This prevents earlier literal lookalikes (e.g. a user
-        mentioning ``<tool_call>`` in prose) from stealing the position
-        of a real special-token anchor that appears later.
-
-        If the same anchor text appears multiple times as real special
-        tokens (not prose), the rightmost-first binding could misalign.
-        In practice this doesn't happen: each special token ID maps to
-        a distinct PreLexedTerminal, and duplicates in prose are resolved
-        by the token-ID filtering layer above.
+        Anchor positions first use adjacent decoded ordinary-token spans.
+        This distinguishes real control IDs from identical literal text before
+        or after them. When neither adjacent span matches (for example, a
+        tokenizer with context-dependent whitespace), retain the existing
+        right-to-left textual recovery for the remaining anchors.
         """
         anchors = [item for item in results if isinstance(item, PreLexedTerminal)]
         if not anchors:
@@ -340,6 +481,7 @@ class TokenIDScanner:
 
         token_groups: list[list[str]] = [[] for _ in range(len(anchors) + 1)]
         count_groups = [0] * (len(anchors) + 1)
+        text_groups = [""] * (len(anchors) + 1)
         group_idx = 0
         for item in results:
             if isinstance(item, PreLexedTerminal):
@@ -347,13 +489,49 @@ class TokenIDScanner:
             else:
                 token_groups[group_idx].extend(item.token_texts)
                 count_groups[group_idx] += item.token_count
+                text_groups[group_idx] += item.text
 
         # Resolve positions right-to-left: each anchor gets the
         # rightmost occurrence that is still before the next anchor.
         positions: list[int] = [-1] * len(anchors)
+        reconstructed = self._join_decoded_text(results)
+        exact_prefix = reconstructed.startswith(delta_text)
+        if exact_prefix:
+            # Stop-string buffering can deliver only a prefix of the tokens.
+            # Use their exact positions; a later control ID may not be visible.
+            offset = 0
+            anchor_idx = 0
+            for item in results:
+                if isinstance(item, PreLexedTerminal):
+                    if offset + len(item.text) <= len(delta_text):
+                        positions[anchor_idx] = offset
+                    anchor_idx += 1
+                offset += len(item.text)
         search_end = len(delta_text)
         for i in range(len(anchors) - 1, -1, -1):
-            pos = delta_text.rfind(anchors[i].text, 0, search_end)
+            if exact_prefix:
+                break
+            # Retain the token-derived following span when locating a marker.
+            # A literal lookalike after the real marker is part of that span,
+            # not another candidate for the control-token boundary.
+            following_text = text_groups[i + 1]
+            pos = (
+                delta_text.rfind(anchors[i].text + following_text, 0, search_end)
+                if following_text
+                else -1
+            )
+            if pos < 0 and text_groups[i]:
+                # The following span may end in an unfinished Unicode byte
+                # sequence held back by the detokenizer. In that case the
+                # preceding token-derived span still identifies this boundary.
+                preceding_text = text_groups[i]
+                prefix_pos = delta_text.rfind(
+                    preceding_text + anchors[i].text, 0, search_end
+                )
+                if prefix_pos >= 0:
+                    pos = prefix_pos + len(preceding_text)
+            if pos < 0:
+                pos = delta_text.rfind(anchors[i].text, 0, search_end)
             if pos >= 0:
                 positions[i] = pos
                 search_end = pos
@@ -389,6 +567,7 @@ class TokenIDScanner:
                     consumed = len(delta_text)
                 self._deferred_terminals.append(anchor)
                 self._deferred_prefix_token_counts.append(count_groups[i])
+                self._deferred_prefix_texts.append(text_groups[i])
         if consumed < len(delta_text):
             new_results.append(
                 TextChunk(

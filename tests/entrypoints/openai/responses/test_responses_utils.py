@@ -4,6 +4,7 @@
 from unittest.mock import patch
 
 import pytest
+from openai.types.responses import CustomTool, FunctionTool, ResponseCustomToolCall
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai.types.responses.response_function_tool_call_output_item import (
     ResponseFunctionToolCallOutputItem,
@@ -16,10 +17,14 @@ from openai.types.responses.response_reasoning_item import (
     Summary,
 )
 
+from vllm.entrypoints.generate.base.protocol import FunctionCall
 from vllm.entrypoints.openai.responses.utils import (
     _construct_message_from_response_item,
+    build_response_output_items,
     construct_chat_messages_with_tool_call,
     construct_input_messages,
+    decode_custom_tool_input,
+    decode_custom_tool_input_prefix,
     should_continue_final_message,
 )
 from vllm.exceptions import VLLMValidationError
@@ -248,6 +253,89 @@ class TestResponsesUtils:
         assert formatted_item["content"] == "dongyi"
 
 
+class TestCustomTools:
+    def test_custom_tool_call_output_item(self):
+        tools = [
+            CustomTool(type="custom", name="emit_command", format={"type": "text"}),
+            FunctionTool(
+                type="function", name="get_weather", parameters={}, strict=None
+            ),
+        ]
+        custom, function = build_response_output_items(
+            reasoning=None,
+            content=None,
+            tool_calls=[
+                FunctionCall(
+                    id="call_1", name="emit_command", arguments='{"input": "pwd"}'
+                ),
+                FunctionCall(
+                    id="call_2", name="get_weather", arguments='{"city": "Paris"}'
+                ),
+            ],
+            tools=tools,
+        )
+        assert isinstance(custom, ResponseCustomToolCall)
+        assert (custom.call_id, custom.input) == ("call_1", "pwd")
+        assert custom.id.startswith("ctc_")
+        assert isinstance(function, ResponseFunctionToolCall)
+        assert function.arguments == '{"city": "Paris"}'
+
+    def test_custom_tool_history_replays_through_function_shim(self):
+        messages = construct_chat_messages_with_tool_call(
+            [
+                make_reasoning_item(content_text="Run pwd."),
+                ResponseCustomToolCall(
+                    type="custom_tool_call",
+                    id="ctc_1",
+                    call_id="call_exec",
+                    name="emit_command",
+                    input='echo "hi"',
+                ),
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_exec",
+                    "output": "hi",
+                },
+                {"role": "user", "content": "Continue"},
+            ]
+        )
+        assert messages == [
+            {
+                "role": "assistant",
+                "reasoning": "Run pwd.",
+                "tool_calls": [
+                    {
+                        "id": "call_exec",
+                        "type": "function",
+                        "function": {
+                            "name": "emit_command",
+                            "arguments": '{"input": "echo \\"hi\\""}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "content": "hi", "tool_call_id": "call_exec"},
+            {"role": "user", "content": "Continue"},
+        ]
+
+    def test_decode_custom_tool_input(self):
+        assert decode_custom_tool_input('{"input": "pwd"}') == "pwd"
+        assert decode_custom_tool_input('{"cmd": "pwd"}') == '{"cmd": "pwd"}'
+        assert decode_custom_tool_input('{"file": "a.py"}') == '{"file": "a.py"}'
+        assert decode_custom_tool_input('{"input": 7}') == '{"input": 7}'
+        assert decode_custom_tool_input("pwd") == "pwd"
+
+    def test_decode_custom_tool_input_prefix(self):
+        assert decode_custom_tool_input_prefix('{"inp') == ""
+        assert decode_custom_tool_input_prefix('{"input": "ls \\"dir') == 'ls "dir'
+        assert decode_custom_tool_input_prefix('{"input": "a\\') == "a"
+        assert decode_custom_tool_input_prefix('{"input": "\\ud83d') == ""
+        assert (
+            decode_custom_tool_input_prefix('{"input": "\\ud83d\\ude00!"}')
+            == "\U0001f600!"
+        )
+
+
 class TestReasoningItemContentPriority:
     """Tests that content is prioritized over summary for reasoning items."""
 
@@ -376,8 +464,8 @@ class TestReasoningItemContentPriority:
         assert exc_info.value.parameter == "input"
 
     @patch("vllm.entrypoints.openai.responses.utils.logger")
-    def test_summary_with_multiple_entries_uses_first(self, mock_logger):
-        """When multiple summary entries exist, the first one is used."""
+    def test_summary_with_multiple_entries_preserves_all(self, mock_logger):
+        """Continuation must retain every summary part in source order."""
         item = ResponseReasoningItem(
             id="reasoning_7",
             summary=[
@@ -396,7 +484,7 @@ class TestReasoningItemContentPriority:
             status=None,
         )
         formatted = _single_chat_message(item)
-        assert formatted["reasoning"] == "First summary"
+        assert formatted["reasoning"] == "First summarySecond summary"
         mock_logger.warning.assert_called_once()
         assert (
             "summary text as reasoning content" in mock_logger.warning.call_args[0][0]
@@ -903,3 +991,183 @@ class TestConstructInputMessagesInstructionsLeak:
         assert len(msgs) == 2
         assert msgs[0] == {"role": "system", "content": "be helpful"}
         assert msgs[1] == {"role": "user", "content": "hello"}
+
+
+def test_previous_response_preserves_parallel_calls_and_instruction_reset():
+    from vllm.entrypoints.generate.base.protocol import FunctionCall
+    from vllm.entrypoints.openai.responses.utils import build_response_output_items
+
+    outputs = build_response_output_items(
+        "private reasoning",
+        "Working.",
+        [
+            FunctionCall(id="source_a", name="echo", arguments='{"text":"one"}'),
+            FunctionCall(id="source_b", name="echo", arguments='{"text":"two"}'),
+        ],
+    )
+    outputs[1].content.append(
+        ResponseOutputText(type="output_text", text=" Still working.", annotations=[])
+    )
+    before = [item.model_dump() for item in outputs]
+    previous = [
+        {"role": "system", "content": "old instructions"},
+        {"role": "user", "content": "original"},
+    ]
+    import copy
+
+    previous_before = copy.deepcopy(previous)
+    messages = construct_input_messages(
+        request_instructions="new instructions",
+        request_input=[
+            {"type": "function_call_output", "call_id": "source_a", "output": "one"},
+            {"type": "function_call_output", "call_id": "source_b", "output": "two"},
+        ],
+        prev_msg=previous,
+        prev_response_output=outputs,
+    )
+    assert [message["role"] for message in messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "tool",
+    ]
+    assert messages[0]["content"] == "new instructions"
+    assert messages[2]["content"] == "Working. Still working."
+    assert previous == previous_before
+    assert "reasoning" not in messages[2]
+    assert [call["id"] for call in messages[2]["tool_calls"]] == [
+        "source_a",
+        "source_b",
+    ]
+    assert [message["tool_call_id"] for message in messages[3:]] == [
+        "source_a",
+        "source_b",
+    ]
+    assert [item.model_dump() for item in outputs] == before
+
+
+@pytest.mark.parametrize(
+    "parts,expected",
+    [
+        ([], ""),
+        ([{"type": "refusal", "refusal": "Cannot do that."}], "Cannot do that."),
+    ],
+)
+def test_previous_response_empty_or_refusal_message(parts, expected):
+    output = ResponseOutputMessage(
+        id="msg_previous",
+        type="message",
+        role="assistant",
+        status="completed",
+        content=parts,
+    )
+    messages = construct_input_messages(
+        request_input="continue",
+        prev_response_output=[output],
+    )
+    assert messages[0] == {"role": "assistant", "content": expected}
+
+
+@pytest.mark.parametrize("field", ["content", "summary"])
+def test_reasoning_continuation_preserves_every_part(field):
+    parts = ["first", " second", " 中文"]
+    item = make_reasoning_item(
+        content=[Content(text=x, type="reasoning_text") for x in parts]
+        if field == "content"
+        else None,
+        summary=[Summary(text=x, type="summary_text") for x in parts]
+        if field == "summary"
+        else None,
+    )
+    assert _single_chat_message(item)["reasoning"] == "".join(parts)
+
+
+def test_dictionary_assistant_continuation_preserves_all_parts():
+    parts = [
+        {"type": "output_text", "text": "first"},
+        {"type": "output_text", "text": "second"},
+        {"type": "refusal", "refusal": "third"},
+    ]
+    item = {"role": "assistant", "type": "message", "content": parts}
+    messages = construct_chat_messages_with_tool_call(
+        [make_reasoning_item(content_text="reason"), item]
+    )
+    assert len(messages) == 1
+    assert messages[0]["content"] == parts
+    assert messages[0]["reasoning"] == "reason"
+
+
+def test_dictionary_assistant_does_not_lose_its_calls_when_merging_history():
+    item = {
+        "role": "assistant",
+        "content": "calling",
+        "tool_calls": [
+            {
+                "id": "call_original",
+                "type": "function",
+                "function": {"name": "echo", "arguments": "{}"},
+            }
+        ],
+    }
+    messages = construct_chat_messages_with_tool_call(
+        [make_reasoning_item(content_text="reason"), item]
+    )
+    assert messages[-1] == item
+
+
+@pytest.mark.parametrize("typed", [False, True])
+def test_function_output_content_parts_reach_chat_parser_as_dicts(typed):
+    from openai.types.responses.response_function_tool_call_output_item import (
+        ResponseFunctionToolCallOutputItem,
+    )
+
+    from vllm.renderers.chat_utils import _parse_chat_message_content_mm_part
+
+    item = {
+        "type": "function_call_output",
+        "id": "fco_parts",
+        "call_id": "call_parts",
+        "status": "completed",
+        "output": [
+            {"type": "input_text", "text": "caption"},
+            {
+                "type": "input_image",
+                "detail": "auto",
+                "image_url": "data:image/png;base64,aGVsbG8=",
+            },
+        ],
+    }
+    if typed:
+        item = ResponseFunctionToolCallOutputItem.model_validate(item)
+    message = construct_chat_messages_with_tool_call([item])[0]
+    assert message["tool_call_id"] == "call_parts"
+    assert [_parse_chat_message_content_mm_part(p) for p in message["content"]] == [
+        ("input_text", "caption"),
+        ("input_image", "data:image/png;base64,aGVsbG8="),
+    ]
+
+
+@pytest.mark.parametrize("content", [None, "working"])
+def test_chat_conversion_does_not_mutate_input_tool_call_lists(content):
+    from copy import deepcopy
+
+    previous = {
+        "role": "assistant",
+        "tool_calls": [
+            {
+                "id": "old",
+                "type": "function",
+                "function": {"name": "first", "arguments": "{}"},
+            }
+        ],
+    }
+    if content is not None:
+        previous["content"] = content
+    items = [previous, make_function_call(call_id="next", name="second")]
+    original = deepcopy(previous)
+    first = construct_chat_messages_with_tool_call(items)
+    second = construct_chat_messages_with_tool_call(items)
+    assert previous == original
+    assert first == second
+    assert [c["id"] for c in first[0]["tool_calls"]] == ["old", "next"]

@@ -19,8 +19,7 @@ Both 2D and 3D launches are supported:
   - 3D: one program per (q-block, kv-head, segm); each program covers a
     KV slice and writes per-segment partials (max/expsum/output).  A
     follow-up ``kernel_reduce_segments_diffkv`` combines them.  Selected
-    for small decode and multi-token batches whose 2D grid would under-fill
-    the GPU.
+    for decode-only batches whose 2D grid would under-fill the GPU.
 """
 
 from typing import Any
@@ -31,6 +30,7 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.platform_utils import num_compute_units
 from vllm.v1.attention.ops.triton_attention_helpers import (
     apply_alibi_to_score,
     apply_softcap,
@@ -54,28 +54,6 @@ _SPEC_3D_MAX_Q = 16
 _SPEC_3D_BLOCK_M = 128
 _SPEC_3D_NUM_WARPS = 8
 _SPEC_3D_TILE = 16
-
-
-def can_use_split_kv(
-    max_seqlen_q: int,
-    num_seqs: int,
-    seq_threshold_3D: int | None,
-    num_par_softmax_segments: int | None,
-    softmax_segm_output: torch.Tensor | None,
-    softmax_segm_max: torch.Tensor | None,
-    softmax_segm_expsum: torch.Tensor | None,
-) -> bool:
-    """One definition of 3D split-KV eligibility for launcher and builders."""
-    return not (
-        seq_threshold_3D is None
-        or num_par_softmax_segments is None
-        or softmax_segm_output is None
-        or softmax_segm_max is None
-        or softmax_segm_expsum is None
-        or max_seqlen_q > 1
-        or num_seqs > seq_threshold_3D
-        or is_batch_invariant
-    )
 
 
 @triton.jit
@@ -257,7 +235,9 @@ def kernel_unified_attention_diffkv(
         tile_mask = seq_offset < max_seq_prefix_len
 
         physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE,
+            mask=tile_mask,
+            other=0,
         ).to(tl.int64)
 
         v_offset = (
@@ -303,11 +283,7 @@ def kernel_unified_attention_diffkv(
             mask=dim_mask_v[None, :] & tile_mask[:, None],
             other=0.0,
         )
-        # Q may be FP8 when static query quantization is enabled. Keep the
-        # score dot in FP8, but do not quantize softmax probabilities to FP8
-        # for P @ V: that introduces avoidable short-prefill output error.
-        # BF16-query routes retain their existing compute dtype.
-        V = V_load.to(tl.bfloat16) if USE_Q_SCALE else V_load.to(Q.dtype)
+        V = V_load.to(Q.dtype)
 
         query_abs_pos = context_len + query_pos[:, None]
         seq_mask = compute_kv_seq_mask(
@@ -389,7 +365,7 @@ def kernel_unified_attention_diffkv(
             NUM_SEGMENTS_PER_SEQ,
         )
     else:
-        acc = acc / L[:, None]
+        acc = tl.where(L[:, None] > 0.0, acc / L[:, None], 0.0)
         output_offset = (
             query_offset_0[:, None] * output_stride_0
             + query_offset_1[:, None] * output_stride_1
@@ -428,9 +404,6 @@ def kernel_reduce_segments_diffkv(
     """
     query_token_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
-
-    if query_token_idx >= tl.load(query_start_len_ptr + num_seqs):
-        return
 
     seq_idx = find_seq_idx(
         query_start_len_ptr, query_token_idx, num_seqs, BLOCK_Q, False
@@ -500,7 +473,8 @@ def unified_attention_diffkv(
     alibi_slopes=None,
     sinks=None,
     use_alibi_sqrt=False,
-    # 3D / split-KV softmax buffers, indexed by query token.
+    # 3D / split-KV softmax buffers.  When all four are provided and the
+    # batch is decode-only with few sequences, the 3D path is taken.
     seq_threshold_3D: int | None = None,
     num_par_softmax_segments: int | None = None,
     softmax_segm_output: torch.Tensor | None = None,
@@ -572,7 +546,15 @@ def unified_attention_diffkv(
     )
 
     spec_tile: int | None = None
-    if use_3d and spec_3d and _SPEC_3D_BLOCK_M > BLOCK_M:
+    # One query token per program re-reads each KV tile per token but keeps
+    # more SMs busy; group the verify once that grid exceeds a few waves.
+    if (
+        use_3d
+        and spec_3d
+        and _SPEC_3D_BLOCK_M > BLOCK_M
+        and q.shape[0] * num_kv_heads * num_par_softmax_segments
+        > 4 * num_compute_units(q.device.index)
+    ):
         spec_bm = min(
             _SPEC_3D_BLOCK_M,
             triton.next_power_of_2(max_seqlen_q * num_queries_per_kv),
@@ -590,15 +572,9 @@ def unified_attention_diffkv(
     tile_size = 32 if not use_3d else (16 if q.element_size() >= 2 else 32)
     if spec_tile is not None:
         tile_size = spec_tile
-    # Triton's SM12x dot instruction requires K >= 32. Both the ordinary
-    # split-KV decode path and the speculative 3D override use TILE_SIZE as K
-    # for P @ V, so clamp after every tile-size override.
-    if (
-        tile_size < 32
-        and current_platform.is_cuda()
-        and current_platform.is_device_capability_family(120)
-    ):
-        tile_size = 32
+    if q.element_size() < 2:
+        # Triton needs K >= 32 for FP8 tl.dot; P @ V reduces over the KV tile.
+        tile_size = max(tile_size, 32)
 
     # A Q/K head size that is not a power of two (192 on MiMo-V2) would be padded to the
     # next one (256) for the Q.K^T dot. In the 2D kernel, split it into its largest

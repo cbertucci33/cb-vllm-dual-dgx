@@ -3,6 +3,7 @@
 
 from dataclasses import replace
 from typing import Any
+from weakref import proxy
 
 import torch
 from typing_extensions import override
@@ -10,11 +11,18 @@ from typing_extensions import override
 from vllm.config import VllmConfig
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import DFlashSWASpec, KVCacheConfig
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 from vllm.v1.spec_decode.utils import (
     _copy_and_expand_dflash_inputs,
     next_power_of_2,
+)
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+    synthesize_draft_ring_block_tables,
 )
 
 logger = init_logger(__name__)
@@ -35,6 +43,12 @@ class DFlashProposer(SpecDecodeBaseProposer):
             pass_hidden_states_to_model=True,
             runner=runner,
         )
+
+        self._target_runner = proxy(runner) if runner is not None else None
+        self._ring_block_table: torch.Tensor | None = None
+        self._ring_base = 1
+        self._ring_size = 0
+        self._ring_request_slots: dict[str, int] = {}
 
         # Only next_token_ids and mask tokens are query tokens, all other context is K/V
         self.max_query_tokens = self.max_batch_size * (1 + self.num_speculative_tokens)
@@ -88,6 +102,86 @@ class DFlashProposer(SpecDecodeBaseProposer):
         )
 
     @override
+    def initialize_attn_backend(
+        self,
+        kv_cache_config: KVCacheConfig,
+        kernel_block_sizes: list[int] | None = None,
+    ) -> None:
+        super().initialize_attn_backend(kv_cache_config, kernel_block_sizes)
+        spec = kv_cache_config.kv_cache_groups[self.kv_cache_gid].kv_cache_spec
+        if type(spec) is not DFlashSWASpec or not spec.private_ring:
+            return
+        assert self._target_runner is not None
+        names = set(kv_cache_config.kv_cache_groups[self.kv_cache_gid].layer_names)
+        tensor = next(
+            tensor
+            for tensor in kv_cache_config.kv_cache_tensors
+            if names.intersection(tensor.layers)
+        )
+        assert tensor.num_blocks is not None
+        self._ring_size, remainder = divmod(tensor.num_blocks - 1, self.max_batch_size)
+        assert self._ring_size > 0 and remainder == 0
+        self._ring_block_table = torch.zeros(
+            self.max_batch_size,
+            cdiv(self.max_model_len + 1 + self.num_speculative_tokens, self.block_size),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        _copy_and_expand_dflash_inputs.register_warmup(
+            block_table_stride=self._ring_block_table.stride(0),
+            parallel_drafting_token_id=self.parallel_drafting_token_id,
+            block_size=self.block_size,
+            num_speculative_tokens=self.num_speculative_tokens,
+        )
+
+    def update_request_state(self, scheduler_output: SchedulerOutput) -> None:
+        if self._ring_block_table is None:
+            return
+        removed = scheduler_output.finished_req_ids | (
+            scheduler_output.preempted_req_ids or set()
+        )
+        for req_id in removed:
+            self._ring_request_slots.pop(req_id, None)
+        free_slots = sorted(
+            set(range(self.max_batch_size)) - set(self._ring_request_slots.values())
+        )
+        for req_id in scheduler_output.num_scheduled_tokens:
+            if req_id not in self._ring_request_slots:
+                assert free_slots, "DFlash request ring capacity exceeded"
+                self._ring_request_slots[req_id] = free_slots.pop(0)
+
+    def _prepare_ring_block_table(
+        self,
+        cad: CommonAttentionMetadata,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+    ) -> CommonAttentionMetadata:
+        if self._ring_block_table is None:
+            return cad
+        assert self._target_runner is not None
+        batch_size = cad.batch_size()
+        req_ids = self._target_runner.input_batch.req_ids[:batch_size]
+        assert len(req_ids) == batch_size
+        slots = async_tensor_h2d(
+            [self._ring_request_slots[req_id] for req_id in req_ids],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        seq_lens = cad.seq_lens
+        if num_rejected_tokens_gpu is not None:
+            seq_lens = seq_lens - num_rejected_tokens_gpu
+        table = self._ring_block_table[:batch_size]
+        synthesize_draft_ring_block_tables(
+            table,
+            slots,
+            seq_lens,
+            self.block_size,
+            self._ring_base,
+            self._ring_size,
+            1 + self.num_speculative_tokens,
+        )
+        return replace(cad, block_table_tensor=table)
+
+    @override
     def _create_draft_vllm_config(self) -> VllmConfig:
         base = super()._create_draft_vllm_config()
         # The draft model is text-only — clear the target's multimodal
@@ -121,6 +215,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
     ) -> tuple[int, torch.Tensor, CommonAttentionMetadata]:
         # DFlash cross-attention: context K/V from target hidden states,
         # Q from query embeddings (bonus + mask tokens).
+        cad = self._prepare_ring_block_table(cad, num_rejected_tokens_gpu)
         batch_size = cad.batch_size()
         num_context = target_token_ids.shape[0]
         num_query_per_req = 1 + self.num_speculative_tokens
@@ -219,8 +314,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         is_graph_capturing: bool = False,
         slot_mappings: dict[str, torch.Tensor] | None = None,
     ) -> None:
-        """
-        Key differences to default dummy_run:
+        """Key differences to default dummy_run:
         - Only one forward pass due to parallel drafting
         - DFlash uses context states as unpadded metadata, so hidden_states will
         use the unpadded num_tokens instead of num_input_tokens

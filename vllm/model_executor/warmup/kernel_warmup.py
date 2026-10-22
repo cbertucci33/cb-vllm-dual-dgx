@@ -1,33 +1,34 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Warmup kernels used during model execution.
+"""Warmup kernels used during model execution.
 This is useful specifically for JIT'ed kernels as we don't want JIT'ing to
 happen during model execution.
 """
 
+import ast
+import json
 import sys
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.model_executor.warmup.attention_warmup import (
+    mixed_batch_attention_warmup,
+)
 from vllm.model_executor.warmup.b12x_warmup import b12x_warmup
 from vllm.model_executor.warmup.cutedsl_warmup import cutedsl_warmup
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
 from vllm.model_executor.warmup.flashinfer_autotune_cache import (
     resolve_flashinfer_autotune_file,
-    write_flashinfer_autotune_cache,
 )
 from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
     autotune_hisparse_flashinfer_attention,
     deepseek_v4_sparse_mla_attention_warmup,
     flashinfer_sparse_mla_decode_autotune_warmup,
-)
-from vllm.model_executor.warmup.glm5next_triton_warmup import (
-    glm5next_triton_warmup,
 )
 from vllm.model_executor.warmup.kimi_k3_triton_warmup import (
     kimi_k3_triton_warmup,
@@ -140,71 +141,23 @@ def _warmup_bf16x3_router_gemm(
     logger.info_once("Warmed up BF16x3 router GEMM configs: %s.", configs)
 
 
-def _warmup_kimi_k3_gemm_rs_ar() -> None:
-    # Kimi-K3 model construction imports this module only when GEMM-RS/AR is
-    # enabled and initializes its singleton before kernel_warmup runs. Avoid
-    # importing it here so other models do not compile the RS/AR variants.
-    module = sys.modules.get("vllm.models.kimi_k3.nvidia.ops.cute_dsl.gemm_rs_ar")
+def _warmup_gemm_rs_ar() -> None:
+    # Model construction (Kimi-K3, DeepSeek-V4.1) imports this module only
+    # when GEMM-RS/AR is enabled and initializes its singleton before
+    # kernel_warmup runs. Avoid importing it here so other models do not
+    # compile the RS/AR variants.
+    module = sys.modules.get("vllm.model_executor.kernels.linear.cute_dsl.gemm_rs_ar")
     if module is None:
         return
     compiled = module.warmup_gemm_rs_ar()
     if compiled:
-        logger.info_once("Warmed up %d Kimi-K3 GEMM-RS/AR variants.", compiled)
+        logger.info_once("Warmed up %d GEMM-RS/AR variants.", compiled)
 
 
 def _autotune_kimi_k3_kda_qkvg(model: torch.nn.Module) -> None:
     module = sys.modules.get("vllm.models.kimi_k3.nvidia.low_latency_gemm")
     if module is not None:
         module.autotune_kda_qkvg(model)
-
-
-def _warmup_dflash_rejection_sampling(worker: "Worker") -> None:
-    """Warm the target-side DFlash rejection kernels with live geometry."""
-    runner = worker.model_runner
-    spec_config = runner.vllm_config.speculative_config
-    if spec_config is None or not spec_config.use_dflash():
-        return
-
-    from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
-        rejection_sample,
-    )
-
-    num_speculative_steps = int(spec_config.num_speculative_tokens)
-    num_logits = num_speculative_steps + 1
-    device = runner.device
-    target_logits = torch.zeros(
-        (num_logits, runner.vocab_size),
-        dtype=runner.dtype,
-        device=device,
-    )
-    draft_sampled = torch.zeros(num_logits, dtype=torch.int32, device=device)
-    cu_num_logits = torch.tensor(
-        [0, num_logits], dtype=torch.int32, device=device
-    )
-    pos = torch.arange(num_logits, dtype=torch.int64, device=device)
-    idx_mapping = torch.zeros(1, dtype=torch.int64, device=device)
-    expanded_idx_mapping = torch.zeros(
-        num_logits, dtype=torch.int64, device=device
-    )
-    expanded_local_pos = torch.arange(
-        num_logits, dtype=torch.int32, device=device
-    )
-    temperature = torch.ones(1, dtype=torch.float32, device=device)
-    seed = torch.zeros(1, dtype=torch.int64, device=device)
-    rejection_sample(
-        target_logits,
-        None,
-        draft_sampled,
-        cu_num_logits,
-        pos,
-        idx_mapping,
-        expanded_idx_mapping,
-        expanded_local_pos,
-        temperature,
-        seed,
-        num_speculative_steps,
-    )
-    logger.info("Warmed target-side DFlash rejection sampling kernels.")
 
 
 def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
@@ -227,12 +180,6 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
             registry = (
                 worker.model_runner.jit_warmup_registry  # type: ignore[attr-defined]
             )
-            from vllm.v1.sample.ops.topk_topp_sampler import (
-                register_top_k_top_p_warmups,
-            )
-
-            with registry.activate():
-                register_top_k_top_p_warmups()
             registry.warmup()
         except Exception:
             logger.exception(
@@ -254,8 +201,6 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
 
     # Run next so input-prep kernels JIT against pristine runner state.
     if enable_jit_warmup:
-        glm5next_triton_warmup(worker.model_runner)
-        _warmup_dflash_rejection_sampling(worker)
         kimi_k3_triton_warmup(worker)
         watermark_sample_warmup(worker)
         qwen4_exp_qsa_triton_warmup(worker)
@@ -269,7 +214,7 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     if current_platform.has_device_capability(90):
         _warmup_ll_bf16_router_gemm(worker.get_model())
 
-    _warmup_kimi_k3_gemm_rs_ar()
+    _warmup_gemm_rs_ar()
 
     if worker.vllm_config.kernel_config.enable_cutedsl_warmup:
         # TODO(roberto): Remove after registered CuTeDSL warmups are migrated
@@ -279,6 +224,13 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
 
     if process_local_only:
         return
+
+    if current_platform.is_rocm():
+        from vllm.model_executor.warmup.rocm_segmented_attn_autotune_warmup import (
+            rocm_segmented_attn_autotune_warmup,
+        )
+
+        rocm_segmented_attn_autotune_warmup(worker)
 
     flashinfer_sparse_mla_decode_autotune_warmup(worker)
     deepseek_v4_sparse_mla_attention_warmup(worker)
@@ -338,15 +290,7 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         )
     ):
         logger.info_once("Warming up FlashInfer attention.")
-        # Warmup with mixed batch containing both prefill and decode tokens
-        # This is to warm up both prefill and decode attention kernels
-        worker.model_runner._dummy_run(
-            num_tokens=16,
-            skip_eplb=True,
-            is_profile=True,
-            force_attention=True,
-            create_mixed_batch=True,
-        )
+        mixed_batch_attention_warmup(worker)
 
 
 def _flashinfer_autotune_skip_ops(runner: "GPUModelRunner") -> set[str] | None:
@@ -368,9 +312,6 @@ def _flashinfer_autotune_skip_ops(runner: "GPUModelRunner") -> set[str] | None:
     return None
 
 
-_FLASHINFER_BF16_AUTOTUNE_MAX_TOKENS = 32
-
-
 def _flashinfer_deferred_moe_token_counts(
     runner: "GPUModelRunner",
 ) -> tuple[int, ...]:
@@ -389,6 +330,9 @@ def _flashinfer_deferred_moe_token_counts(
             token_counts.append(min(max_tokens, max_deferred_tokens))
 
     return tuple(dict.fromkeys(token_counts))
+
+
+_FLASHINFER_BF16_AUTOTUNE_MAX_TOKENS = 32
 
 
 def _flashinfer_autotune_token_counts(
@@ -415,13 +359,32 @@ def _run_flashinfer_autotune_dummy_runs(
 
     dummy_run_kwargs = {"skip_attn": True} if skip_attn else {}
     for num_tokens in _flashinfer_autotune_token_counts(runner, include_bf16=False):
-        tuning_buckets = fi_utils.flashinfer_get_hybrid_num_tokens_buckets(num_tokens)
+        # The drafter may use more tokens than this pass in the same dummy run.
+        # Include its max M when building the autotune buckets.
+        max_tuning_tokens = num_tokens
+        speculator = getattr(runner, "speculator", None)
+        if speculator is not None:
+            num_query_per_req = speculator.num_query_per_req
+            num_draft_reqs = min(
+                num_tokens,
+                runner.max_num_reqs,
+                runner.max_num_tokens // num_query_per_req,
+            )
+            max_tuning_tokens = max(
+                max_tuning_tokens, num_draft_reqs * num_query_per_req
+            )
+
+        tuning_buckets = fi_utils.flashinfer_get_hybrid_num_tokens_buckets(
+            max_tuning_tokens
+        )
         logger.info(
             "Running FlashInfer autotune with %d tokens and token buckets %s.",
             num_tokens,
             tuning_buckets,
         )
-        with fi_utils.autotune(tuning_buckets=tuning_buckets):
+        # Round M up to match serving-time bucket selection for non-bucket M.
+        # See https://github.com/flashinfer-ai/flashinfer/issues/5450
+        with fi_utils.autotune(tuning_buckets=tuning_buckets, round_up=True):
             runner._dummy_run(
                 num_tokens=num_tokens,
                 skip_eplb=True,
@@ -461,9 +424,183 @@ def _run_flashinfer_bf16_autotune_dummy_run(
         )
 
 
-def flashinfer_autotune(runner: "GPUModelRunner") -> None:
-    """
-    Autotune FlashInfer operations.
+_FLASHINFER_CACHE_RESERVED_KEYS = frozenset({"_metadata", "_records", "_generation"})
+_FLASHINFER_UNIFIED_MOE_RUNNERS = frozenset(
+    {
+        "CakeWarpDecodeRunner",
+        "CutlassBf16Runner",
+        "CutlassW4A16Runner",
+        "CutlassNvfp4Runner",
+        "CutlassFp8PerTensorRunner",
+        "CutlassFp8BlockRunner",
+        "CutlassMxfp8Mxfp4Runner",
+        "CutlassMxfp8Runner",
+        "CutlassW4A8Runner",
+        "CutlassHummingRunner",
+        "CuTileBf16Runner",
+        "CuTileNvfp4Runner",
+        "CuTileNvfp4Bf16Runner",
+        "CuTileMxfp4Runner",
+        "CuTileMxfp4Bf16Runner",
+        "CuteDslRunner",
+        "TrtllmFp4RoutedRunner",
+        "TrtllmFp8BlockRunner",
+        "TrtllmFp8PerTensorRunner",
+        "TrtllmBf16RoutedRunner",
+        "TrtllmMxInt4RoutedRunner",
+        "B12xNvfp4Runner",
+        "B12xW4A16Runner",
+    }
+)
+
+# num_experts, num_local_experts, local_expert_offset, tp_size, tp_rank,
+# ep_size, ep_rank. These are the rank-local fields emitted by the exact
+# FlashInfer revision pinned in build/versions.env.
+_FlashInferMoEContext = tuple[int, int, int, int, int, int, int]
+
+
+def _flashinfer_moe_cache_contexts(
+    runner: "GPUModelRunner",
+) -> frozenset[_FlashInferMoEContext]:
+    """Collect the live rank's MoE key fields used by FlashInfer."""
+    from vllm.model_executor.layers.fused_moe import MoERunner
+
+    models = [runner.get_model()]
+    draft_model = getattr(getattr(runner, "speculator", None), "model", None)
+    if draft_model is not None:
+        models.append(draft_model)
+
+    contexts: set[_FlashInferMoEContext] = set()
+    for model in models:
+        for module in model.modules():
+            if not isinstance(module, MoERunner):
+                continue
+            config = module.moe_config
+            contexts.add(
+                (
+                    int(config.num_experts),
+                    int(config.num_local_experts),
+                    int(config.ep_rank * config.num_local_experts),
+                    int(config.tp_size),
+                    int(config.tp_rank),
+                    int(config.ep_size),
+                    int(config.ep_rank),
+                )
+            )
+    return frozenset(contexts)
+
+
+def _ast_int(node: ast.expr) -> int | None:
+    value = node.value if isinstance(node, ast.Constant) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _normalize_flashinfer_cache_key(
+    file_key: str,
+    moe_contexts: frozenset[_FlashInferMoEContext],
+) -> str | None:
+    """Canonicalize only validated rank-local fields in a FlashInfer key."""
+    try:
+        body = ast.parse(file_key, mode="eval").body
+    except (SyntaxError, ValueError, TypeError):
+        return None
+    if not isinstance(body, ast.Tuple) or len(body.elts) != 4:
+        return None
+    runner_node = body.elts[1]
+    extras = body.elts[3]
+    if not isinstance(runner_node, ast.Constant) or not isinstance(
+        runner_node.value, str
+    ):
+        return None
+    if not isinstance(extras, ast.Tuple):
+        return None
+
+    runner_name = runner_node.value
+    values = extras.elts
+    rank_fields: tuple[int, ...] = ()
+    context_matches = False
+
+    if runner_name == "MoERunner" and len(values) == 20:
+        tp_size, tp_rank = _ast_int(values[4]), _ast_int(values[5])
+        ep_size, ep_rank = _ast_int(values[6]), _ast_int(values[7])
+        context_matches = any(
+            (tp_size, tp_rank, ep_size, ep_rank) == context[3:]
+            for context in moe_contexts
+        )
+        rank_fields = (5, 7)
+    elif runner_name in _FLASHINFER_UNIFIED_MOE_RUNNERS and len(values) == 18:
+        num_experts = _ast_int(values[5])
+        num_local_experts = _ast_int(values[6])
+        local_expert_offset = _ast_int(values[7])
+        context_matches = any(
+            (num_experts, num_local_experts, local_expert_offset) == context[:3]
+            for context in moe_contexts
+        )
+        rank_fields = (7,)
+    elif runner_name == "CuteDslFusedMoERunner" and len(values) == 12:
+        num_experts = _ast_int(values[7])
+        local_expert_offset = _ast_int(values[8])
+        context_matches = any(
+            (num_experts, local_expert_offset) == (context[0], context[2])
+            for context in moe_contexts
+        )
+        rank_fields = (8,)
+    elif runner_name == "CuteDslFusedMoEW4A16Runner" and len(values) == 13:
+        num_experts = _ast_int(values[0])
+        num_local_experts = _ast_int(values[2])
+        local_expert_offset = _ast_int(values[3])
+        context_matches = any(
+            (num_experts, num_local_experts, local_expert_offset) == context[:3]
+            for context in moe_contexts
+        )
+        rank_fields = (3,)
+
+    if rank_fields:
+        if not context_matches:
+            return None
+        for index in rank_fields:
+            values[index] = ast.Constant(value="__rank_local__")
+
+    return ast.dump(body, annotate_fields=False, include_attributes=False)
+
+
+def _autotune_cache_fingerprint(
+    path: Path,
+    moe_contexts: frozenset[_FlashInferMoEContext] = frozenset(),
+) -> tuple[str, frozenset[str]] | None:
+    """Identify exact cross-rank tactic coverage in a FlashInfer cache."""
+    try:
+        configs = json.loads(path.read_text())
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(configs, dict):
+        return None
+    metadata = configs.get("_metadata")
+    coverage: set[str] = set()
+    for file_key in configs.keys() - _FLASHINFER_CACHE_RESERVED_KEYS:
+        normalized = _normalize_flashinfer_cache_key(file_key, moe_contexts)
+        if normalized is None:
+            return None
+        coverage.add(normalized)
+    return json.dumps(metadata, sort_keys=True), frozenset(coverage)
+
+
+def _all_ranks_have_matching_cache(
+    path: Path,
+    group,
+    moe_contexts: frozenset[_FlashInferMoEContext] = frozenset(),
+) -> bool:
+    """True iff every rank in ``group`` has its own, mutually consistent file."""
+    fingerprint = _autotune_cache_fingerprint(path, moe_contexts)
+    if group.world_size == 1:
+        return fingerprint is not None
+    gathered: list[tuple[str, frozenset[str]] | None] = [None] * group.world_size
+    torch.distributed.all_gather_object(gathered, fingerprint, group=group.cpu_group)
+    return fingerprint is not None and all(f == fingerprint for f in gathered)
+
+
+def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) -> None:
+    """Autotune FlashInfer operations.
     FlashInfer have many implementations for the same operation,
     autotuning runs benchmarks for each implementation and stores
     the results. The results are cached transparently and
@@ -471,17 +608,30 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     Without autotuning, FlashInfer will rely on heuristics, which may
     be significantly slower.
 
-    Every rank profiles the same tactics. When distributed, per-tactic
-    timings are averaged over the world CPU group so all ranks select the
-    same tactic.
+    With PP > 1, stages run different layers and may profile different ops,
+    so each stage's TP group tunes separately with its own cache file;
+    otherwise the world group tunes together. Per-tactic timings are
+    averaged over the tuning group so all its ranks select the same tactic.
+
+    Results are persisted per rank: FlashInfer keys MoE entries by tp/ep rank
+    (``MoERunner.get_cache_key_extras``), so one rank's file only hits on that
+    rank. A rank with a cache hit skips the per-tactic reduce the others block
+    in, so ranks keep loaded configs only if every rank in the tuning group
+    has a matching file and successfully loads it.
     """
     from flashinfer.autotuner import AutoTuner, set_autotune_process_group
 
     import vllm.utils.flashinfer as fi_utils
-    from vllm.distributed.parallel_state import get_world_group
+    from vllm.distributed.parallel_state import (
+        get_pp_group,
+        get_tp_group,
+        get_world_group,
+    )
 
     world = get_world_group()
-    is_leader = world.rank_in_group == 0
+    pp_size = get_pp_group().world_size
+    tune_group = get_tp_group() if pp_size > 1 else world
+    is_leader = tune_group.rank_in_group == 0
     tuner = AutoTuner.get()
 
     autotune_kwargs: dict = {}
@@ -494,6 +644,11 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
         autotune_kwargs["skip_ops"] = skip_ops
 
     cache_path = resolve_flashinfer_autotune_file(runner)
+    # The world group only spans DP ranks when vLLM folds DP into it.
+    dp_rank = runner.vllm_config.parallel_config.data_parallel_rank
+    cache_path = cache_path.with_name(
+        f"{cache_path.stem}_dp{dp_rank}_rank{world.rank_in_group}{cache_path.suffix}"
+    )
     if is_leader:
         logger.info_once("Using FlashInfer autotune cache file: %s", cache_path)
 
@@ -502,18 +657,19 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     # which lead to some EP ranks receiving no tokens and skipping their
     # MoE kernel entirely, and cause hang due to all-reduce collective
     # during synchronized autotuning.
-    # Read cached autotune results and broadcast to all ranks.
-    cached_results: bytes | None = None
-    if is_leader and cache_path.exists():
-        with open(cache_path, "rb") as f:
-            cached_results = f.read()
-    cached_results = world.broadcast_object(cached_results, src=0)
-    if cached_results is not None:
-        write_flashinfer_autotune_cache(cache_path, cached_results)
-        world.barrier()
-        tuner.load_configs(str(cache_path))
+    moe_contexts = _flashinfer_moe_cache_contexts(runner)
+    if _all_ranks_have_matching_cache(cache_path, tune_group, moe_contexts):
+        loaded = tuner.load_configs(str(cache_path))
+        if tune_group.world_size > 1:
+            loaded_by_rank: list[bool | None] = [None] * tune_group.world_size
+            torch.distributed.all_gather_object(
+                loaded_by_rank, loaded, group=tune_group.cpu_group
+            )
+            loaded = all(loaded_by_rank)
+        if not loaded:
+            tuner.clear_cache()
 
-    group = world.cpu_group if world.world_size > 1 else None
+    group = tune_group.cpu_group if tune_group.world_size > 1 else None
     set_autotune_process_group(group)
     try:
         with (
@@ -527,17 +683,21 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
                 # HiSparse hot-buffer attention is bounded by decode batch
                 # size, not the prefill-sized batch used for the full model.
                 autotune_hisparse_flashinfer_attention(runner)
-            _run_flashinfer_autotune_dummy_runs(runner, skip_attn=hisparse_enabled)
+            _run_flashinfer_autotune_dummy_runs(
+                runner, skip_attn=skip_attn or hisparse_enabled
+            )
             replayssm_autotune_warmup(runner)
             _autotune_kimi_k3_kda_qkvg(runner.get_model())
         with torch.inference_mode():
             _run_flashinfer_bf16_autotune_dummy_run(
-                runner, skip_ops=skip_ops, skip_attn=hisparse_enabled
+                runner, skip_ops=skip_ops, skip_attn=skip_attn or hisparse_enabled
             )
     finally:
         set_autotune_process_group(None)
 
     if world.world_size > 1:
         world.barrier()
-    if is_leader:
+    # Skip the rewrite when nothing was tuned this start (every entry came from
+    # the file). FlashInfer gates its own autotune(cache=...) save the same way.
+    if tuner._dirty:
         tuner.save_configs(str(cache_path))

@@ -1015,3 +1015,331 @@ class TestRebuildFromAnchorsCascadingDeferral:
         assert bare_scanner._deferred_post_text == "more"
         assert len(bare_scanner._deferred_terminals) == 1
         assert bare_scanner._deferred_terminals[0].terminal == "THINK_END"
+
+
+@pytest.mark.parametrize("profile", ["glm", "mimo"])
+@pytest.mark.parametrize("glyph", ["漢", "𐐀"])
+@pytest.mark.parametrize("schedule", ["full", "whole", "two_chunks"])
+def test_actual_tokenizer_literal_after_real_reasoning_end(profile, glyph, schedule):
+    from tests.parser.engine.replay_harness import load_local_model_parser
+    from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+
+    tokenizer, cls = load_local_model_parser(profile)
+    reasoning = "reason" + glyph
+    content = 'Print literal "</think>" exactly.'
+    prefix = tokenizer.encode(
+        "<think>" + reasoning + "</think>", add_special_tokens=False
+    )
+    # Literal markup is ordinary token IDs, not a reasoning control token.
+    ordinary = [
+        tid
+        for char in content
+        for tid in tokenizer.encode(char, add_special_tokens=False)
+    ]
+    assert tokenizer.get_vocab()["</think>"] not in ordinary
+    ids = prefix + ordinary
+    text = tokenizer.decode(ids)
+    request = ResponsesRequest(model="test", input="hi", include_reasoning=True)
+    if schedule == "full":
+        assert cls(tokenizer).parse(text, request, True, ids)[:2] == (
+            reasoning,
+            content,
+        )
+        return
+    schedules = (
+        [[len(ids)]]
+        if schedule == "whole"
+        else [[split, len(ids)] for split in range(1, len(ids))]
+    )
+    for ends in schedules:
+        parser = cls(tokenizer)
+        deltas = []
+        start, previous = 0, ""
+        for end in ends:
+            decoded = tokenizer.decode(ids[:end]).rstrip("\ufffd")
+            assert decoded.startswith(previous)
+            deltas.extend(
+                parser.parse_deltas(
+                    decoded[len(previous) :],
+                    ids[start:end],
+                    request,
+                    finished=end == len(ids),
+                )
+            )
+            start, previous = end, decoded
+        assert "".join(d.reasoning or "" for d in deltas) == reasoning, ends
+        assert "".join(d.content or "" for d in deltas) == content, ends
+
+
+@pytest.mark.parametrize("profile", ["glm", "mimo"])
+@pytest.mark.parametrize("detokenizer_kind", ["fast", "slow"])
+@pytest.mark.parametrize("holdback", [False, True])
+@pytest.mark.parametrize("literal_reasoning", [False, True])
+def test_real_detokenizer_anchor_alignment(
+    profile, detokenizer_kind, holdback, literal_reasoning
+):
+    from types import SimpleNamespace
+
+    from tests.parser.engine.replay_harness import load_local_model_parser
+    from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.engine.detokenizer import (
+        FastIncrementalDetokenizer,
+        SlowIncrementalDetokenizer,
+    )
+
+    tokenizer, parser_cls = load_local_model_parser(profile)
+    reasoning = (
+        "reason𐐀 literal </think> before the end." if literal_reasoning else "reason𐐀"
+    )
+    content = 'Print literal "</think>" exactly.𐐀 END.'
+
+    def ordinary(text):
+        return [
+            tid
+            for char in text
+            for tid in tokenizer.encode(char, add_special_tokens=False)
+        ]
+
+    ids = (
+        tokenizer.encode("<think>", add_special_tokens=False)
+        + ordinary(reasoning)
+        + tokenizer.encode("</think>", add_special_tokens=False)
+        + ordinary(content)
+    )
+    detokenizer_cls = (
+        FastIncrementalDetokenizer
+        if detokenizer_kind == "fast"
+        else SlowIncrementalDetokenizer
+    )
+    schedules = [[len(ids)], list(range(1, len(ids) + 1))]
+    schedules.extend([split, len(ids)] for split in range(1, len(ids)))
+    for ends in schedules:
+        sampling = SamplingParams(
+            skip_special_tokens=False,
+            stop=["unused_stop_marker"] if holdback else None,
+        )
+        core_request = SimpleNamespace(
+            sampling_params=sampling,
+            prompt_token_ids=[],
+            prompt_embeds=None,
+            request_id="scanner-boundary",
+        )
+        detokenizer = detokenizer_cls(tokenizer, core_request)
+        parser = parser_cls(tokenizer)
+        request = ResponsesRequest(model="test", input="hi", include_reasoning=True)
+        deltas = []
+        start = 0
+        for end in ends:
+            detokenizer.update(ids[start:end], stop_terminated=False)
+            finished = end == len(ids)
+            text = detokenizer.get_next_output_text(finished, delta=True)
+            deltas.extend(
+                parser.parse_deltas(text, ids[start:end], request, finished=finished)
+            )
+            expected_count = min(max(end - 1, 0), len(ordinary(reasoning)))
+            assert parser.count_reasoning_tokens(ids[:end]) == expected_count, ends
+            start = end
+        assert "".join(d.reasoning or "" for d in deltas) == reasoning, ends
+        assert "".join(d.content or "" for d in deltas) == content, ends
+
+
+@pytest.mark.parametrize("profile", ["glm", "mimo"])
+@pytest.mark.parametrize("detokenizer_kind", ["fast", "slow"])
+@pytest.mark.parametrize("holdback", [False, True])
+@pytest.mark.parametrize("prompt_kind", ["empty", "thinking", "partial_utf8"])
+@pytest.mark.parametrize("spaces_between_special_tokens", [False, True])
+def test_native_positions_three_chunk_unicode(
+    profile, detokenizer_kind, holdback, prompt_kind, spaces_between_special_tokens
+):
+    from types import SimpleNamespace
+
+    from tests.parser.engine.replay_harness import load_local_model_parser
+    from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.engine.detokenizer import (
+        FastIncrementalDetokenizer,
+        SlowIncrementalDetokenizer,
+    )
+
+    tok, cls = load_local_model_parser(profile)
+    enc = lambda text: tok.encode(text, add_special_tokens=False)
+    ordinary = lambda text: [tid for char in text for tid in enc(char)]
+    glyph = enc("𐐀")
+    prefix = enc("<think>")
+    prompt = []
+    first_glyph = glyph
+    if prompt_kind != "empty":
+        prompt = enc("user input\n") + prefix
+        prefix = []
+        if prompt_kind == "partial_utf8":
+            prompt += glyph[:1]
+            first_glyph = glyph[1:]
+    middle = enc("</think>") + ordinary("x</think>")
+    ids = prefix + first_glyph + middle + glyph + enc(" end")
+    second_start = len(prefix) + len(first_glyph) + len(middle)
+    schedules = [
+        [len(prefix) + a, second_start + b, len(ids)]
+        for a in range(1, len(first_glyph))
+        for b in range(1, len(glyph))
+    ]
+    detok_cls = (
+        FastIncrementalDetokenizer
+        if detokenizer_kind == "fast"
+        else SlowIncrementalDetokenizer
+    )
+    for ends in schedules:
+        sampling = SamplingParams(
+            skip_special_tokens=False,
+            spaces_between_special_tokens=spaces_between_special_tokens,
+            stop=["unused_stop_marker"] if holdback else None,
+        )
+        detok = detok_cls(
+            tok,
+            SimpleNamespace(
+                sampling_params=sampling,
+                prompt_token_ids=prompt,
+                prompt_embeds=None,
+                request_id="three-chunk-regression",
+            ),
+        )
+        parser = cls(tok)
+        engine = parser._reasoning_parser._parser_engine
+        assert engine._engine._scanner.tracks_token_positions
+        request = ResponsesRequest(model="test", input="hi", include_reasoning=True)
+        deltas = []
+        start = 0
+        for end in ends:
+            detok.update(ids[start:end], stop_terminated=False)
+            finished = end == len(ids)
+            text = detok.get_next_output_text(finished, delta=True)
+            deltas.extend(
+                parser.parse_deltas(
+                    text, ids[start:end], request, prompt, finished=finished
+                )
+            )
+            start = end
+        assert "".join(d.reasoning or "" for d in deltas) == "𐐀", ends
+        assert "".join(d.content or "" for d in deltas) == "x</think>𐐀 end", ends
+        assert parser.count_reasoning_tokens(ids) == len(first_glyph)
+        positions = parser._reasoning_parser._parser_engine._engine._scanner._positions
+        assert not positions.pending_text and not positions.terminals
+        parser._reasoning_parser._parser_engine._reset()
+        assert positions.stream is None and positions.emitted_chars == 0
+
+
+@pytest.mark.parametrize("profile", ["glm", "mimo"])
+@pytest.mark.parametrize("detokenizer_kind", ["fast", "slow"])
+@pytest.mark.parametrize("stop_kind", ["ordinary", "control", "partial_control", "eos"])
+@pytest.mark.parametrize("include_stop", [False, True])
+def test_native_positions_stop_truncation(
+    profile, detokenizer_kind, stop_kind, include_stop
+):
+    from types import SimpleNamespace
+
+    from tests.parser.engine.replay_harness import load_local_model_parser
+    from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.engine.detokenizer import (
+        FastIncrementalDetokenizer,
+        SlowIncrementalDetokenizer,
+    )
+
+    tok, cls = load_local_model_parser(profile)
+    enc = lambda text: tok.encode(text, add_special_tokens=False)
+    ordinary = lambda text: [tid for char in text for tid in enc(char)]
+    ids = enc("<think>𐐀</think>") + ordinary("safe </think> STOP hidden")
+    stop = {
+        "ordinary": ["STOP"],
+        "control": ["</think>"],
+        "partial_control": ["</think>"[:5]],
+        "eos": None,
+    }[stop_kind]
+    if stop_kind == "eos":
+        ids = enc("<think>𐐀</think>") + ordinary("safe </think>")
+        ids += [tok.eos_token_id]
+    else:
+        ids += enc("<think>not delivered</think>") + ordinary("nor this")
+    sampling = SamplingParams(
+        skip_special_tokens=False,
+        stop=stop,
+        include_stop_str_in_output=include_stop,
+    )
+    detok_cls = (
+        FastIncrementalDetokenizer
+        if detokenizer_kind == "fast"
+        else SlowIncrementalDetokenizer
+    )
+    detok = detok_cls(
+        tok,
+        SimpleNamespace(
+            sampling_params=sampling,
+            prompt_token_ids=[],
+            prompt_embeds=None,
+            request_id="stop-position-regression",
+        ),
+    )
+    detok.update(ids, stop_terminated=stop_kind == "eos")
+    text = detok.get_next_output_text(finished=True, delta=True)
+    parser = cls(tok)
+    request = ResponsesRequest(model="test", input="hi", include_reasoning=True)
+    deltas = parser.parse_deltas(text, ids, request, finished=True)
+    assert "".join(d.reasoning or "" for d in deltas) == "𐐀"
+    expected = (
+        "safe </think> " + ("STOP" if include_stop else "")
+        if stop_kind == "ordinary"
+        else "safe </think>"
+        if stop_kind == "eos"
+        else ""
+    )
+    assert "".join(d.content or "" for d in deltas) == expected
+    positions = parser._reasoning_parser._parser_engine._engine._scanner._positions
+    assert not positions.pending_text
+    assert not positions.terminals
+
+
+@pytest.mark.parametrize("split", [1, 2, 3])
+@pytest.mark.parametrize("fused_prefix", [False, True])
+@pytest.mark.parametrize("literal_replacement", [False, True])
+def test_native_partial_prefill_owns_only_prompt_text(
+    split, fused_prefix, literal_replacement
+):
+    from tokenizers import Tokenizer
+    from tokenizers.decoders import ByteLevel
+    from tokenizers.models import WordLevel
+
+    from vllm.tokenizers.streaming import create_decode_stream
+
+    visible = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
+    byte_map = {value: chr(value) for value in visible}
+    for value in range(256):
+        if value not in byte_map:
+            byte_map[value] = chr(256 + len(byte_map) - len(visible))
+
+    def raw(data):
+        return "".join(byte_map[value] for value in data)
+
+    prefix = "prompt \ufffd" if literal_replacement else "prompt "
+    pieces = [raw(prefix.encode()), *[raw(bytes([b])) for b in "𐐀".encode()]]
+    if fused_prefix:
+        pieces[1] = pieces[0] + pieces[1]
+    pieces += [raw(" suffix\ufffd end".encode())]
+    vocab = {piece: idx for idx, piece in enumerate(dict.fromkeys(pieces))}
+    piece_ids = [vocab[piece] for piece in pieces]
+    tokenizer = Tokenizer(WordLevel(vocab=vocab, unk_token="[unk]"))
+    tokenizer.decoder = ByteLevel()
+    prompt = ([piece_ids[0]] if not fused_prefix else []) + piece_ids[1 : split + 1]
+    output = piece_ids[split + 1 :]
+    assert tokenizer.decode(prompt + output) == prefix + "𐐀 suffix\ufffd end"
+    stream = create_decode_stream(tokenizer, prompt)
+    assert "".join(stream.step(tokenizer, tid) or "" for tid in output) == (
+        "𐐀 suffix\ufffd end"
+    )
+
+    # A genuine replacement character at the end of a prompt is owned by the
+    # prompt; an identical character in generated output must remain visible.
+    replacement = raw("\ufffd".encode())
+    tokenizer.add_tokens([replacement])
+    replacement_id = tokenizer.token_to_id(replacement)
+    stream = create_decode_stream(tokenizer, [piece_ids[0], replacement_id])
+    assert stream.step(tokenizer, piece_ids[-1]) == " suffix\ufffd end"

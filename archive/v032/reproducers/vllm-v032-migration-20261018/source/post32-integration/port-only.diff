@@ -1,0 +1,556 @@
+--- before/tests/v1/worker/test_gpu_block_table.py
++++ after/tests/v1/worker/test_gpu_block_table.py
+@@ -305,3 +305,104 @@
+         num_tokens_padded=3,
+     )
+     assert dummy[0].tolist() == [PAD_SLOT_ID] * 3
++
++
++@pytest.fixture
++def populated_block_tables():
++    tables = BlockTables([16, 32], 8, 64, [3, 5], torch.device("cuda"))
++    for req_index in range(8):
++        tables.append_block_ids(
++            req_index, ([req_index + 1] * 3, [req_index + 1] * 5), overwrite=True
++        )
++    tables.apply_staged_writes()
++    tables.gather_block_tables(torch.arange(8, device="cuda"), num_reqs_padded=8)
++    return tables
++
++
++@pytest.mark.parametrize("previous_dummy", [False, True])
++@pytest.mark.parametrize("next_dummy", [False, True])
++def test_shared_block_tables_clear_rows_from_larger_batch(
++    populated_block_tables, previous_dummy, next_dummy
++):
++    """A smaller target batch must leave no stale rows for larger draft graphs."""
++    tables = populated_block_tables
++    if previous_dummy:
++        for table in tables.get_dummy_block_tables(8):
++            table.fill_(99)  # Profiling supplies valid context/state slots.
++    ptrs = [table.data_ptr() for table in tables.input_block_tables]
++    idx = torch.tensor([7, 2, 0, 5, 1], device="cuda")
++    for num_reqs in (3, 5, 0):
++        if next_dummy:
++            out = tables.get_dummy_block_tables(num_reqs)
++            num_rows = num_reqs
++        else:
++            num_rows = num_reqs + 1
++            out = tables.gather_block_tables(idx[:num_reqs], num_rows)
++        for table, view, ptr in zip(tables.input_block_tables, out, ptrs):
++            assert view.shape == (num_rows, table.shape[1])
++            assert table.data_ptr() == ptr
++            if num_rows:
++                assert view.data_ptr() == ptr
++            assert torch.count_nonzero(table[num_reqs:]).item() == 0
++            if next_dummy:
++                assert torch.count_nonzero(view).item() == 0
++                view.fill_(99)
++            else:
++                expected = (idx[:num_reqs, None] + 1).expand(-1, table.shape[1])
++                torch.testing.assert_close(view[:num_reqs], expected.to(torch.int32))
++
++
++def test_external_block_table_output_preserves_shared_rows(populated_block_tables):
++    """PCP-local gathers must neither clear shared rows nor reset their tracking."""
++    tables = populated_block_tables
++    previous = [table.clone() for table in tables.input_block_tables]
++    out = tuple(torch.full_like(table[:3], -1) for table in previous)
++    out_ptrs = torch.tensor(
++        [table.data_ptr() for table in out], dtype=torch.uint64, device="cuda"
++    )
++    idx = torch.tensor([7, 2], device="cuda")
++    result = tables.gather_block_tables(idx, 3, out=out, out_ptrs=out_ptrs)
++    for table, before, view in zip(tables.input_block_tables, previous, result):
++        torch.testing.assert_close(table, before)
++        assert view[:, 0].tolist() == [8, 3, 0]
++    tables.gather_block_tables(idx[:1], num_reqs_padded=1)
++    for table in tables.input_block_tables:
++        assert torch.count_nonzero(table[1:]).item() == 0
++
++
++@pytest.mark.parametrize("use_cuda_graph", [False, True])
++def test_larger_draft_batch_uses_null_kpool_slots(
++    populated_block_tables, use_cuda_graph
++):
++    """Draft padding must not resolve to another request's physical KPool slots."""
++    from vllm.v1.attention.backends.mla.indexer import compute_kpool_tail_slot_mapping
++
++    tables = populated_block_tables
++    idx = torch.tensor([2, 0, 4, 1, 3], device="cuda")
++    query_start_loc = torch.arange(9, dtype=torch.int32, device="cuda").clamp_max_(5)
++    slot_mapping = torch.full((8,), -1, dtype=torch.int64, device="cuda")
++    positions = torch.arange(8, dtype=torch.int64, device="cuda")
++
++    def compute_slots():
++        return compute_kpool_tail_slot_mapping(
++            slot_mapping,
++            tables.input_block_tables[0],
++            query_start_loc,
++            positions,
++            num_actual_tokens=8,
++            num_reqs=8,
++            kpool=8,
++        )
++
++    if use_cuda_graph:
++        compute_slots()
++        torch.accelerator.synchronize()
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph):
++            slots = compute_slots()
++    tables.gather_block_tables(idx, num_reqs_padded=5)
++    if use_cuda_graph:
++        graph.replay()
++    else:
++        slots = compute_slots()
++    assert slots.tolist() == [24, 9, 42, 19, 36, -1, -1, -1]
+--- before/vllm/v1/worker/gpu/block_table.py
++++ after/vllm/v1/worker/gpu/block_table.py
+@@ -74,6 +74,7 @@
+         self.input_block_tables: list[torch.Tensor] = [
+             torch.zeros_like(b.gpu) for b in self.block_tables
+         ]
++        self._num_dirty_rows = 0
+ 
+         self.slot_mappings = torch.zeros(
+             self.num_kv_cache_groups,
+@@ -151,15 +152,18 @@
+     ) -> tuple[torch.Tensor, ...]:
+         if self.num_kv_cache_groups == 0:
+             return ()
++        num_reqs = idx_mapping.shape[0]
++        num_rows = num_reqs_padded
+         if out is None:
+             out = tuple(self.input_block_tables)
+             out_ptrs = self.input_block_table_ptrs
++            num_rows = max(num_rows, self._num_dirty_rows)
++            self._num_dirty_rows = num_reqs
+         else:
+             assert out_ptrs is not None
+             assert len(out) == self.num_kv_cache_groups
+-        num_reqs = idx_mapping.shape[0]
+-        # Launch kernel with num_reqs_padded to fuse zeroing of padded rows.
+-        _gather_block_tables_kernel[(self.num_kv_cache_groups, num_reqs_padded)](
++        # Also clear rows left by a larger batch in the shared buffer.
++        _gather_block_tables_kernel[(self.num_kv_cache_groups, num_rows)](
+             idx_mapping,
+             self.block_table_ptrs,
+             out_ptrs,
+@@ -180,9 +184,12 @@
+         # Zero the rows so dummy runs write mamba state to the reserved null
+         # block rather than through the previous real step's (stale) block
+         # ids, which may point at blocks since freed and reallocated.
+-        return tuple(
+-            block_table[:num_reqs].zero_() for block_table in self.input_block_tables
+-        )
++        num_rows = max(num_reqs, self._num_dirty_rows)
++        for block_table in self.input_block_tables:
++            block_table[:num_rows].zero_()
++        # Profiling may populate the returned rows with valid block IDs.
++        self._num_dirty_rows = num_reqs
++        return tuple(block_table[:num_reqs] for block_table in self.input_block_tables)
+ 
+     def compute_slot_mappings(
+         self,
+--- before/tests/v1/spec_decode/test_adaptive_verification.py
++++ after/tests/v1/spec_decode/test_adaptive_verification.py
+@@ -16,7 +16,6 @@
+     maybe_create_adaptive_verification_manager,
+     resolve_adaptive_cudagraph_mode,
+ )
+-from vllm.v1.worker.gpu.structured_outputs import _build_grammar_mapping
+ 
+ 
+ def make_manager(
+@@ -307,52 +306,3 @@
+     assert cu_num_logits_np.dtype == scheduled_cu_num_logits.dtype
+     # The prefill keeps its scheduled tokens; only drafts are dropped.
+     assert np.array_equal(compacted, np.array([1, 1, 40], dtype=np.int32))
+-
+-
+-def test_zero_budget_keeps_one_grammar_row_per_scheduled_draft():
+-    # The scheduler sizes the grammar bitmask from the *scheduled* drafts
+-    # (len(drafts) + 1 rows per request), but a zero budget rewrites
+-    # cu_num_logits_np to bonus-only. Deriving the bitmask -> logits mapping
+-    # from those rewritten offsets drops rows and trips the
+-    # `num_masks == len(mapping)` assert in apply_grammar_bitmask.
+-    manager = make_manager(
+-        np.array([[0.9, 0.9], [0.9, 0.9], [1.0, 1.0]], dtype=np.float32),
+-        np.ones(64),
+-    )
+-    manager.req_states.req_id_to_index["prefill"] = 2
+-    manager.req_states.num_computed_tokens_np = np.zeros(3, dtype=np.int32)
+-    manager.req_states.prefill_len.np = np.array([0, 0, 60], dtype=np.int32)
+-    manager._max_total_logits = 2  # < 3 requests * 1 bonus token
+-
+-    scheduled_spec_decode_tokens = {"low": [1, 2], "high": [3, 4]}
+-    manager.get_num_tokens(
+-        {"low": 3, "high": 3, "prefill": 40}, scheduled_spec_decode_tokens
+-    )
+-    assert manager._batch_budget is not None
+-    assert manager._batch_budget[2] == 0
+-
+-    req_ids = ["low", "high", "prefill"]
+-    num_draft_tokens_per_req = np.array([2, 2, 0], dtype=np.int32)
+-    _, cu_num_logits_np = manager.compact_batch(
+-        num_draft_tokens_per_req,
+-        np.array([3, 3, 40], dtype=np.int32),
+-        np.array([0, 3, 6, 7], dtype=np.int32),
+-    )
+-
+-    mask_stride = manager.num_speculative_steps + manager.num_bonus_tokens
+-    mapping = _build_grammar_mapping(
+-        req_ids,
+-        req_ids,
+-        cu_num_logits_np,
+-        num_draft_tokens_per_req,
+-        manager.num_bonus_tokens,
+-        mask_stride,
+-    )
+-
+-    num_bitmask_rows = sum(
+-        len(scheduled_spec_decode_tokens.get(req_id, ())) + 1 for req_id in req_ids
+-    )
+-    assert len(mapping) == num_bitmask_rows
+-    # (request, position) keys, so the kernel can mask rows the compacted
+-    # device layout no longer has room for.
+-    assert mapping == [0, 1, 2, 3, 4, 5, 6]
+--- before/tests/v1/spec_decode/test_mtp_structured_output.py
++++ after/tests/v1/spec_decode/test_mtp_structured_output.py
+@@ -153,7 +153,7 @@
+     )
+ 
+     assert bitmask is not None
+-    assert bitmask.shape[0] == len(drafts) + 1
++    assert bitmask.shape[0] == NUM_SPEC_TOKENS + 1
+     assert (bitmask[0] == -1).all()
+     assert (bitmask[1] == -1).all()
+     assert not (bitmask[2] == -1).all()
+--- before/tests/v1/structured_output/test_structured_output_manager.py
++++ after/tests/v1/structured_output/test_structured_output_manager.py
+@@ -196,8 +196,8 @@
+         scheduled_spec_decode_tokens={request.request_id: padded},
+     )
+     assert bitmask is not None
+-    assert bitmask.shape[0] == len(raw_drafts) + 1
+-    assert _row_pattern(bitmask) == expected_row_pattern
++    assert bitmask.shape[0] == NUM_SPEC_TOKENS + 1
++    assert _row_pattern(bitmask[: len(raw_drafts) + 1]) == expected_row_pattern
+ 
+     # grammar_bitmask() must rollback any speculative state it advanced.
+     assert manager.validate_tokens(request, list(raw_drafts)) == expected_validated
+@@ -224,7 +224,7 @@
+         scheduled_spec_decode_tokens={},
+     )
+     assert post_accept_bitmask is not None
+-    assert post_accept_bitmask.shape[0] == 1
++    assert post_accept_bitmask.shape[0] == NUM_SPEC_TOKENS + 1
+     assert (post_accept_bitmask[0] == expected_post_accept_row).all()
+     assert structured_req.reasoning_ended == expected_reasoning
+     assert grammar.is_terminated() is expect_terminated
+@@ -534,7 +534,7 @@
+         scheduled_spec_decode_tokens={request.request_id: drafts},
+     )
+     assert bitmask is not None
+-    assert _row_pattern(bitmask) == "CCCC"
++    assert _row_pattern(bitmask[: len(drafts) + 1]) == "CCCC"
+     assert (bitmask[2] == bitmask[1]).all()
+     assert (bitmask[3] == bitmask[1]).all()
+ 
+--- before/tests/v1/worker/test_gpu_batch_shard.py
++++ after/tests/v1/worker/test_gpu_batch_shard.py
+@@ -292,25 +292,22 @@
+     max_num_reqs = 32
+     num_reqs = 12
+     slots = rng.choice(np.arange(max_num_reqs), size=num_reqs, replace=False)
+-    k = rng.integers(0, 4, size=num_reqs)
+-    cu = np.zeros(num_reqs + 1, dtype=np.int32)
+-    np.cumsum(1 + k, out=cu[1:])
++    mask_stride = 4
+     owner = slots % tp_size
+ 
+     # Grammar requests: every other request, in a scrambled order.
+     req_ids = [f"req-{i}" for i in range(num_reqs)]
+     grammar_idx = list(rng.permutation(np.arange(0, num_reqs, 2)))
+     grammar_req_ids = [req_ids[i] for i in grammar_idx]
+-    num_grammar_rows = sum(int(cu[i + 1] - cu[i]) for i in grammar_idx)
++    num_grammar_rows = len(grammar_idx) * mask_stride
+     bitmask = rng.integers(0, 2**31, size=(num_grammar_rows, 4), dtype=np.int32)
+-    input_batch = SimpleNamespace(req_ids=req_ids, cu_num_logits_np=cu)
+ 
+     # Global row offset of each grammar request within the bitmask.
+     row_offsets = {}
+     cursor = 0
+     for i in grammar_idx:
+         row_offsets[i] = cursor
+-        cursor += int(cu[i + 1] - cu[i])
++        cursor += mask_stride
+ 
+     grammar_output = GrammarOutput(
+         structured_output_request_ids=grammar_req_ids,
+@@ -320,7 +317,7 @@
+     kept_total = 0
+     for rank in range(tp_size):
+         local_req_ids = [req_ids[i] for i in range(num_reqs) if owner[i] == rank]
+-        local = _shard_grammar_output(grammar_output, input_batch, local_req_ids)
++        local = _shard_grammar_output(grammar_output, local_req_ids)
+         expected_idx = [i for i in grammar_idx if owner[i] == rank]
+         if not expected_idx:
+             assert local is None
+@@ -329,7 +326,7 @@
+         assert local.structured_output_request_ids == [req_ids[i] for i in expected_idx]
+         expected_rows = np.concatenate(
+             [
+-                np.arange(row_offsets[i], row_offsets[i] + cu[i + 1] - cu[i])
++                np.arange(row_offsets[i], row_offsets[i] + mask_stride)
+                 for i in expected_idx
+             ]
+         )
+--- before/vllm/v1/structured_output/__init__.py
++++ after/vllm/v1/structured_output/__init__.py
+@@ -339,6 +339,8 @@
+ 
+         # Covers both speculative decoding and diffusion LLMs (canvas_length).
+         max_num_spec_tokens = self.vllm_config.num_speculative_tokens
++        is_diffusion = self.vllm_config.model_config.is_diffusion
++        mask_stride = max_num_spec_tokens + (0 if is_diffusion else 1)
+ 
+         if self._grammar_bitmask is None:
+             assert self.backend is not None
+@@ -354,7 +356,7 @@
+         # Generate a batched bitmask for all structured output requests.
+         # When speculative decoding is enabled, we need to include multiple
+         # masks for each request, one for each possible bonus token position.
+-        # These are stored inline in the tensor and unpacked by the gpu runner.
++        # Each request owns a fixed-width block of `mask_stride` rows.
+         cumulative_index = 0
+ 
+         # Optimized parallel filling of bitmasks for
+@@ -391,7 +393,8 @@
+                 promise.result()
+         else:
+             # Fallback to serial filling of bitmasks for small-batch-size cases
+-            for req_id in structured_output_request_ids:
++            for grammar_idx, req_id in enumerate(structured_output_request_ids):
++                cumulative_index = grammar_idx * mask_stride
+                 request = requests[req_id]
+                 structured_output_request = request.structured_output_request
+ 
+@@ -437,7 +440,7 @@
+ 
+                 # Diffusion LLMs don't sample a bonus token after the
+                 # scheduled positions, so skip its bitmask in that case.
+-                if not (self.vllm_config.model_config.is_diffusion and req_tokens):
++                if not (is_diffusion and req_tokens):
+                     if failed_index is not None:
+                         bitmask[cumulative_index].copy_(bitmask[failed_index])
+                     else:
+@@ -451,8 +454,9 @@
+                     grammar.rollback(state_advancements)
+ 
+         bitmask_tensor = self._grammar_bitmask
+-        if cumulative_index < bitmask_tensor.shape[0]:
+-            bitmask_tensor = bitmask_tensor[:cumulative_index]
++        num_masks = len(structured_output_request_ids) * mask_stride
++        if num_masks < bitmask_tensor.shape[0]:
++            bitmask_tensor = bitmask_tensor[:num_masks]
+ 
+         # After finishing with the xgrammar operations, we convert to
+         # np.ndarray, because that is much more efficient for serialization
+--- before/vllm/v1/structured_output/utils.py
++++ after/vllm/v1/structured_output/utils.py
+@@ -136,7 +136,7 @@
+         if req_id in struct_out_req_ids:
+             struct_out_req_batch_indices[req_id] = logit_index
+ 
+-    out_indices = []
++    out_indices: list[int] = []
+ 
+     # Reorder the bitmask to match the order of the requests in the batch.
+     sorted_bitmask_tensor = torch.full(
+@@ -146,15 +146,18 @@
+         pin_memory=PIN_MEMORY,
+     )
+     sorted_bitmask = sorted_bitmask_tensor.numpy()
++    mask_stride = grammar_bitmask.shape[0] // len(
++        grammar_output.structured_output_request_ids
++    )
+     cumulative_index = 0
+     for req_id in grammar_output.structured_output_request_ids:
+-        num_spec_tokens = len(spec_tokens.get(req_id, ()))
++        num_rows = 1 + len(spec_tokens.get(req_id, ()))
+         if (logit_idx := struct_out_req_batch_indices.get(req_id)) is not None:
+-            for i in range(1 + num_spec_tokens):
+-                bitmask_index = logit_idx + i
+-                sorted_bitmask[bitmask_index] = grammar_bitmask[cumulative_index + i]
+-                out_indices.append(bitmask_index)
+-        cumulative_index += 1 + num_spec_tokens
++            sorted_bitmask[logit_idx : logit_idx + num_rows] = grammar_bitmask[
++                cumulative_index : cumulative_index + num_rows
++            ]
++            out_indices.extend(range(logit_idx, logit_idx + num_rows))
++        cumulative_index += mask_stride
+ 
+     # Copy async to device.
+     grammar_bitmask = sorted_bitmask_tensor.to(logits.device, non_blocking=True)
+--- before/vllm/v1/worker/gpu/model_runner.py
++++ after/vllm/v1/worker/gpu/model_runner.py
+@@ -527,7 +527,6 @@
+                 vocab_size=self.vocab_size,
+                 device=self.device,
+                 mask_stride=self.decode_query_len,
+-                num_bonus_tokens=self.model_state.num_new_sampled_tokens_per_step,
+             )
+ 
+         if self.is_pooling_model and self.is_last_pp_rank:
+--- before/vllm/v1/worker/gpu/sample/batch_shard.py
++++ after/vllm/v1/worker/gpu/sample/batch_shard.py
+@@ -275,9 +275,7 @@
+         )
+         local_grammar_output = None
+         if grammar_output is not None:
+-            local_grammar_output = _shard_grammar_output(
+-                grammar_output, input_batch, local_req_ids
+-            )
++            local_grammar_output = _shard_grammar_output(grammar_output, local_req_ids)
+         metadata = BatchShardMetadata(
+             tp_size=tp_size,
+             num_logits_per_rank=num_logits_per_rank_np.tolist(),
+@@ -314,34 +312,25 @@
+ 
+ def _shard_grammar_output(
+     grammar_output: GrammarOutput,
+-    input_batch: InputBatch,
+     local_req_ids: list[str],
+ ) -> GrammarOutput | None:
+     owned = set(local_req_ids)
+-    req_id_to_idx = {req_id: i for i, req_id in enumerate(input_batch.req_ids)}
+-    cu_num_logits_np = input_batch.cu_num_logits_np
+-
+-    local_ids: list[str] = []
+-    keep_indices: list[int] = []
+-    cursor = 0
+-    for req_id in grammar_output.structured_output_request_ids:
+-        req_idx = req_id_to_idx[req_id]
+-        num_req_logits = int(cu_num_logits_np[req_idx + 1] - cu_num_logits_np[req_idx])
+-        if req_id in owned:
+-            local_ids.append(req_id)
+-            keep_indices.extend(range(cursor, cursor + num_req_logits))
+-        cursor += num_req_logits
+-    if not local_ids:
++    grammar_req_ids = grammar_output.structured_output_request_ids
++    keep = [i for i, req_id in enumerate(grammar_req_ids) if req_id in owned]
++    if not keep:
+         return None
++    local_ids = [grammar_req_ids[i] for i in keep]
++    # Each request owns a fixed-width block of rows.
++    bitmask = grammar_output.grammar_bitmask
++    blocks = bitmask.reshape(len(grammar_req_ids), -1, bitmask.shape[-1])
++    local_bitmask = blocks[keep].reshape(-1, bitmask.shape[-1])
+     # num_acceptable_drafts is ordered with structured_output_request_ids.
+     num_acceptable = grammar_output.num_acceptable_drafts
+     if num_acceptable is not None:
+-        owned = set(local_ids)
+-        ids = grammar_output.structured_output_request_ids
+-        num_acceptable = [n for i, n in zip(ids, num_acceptable) if i in owned]
++        num_acceptable = [num_acceptable[i] for i in keep]
+     return GrammarOutput(
+         structured_output_request_ids=local_ids,
+-        grammar_bitmask=grammar_output.grammar_bitmask[keep_indices],
++        grammar_bitmask=local_bitmask,
+         num_acceptable_drafts=num_acceptable,
+     )
+ 
+--- before/vllm/v1/worker/gpu/structured_outputs.py
++++ after/vllm/v1/worker/gpu/structured_outputs.py
+@@ -7,32 +7,6 @@
+ from vllm.utils.math_utils import cdiv
+ from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
+ from vllm.v1.worker.gpu.input_batch import InputBatch
+-
+-
+-def _build_grammar_mapping(
+-    req_ids: list[str],
+-    grammar_req_ids: list[str],
+-    cu_num_logits_np: np.ndarray,
+-    num_draft_tokens_per_req: np.ndarray | None,
+-    num_bonus_tokens: int,
+-    mask_stride: int,
+-) -> list[int]:
+-    mapping: list[int] = []
+-    req_id_to_idx = {req_id: i for i, req_id in enumerate(req_ids)}
+-    for grammar_req_id in grammar_req_ids:
+-        req_idx = req_id_to_idx[grammar_req_id]
+-        if num_draft_tokens_per_req is None:
+-            num_positions = int(
+-                cu_num_logits_np[req_idx + 1] - cu_num_logits_np[req_idx]
+-            )
+-        else:
+-            # Grammar masks follow the scheduled layout even when adaptive
+-            # verification compacts the actual CPU logit offsets to bonus-only.
+-            num_positions = int(num_draft_tokens_per_req[req_idx]) + num_bonus_tokens
+-        mapping.extend(
+-            req_idx * mask_stride + position for position in range(num_positions)
+-        )
+-    return mapping
+ 
+ 
+ def grammar_invalid_drafts(
+@@ -79,7 +53,6 @@
+         vocab_size: int,
+         device: torch.device,
+         mask_stride: int,
+-        num_bonus_tokens: int,
+     ):
+         self.logits_indices = torch.zeros(
+             max_num_logits, dtype=torch.int32, device=device
+@@ -90,7 +63,6 @@
+         self.device = device
+         self.copy_stream = torch.cuda.Stream()
+         self.mask_stride = mask_stride
+-        self.num_bonus_tokens = num_bonus_tokens
+ 
+     def apply_grammar_bitmask(
+         self,
+@@ -108,18 +80,15 @@
+                 grammar_bitmask, out=self.grammar_bitmask[: grammar_bitmask.shape[0]]
+             )
+ 
+-        # Construct bitmask -> logits mapping
+-        # Key by (request, position) rather than absolute logit index:
+-        # adaptive verification finalizes per-request logit offsets on
+-        # device, so the kernel resolves them from the GPU cu_num_logits.
+-        mapping = _build_grammar_mapping(
+-            input_batch.req_ids,
+-            grammar_req_ids,
+-            input_batch.cu_num_logits_np,
+-            input_batch.num_draft_tokens_per_req,
+-            self.num_bonus_tokens,
+-            self.mask_stride,
+-        )
++        # Each grammar request owns `mask_stride` bitmask rows. Key them by
++        # (request, position); the kernel skips positions beyond the device
++        # cu_num_logits, which adaptive verification may trim.
++        req_id_to_idx = {req_id: i for i, req_id in enumerate(input_batch.req_ids)}
++        mapping = [
++            req_id_to_idx[req_id] * self.mask_stride + position
++            for req_id in grammar_req_ids
++            for position in range(self.mask_stride)
++        ]
+ 
+         # Asynchronously copy the mapping to GPU.
+         with torch.cuda.stream(self.copy_stream):
+--- before/vllm/v1/worker/gpu/warmup.py
++++ after/vllm/v1/worker/gpu/warmup.py
+@@ -383,7 +383,9 @@
+             vocab_size = model_runner.model_config.get_vocab_size()
+             bitmask_width = (vocab_size + 31) // 32
+             grammar_bitmask = np.full(
+-                (len(req_ids), bitmask_width), fill_value=-1, dtype=np.int32
++                (len(req_ids) * model_runner.decode_query_len, bitmask_width),
++                fill_value=-1,
++                dtype=np.int32,
+             )
+             grammar_output = GrammarOutput(
+                 structured_output_request_ids=req_ids, grammar_bitmask=grammar_bitmask

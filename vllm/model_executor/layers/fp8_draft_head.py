@@ -31,7 +31,7 @@ def quantize_draft_head(weight: torch.Tensor) -> Fp8DraftHead:
         w = weight.detach()
         row_max = w.abs().amax(dim=1, keepdim=True).float().clamp(min=1e-6)
         weight_fp8 = (w.float() * (_FP8_MAX / row_max)).to(torch.float8_e4m3fn)
-        row_scale = (row_max / _FP8_MAX).to(w.dtype).reshape(1, -1)
+        row_scale = (row_max / _FP8_MAX).reshape(1, -1)
         unit_scale = torch.ones(1, dtype=torch.float32, device=w.device)
     return Fp8DraftHead(weight_fp8, row_scale, unit_scale)
 
@@ -41,15 +41,18 @@ def fp8_draft_head_logits(
     head: Fp8DraftHead,
 ) -> torch.Tensor:
     """Compute local draft logits with dynamic-activation rowwise FP8 GEMM."""
-    act_max = hidden_states.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
-    act_fp8 = (hidden_states * (_FP8_MAX / act_max)).to(torch.float8_e4m3fn)
+    # Keep activation quantization and dequantization scales in FP32. Casting
+    # a BF16 GEMM result afterward cannot recover logits rounded before top-k.
+    hidden_float = hidden_states.float()
+    act_max = hidden_float.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
+    act_fp8 = (hidden_float * (_FP8_MAX / act_max)).to(torch.float8_e4m3fn)
     logits = torch._scaled_mm(
         act_fp8,
         head.weight_fp8.t(),
         scale_a=head.unit_scale,
         scale_b=head.unit_scale,
-        out_dtype=hidden_states.dtype,
+        out_dtype=torch.float32,
     )
     logits = logits * head.row_scale
-    logits = logits * (act_max / _FP8_MAX).to(hidden_states.dtype)
+    logits = logits * (act_max / _FP8_MAX)
     return logits

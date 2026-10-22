@@ -1,9 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+from threading import Barrier
+
 import numpy as np
 import pytest
 import torch
 
+from vllm.utils import torch_utils
 from vllm.utils.torch_utils import (
     OMP_NUM_THREADS_SET_BY_VLLM,
     PinnedStagingBuffer,
@@ -15,6 +20,7 @@ from vllm.utils.torch_utils import (
     is_lossless_cast,
     is_quantized_kv_cache,
     set_default_torch_dtype,
+    set_random_seed,
     set_torch_threads_for_runtime,
     startup_omp_num_threads,
 )
@@ -220,20 +226,208 @@ def test_async_tensor_h2d_staging(device):
     )
 
 
+def test_set_random_seed_differs_per_data_parallel_index():
+    """Unseeded requests draw from the global RNGs; DP engines sharing the engine
+    seed must get distinct, reproducible streams, and index 0 keeps the seed."""
+
+    def draws(*args):
+        set_random_seed(*args)
+        return np.random.randint(2**31, size=4).tolist(), torch.rand(4).tolist()
+
+    assert draws(42, 0) == draws(42)
+    assert draws(42, 1) == draws(42, 1)
+    assert len({str(draws(42, i)) for i in range(4)}) == 4
+    assert draws(42, 1) != draws(43, 1)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 def test_pinned_staging_buffer():
-    """Copies of any size are staged through one fixed-size pinned buffer."""
     capacity = 1 << 20
     staging = PinnedStagingBuffer(capacity)
     pinned_before = torch.cuda.host_memory_stats().get("allocated_bytes.current", 0)
-
-    # Sizes below and above half the capacity (chunked), plus a permuted view.
     srcs = [torch.randn(n) for n in (1, 1000, 100_000, 300_000, 1_000_000)]
     srcs.append(torch.randn(256, 512).T)
     outs = [staging.copy_to_device(x, "cuda") for _ in range(3) for x in srcs]
     for out, x in zip(outs, srcs * 3):
         assert torch.equal(out.cpu(), x)
-
     pinned_after = torch.cuda.host_memory_stats()["allocated_bytes.current"]
     assert pinned_after - pinned_before <= capacity
     assert staging.empty((capacity + 1,), torch.uint8) is None
+
+
+def _mock_cuda_events(monkeypatch: pytest.MonkeyPatch):
+    events = []
+
+    class FakeStream:
+        def __init__(self, device):
+            self.device = torch.device(device)
+            self.synchronized = False
+
+        def synchronize(self):
+            self.synchronized = True
+
+    class FakeEvent:
+        def __init__(self, device):
+            self.device = torch.device(device)
+            self.stream = None
+            self.synchronized = False
+            events.append(self)
+
+        def record(self, stream):
+            self.stream = stream
+
+        def query(self):
+            return self.synchronized
+
+        def synchronize(self):
+            self.synchronized = True
+
+    monkeypatch.setattr(torch, "Event", FakeEvent)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda device=None: FakeStream(device),
+    )
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext(stream))
+    monkeypatch.setattr(
+        torch_utils,
+        "_pinned_uint8_buffer",
+        lambda capacity: torch.empty(capacity, dtype=torch.uint8),
+    )
+    return events
+
+
+def test_pinned_staging_buffer_uses_destination_device_stream(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    events = _mock_cuda_events(monkeypatch)
+    real_empty = torch.empty
+    requested_devices = []
+
+    def fake_empty(*args, **kwargs):
+        device = kwargs.get("device")
+        if device is not None and torch.device(device).type == "cuda":
+            requested_devices.append(torch.device(device))
+            kwargs["device"] = "cpu"
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", fake_empty)
+    destination = torch.device("cuda:1")
+    source = torch.arange(32, dtype=torch.int32)
+    staging = PinnedStagingBuffer(4096)
+
+    output = staging.copy_to_device(source, destination)
+
+    assert torch.equal(output, source)
+    assert requested_devices == [destination]
+    assert len(events) == 1
+    assert events[0].device == destination
+    assert events[0].stream.device == destination
+
+
+def test_pinned_staging_buffer_concurrent_leases_and_event_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    events = _mock_cuda_events(monkeypatch)
+    staging = PinnedStagingBuffer(1024)
+    barrier = Barrier(4)
+
+    def reserve_and_record(index: int) -> int:
+        tensor = staging.empty((128,), torch.uint8)
+        assert tensor is not None
+        barrier.wait()
+        staging.record(tensor, torch.device(f"cuda:{index}"))
+        return tensor.data_ptr()
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        pointers = list(pool.map(reserve_and_record, range(4)))
+
+    assert len(set(pointers)) == 4
+    assert len(events) == 4
+    assert {event.device for event in events} == {
+        torch.device(f"cuda:{index}") for index in range(4)
+    }
+    assert all(event.stream.device == event.device for event in events)
+
+    # The ring is full. Reusing its first slot must synchronize the matching
+    # event before returning overlapping host storage.
+    first_events = tuple(events)
+    reused = staging.empty((1,), torch.uint8)
+    assert reused is not None
+    assert any(event.synchronized for event in first_events)
+
+
+def test_pinned_staging_buffer_does_not_lease_zero_sized_regions(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _mock_cuda_events(monkeypatch)
+    staging = PinnedStagingBuffer(1024)
+
+    assert staging.empty((0, 4), torch.float32) is None
+    assert not staging._regions
+
+
+def test_pinned_staging_buffer_releases_lease_after_copy_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _mock_cuda_events(monkeypatch)
+    real_empty = torch.empty
+
+    def fake_empty(*args, **kwargs):
+        if torch.device(kwargs.get("device", "cpu")).type == "cuda":
+            kwargs["device"] = "cpu"
+        return real_empty(*args, **kwargs)
+
+    def fail_copy(*args, **kwargs):
+        raise RuntimeError("copy failed")
+
+    monkeypatch.setattr(torch, "empty", fake_empty)
+    monkeypatch.setattr(torch.Tensor, "copy_", fail_copy)
+    staging = PinnedStagingBuffer(1024)
+
+    with pytest.raises(RuntimeError, match="copy failed"):
+        staging.copy_to_device(torch.arange(16), torch.device("cuda:1"))
+
+    assert not staging._regions
+
+
+def test_pinned_staging_buffer_drains_stream_before_release_on_record_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _mock_cuda_events(monkeypatch)
+    real_empty = torch.empty
+    streams = []
+
+    class TrackingStream:
+        def __init__(self, device):
+            self.device = torch.device(device)
+            self.synchronized = False
+            streams.append(self)
+
+        def synchronize(self):
+            self.synchronized = True
+
+    def fake_empty(*args, **kwargs):
+        if torch.device(kwargs.get("device", "cpu")).type == "cuda":
+            kwargs["device"] = "cpu"
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", fake_empty)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda device=None: TrackingStream(device),
+    )
+    staging = PinnedStagingBuffer(1024)
+    monkeypatch.setattr(
+        staging,
+        "record",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("record failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="record failed"):
+        staging.copy_to_device(torch.arange(16), torch.device("cuda:1"))
+
+    assert len(streams) == 1
+    assert streams[0].synchronized
+    assert not staging._regions

@@ -69,6 +69,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     stride_final_state_token: tl.constexpr,
     stride_indices_seq: tl.constexpr,
     stride_indices_tok: tl.constexpr,
+    STATE_INDICES_WIDTH: tl.constexpr,
     # Token strides of q/k/v/beta (elements), see `token_stride`.
     stride_q_t,
     stride_k_t,
@@ -87,7 +88,6 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     SAFE_GATE: tl.constexpr,  # bounded gate variant (only branch implemented)
     LOWER_BOUND: tl.constexpr,
 ):
-    """Gated delta-rule recurrence; an invalid state index zeroes the output."""
     i_nh, i_v, i_k = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
@@ -139,9 +139,11 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
                 i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
             else:
                 i_t = 0
-            idx_in_row = (i_t >= 0) & (i_t < stride_indices_seq)
+            # The accepted column belongs to the PREVIOUS speculative step.
+            # Current query length and physical row stride are not its bounds.
+            idx_in_row = (i_t >= 0) & (i_t < STATE_INDICES_WIDTH)
             state_idx = tl.load(
-                ssm_state_indices + i_n * stride_indices_seq + i_t,
+                ssm_state_indices + i_n * stride_indices_seq + i_t * stride_indices_tok,
                 mask=idx_in_row,
                 other=0,
             ).to(tl.int64)
@@ -204,7 +206,9 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         if INPLACE_FINAL_STATE:
             # Load state index and check for invalid entries
             final_state_idx = tl.load(
-                ssm_state_indices + i_n * stride_indices_seq + i_t
+                ssm_state_indices + i_n * stride_indices_seq + i_t * stride_indices_tok,
+                mask=i_t < STATE_INDICES_WIDTH,
+                other=0,
             ).to(tl.int64)
             # Only store if state index is valid (not NULL_BLOCK_ID=0)
             if final_state_idx > 0:
@@ -260,11 +264,13 @@ def fused_recurrent_gated_delta_rule_fwd(
     stride_final_state_token = final_state.stride(0)
 
     if ssm_state_indices is None:
-        stride_indices_seq, stride_indices_tok = 1, 1
+        stride_indices_seq, stride_indices_tok, state_indices_width = 1, 1, 1
     elif ssm_state_indices.ndim == 1:
         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride(0), 1
+        state_indices_width = 1
     else:
         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
+        state_indices_width = ssm_state_indices.shape[1]
 
     # N * HV goes in gridDim.x: gridDim.z is capped at 65535 and batch x heads exceeds it
     # (e.g. GLM-5.3-Flash at TP=1: 1024 x 64 = 65536 -> "invalid argument" at CUDA-graph capture).
@@ -295,6 +301,7 @@ def fused_recurrent_gated_delta_rule_fwd(
         stride_final_state_token=stride_final_state_token,
         stride_indices_seq=stride_indices_seq,
         stride_indices_tok=stride_indices_tok,
+        STATE_INDICES_WIDTH=state_indices_width,
         stride_q_t=token_stride(q),
         stride_k_t=token_stride(k),
         stride_v_t=token_stride(v),
@@ -598,8 +605,7 @@ def fused_recurrent_gated_delta_rule(
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    r"""
-    Args:
+    r"""Args:
         q (torch.Tensor):
             queries of shape `[B, T, H, K]`.
         k (torch.Tensor):
@@ -661,6 +667,7 @@ def fused_recurrent_gated_delta_rule(
             initial_state=h0,
             cu_seqlens=cu_seqlens
         )
+
     """
     if cu_seqlens is not None and q.shape[0] != 1:
         raise ValueError(

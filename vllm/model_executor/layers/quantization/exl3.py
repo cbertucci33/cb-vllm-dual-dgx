@@ -20,13 +20,18 @@ from __future__ import annotations
 
 import ctypes
 import importlib
+import math
 import os
 import sys
+import weakref
+from contextlib import suppress
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import regex as re
 import torch
-from transformers import PretrainedConfig
+from huggingface_hub.constants import HF_HUB_OFFLINE
+from transformers import PreTrainedConfig
 
 from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed import (
@@ -54,7 +59,12 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.parameter import BasevLLMParameter
-from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
+from vllm.transformers_utils.repo_utils import (
+    file_or_path_exists,
+    get_hf_file_to_dict,
+    try_get_local_file,
+)
+from vllm.utils.mem_utils import check_startup_memory, record_startup_memory_peak
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
@@ -72,6 +82,10 @@ _EXL3_EXT: Any | None = None
 _SPARKINFER_TRELLIS_API: Any | None = None
 _RANK_SLICED_RUNTIMES: dict[tuple[Any, ...], dict[str, Any]] = {}
 _NEXT_RUNTIME_SCOPE_ID = 0
+
+
+class _RuntimeScopeOwner:
+    pass
 
 
 # Smallest m the Trellis kernel path can service, and therefore the smallest
@@ -119,6 +133,12 @@ def _runtime_owner_token(quant_config: Any, layer: Any) -> tuple[int, bool]:
     return (_runtime_scope_id(quant_config), _is_draft_layer(layer))
 
 
+def _release_runtime_scope(scope: int) -> None:
+    for key in tuple(_RANK_SLICED_RUNTIMES):
+        if key[0][0] == scope:
+            del _RANK_SLICED_RUNTIMES[key]
+
+
 def _runtime_scope_id(quant_config: Any) -> int:
     """Stable identity for the model that owns a rank-sliced runtime.
 
@@ -139,15 +159,23 @@ def _runtime_scope_id(quant_config: Any) -> int:
     global _NEXT_RUNTIME_SCOPE_ID
     scope = getattr(quant_config, "_exl3_runtime_scope_id", None)
     if scope is not None:
+        if not isinstance(
+            getattr(quant_config, "_exl3_runtime_owner", None), _RuntimeScopeOwner
+        ):
+            raise RuntimeError("EXL3 runtime scope has no live resource owner")
         return scope
     scope = _NEXT_RUNTIME_SCOPE_ID
     _NEXT_RUNTIME_SCOPE_ID += 1
+    owner = _RuntimeScopeOwner()
     try:
+        quant_config._exl3_runtime_owner = owner  # noqa: SLF001
         quant_config._exl3_runtime_scope_id = scope  # noqa: SLF001
-    except AttributeError:
-        # Frozen/slotted config: fall back to object identity. Configs live for
-        # the process lifetime, so reuse-after-GC aliasing is not a concern here.
-        return id(quant_config)
+    except (AttributeError, TypeError) as exc:
+        for name in ("_exl3_runtime_owner", "_exl3_runtime_scope_id"):
+            with suppress(AttributeError):
+                delattr(quant_config, name)
+        raise TypeError("EXL3 runtime owner must retain a unique scope") from exc
+    weakref.finalize(owner, _release_runtime_scope, scope)
     return scope
 
 
@@ -162,7 +190,6 @@ ShardId = str | int | tuple[int, ...] | None
 
 def _load_exl3_ext() -> Any:
     """Load the existing ExLlamaV3 extension only from an actual CUDA call."""
-
     global _EXL3_EXT
     if _EXL3_EXT is not None:
         return _EXL3_EXT
@@ -198,7 +225,6 @@ def _load_exl3_ext() -> Any:
 
 def _load_sparkinfer_trellis() -> Any:
     """Resolve the public planned Trellis MoE API lazily."""
-
     global _SPARKINFER_TRELLIS_API
     if _SPARKINFER_TRELLIS_API is not None:
         return _SPARKINFER_TRELLIS_API
@@ -247,11 +273,10 @@ def _exl3_gemm(
     mul1: bool,
 ) -> torch.Tensor:
     """Opaque torch op around the bit-faithful ExLlamaV3 dense call."""
-
     ext = _load_exl3_ext()
     output = torch.empty(
         (x.shape[0], trellis.shape[1] * 16),
-        dtype=torch.float16,
+        dtype=torch.float32,
         device=x.device,
     )
     x_had = torch.empty_like(x)
@@ -267,7 +292,8 @@ def _exl3_gemm(
         mul1,
         0,
     )
-    return output
+    # C also stores inter-CTA split-K partial sums in the native kernel.
+    return output.to(torch.float16)
 
 
 @_exl3_gemm.register_fake
@@ -304,7 +330,8 @@ class Exl3Config(QuantizationConfig):
         self.codebook = codebook
         self.version = version
         self.tensor_storage = tensor_storage or {}
-        self._eager_checked = False
+        self._kv_cache_scale_names: set[str] = set()
+        self._kv_cache_scales_initialized = False
         self.rank_sliced_metadata: dict[str, Any] | None = None
 
     def get_name(self) -> QuantizationMethods:
@@ -338,7 +365,7 @@ class Exl3Config(QuantizationConfig):
         cls,
         hf_quant_cfg: dict[str, Any],
         user_quant: str | None,
-        hf_config: PretrainedConfig | None = None,
+        hf_config: PreTrainedConfig | None = None,
     ) -> QuantizationMethods | None:
         del hf_quant_cfg
         if user_quant is not None and user_quant != "exl3":
@@ -351,7 +378,7 @@ class Exl3Config(QuantizationConfig):
     def maybe_update_config(
         self,
         model_name: str,
-        hf_config: PretrainedConfig | None = None,
+        hf_config: PreTrainedConfig | None = None,
         revision: str | None = None,
     ) -> None:
         rank_sliced = getattr(hf_config, "hybrid_tr3_tail", None)
@@ -361,14 +388,16 @@ class Exl3Config(QuantizationConfig):
         ):
             self._configure_rank_sliced(rank_sliced)
 
+        resolved_revision = revision
+        if resolved_revision is None and hf_config is not None:
+            resolved_revision = getattr(hf_config, "_commit_hash", None)
+        self._load_kv_cache_scale_names(model_name, resolved_revision)
+
         # vLLM returns the summary embedded in config.json without consulting
         # get_config_filenames().  Hydrate the per-module records explicitly.
         # Rank-sliced checkpoints still need these records for dense linears;
         # only routed-expert storage is described by rank_sliced_metadata.
         if not self.tensor_storage:
-            resolved_revision = revision
-            if resolved_revision is None and hf_config is not None:
-                resolved_revision = getattr(hf_config, "_commit_hash", None)
             config = get_hf_file_to_dict(
                 "quantization_config.json",
                 model_name,
@@ -395,6 +424,55 @@ class Exl3Config(QuantizationConfig):
 
         self._validate_storage_metadata()
         self._force_independent_lm_head(hf_config)
+
+    def _load_kv_cache_scale_names(self, model_name: str, revision: str | None) -> None:
+        if self._kv_cache_scales_initialized:
+            return
+        index = get_hf_file_to_dict(
+            "model.safetensors.index.json", model_name, revision=revision
+        )
+        weight_map: dict[str, Any]
+        if index is None:
+            if (
+                not Path(model_name).is_dir()
+                and HF_HUB_OFFLINE
+                and try_get_local_file(
+                    model_name, "model.safetensors.index.json", revision
+                )
+                is None
+            ):
+                raise ValueError("Cannot establish EXL3 KV calibration in offline mode")
+            if file_or_path_exists(
+                model_name, "model.safetensors.index.json", revision
+            ):
+                raise ValueError("Could not read EXL3 checkpoint tensor inventory")
+            weight_map = {}
+        else:
+            raw_weight_map = (
+                index.get("weight_map") if isinstance(index, dict) else None
+            )
+            if not isinstance(raw_weight_map, dict) or not all(
+                isinstance(name, str) for name in raw_weight_map
+            ):
+                raise ValueError("Invalid EXL3 checkpoint tensor inventory")
+            weight_map = raw_weight_map
+        scale_names = {
+            name for name in weight_map if name.endswith((".k_scale", ".v_scale"))
+        }
+        for name in scale_names:
+            prefix, kind = name.rsplit(".", 1)
+            counterpart = "v_scale" if kind == "k_scale" else "k_scale"
+            if f"{prefix}.{counterpart}" not in scale_names:
+                raise ValueError(f"Incomplete EXL3 KV calibration for {prefix}")
+        mapped_names = set(self.get_cache_scale_mapper().apply_list(list(scale_names)))
+        self._kv_cache_scale_names = mapped_names
+        self._kv_cache_scales_initialized = True
+
+    def _has_kv_cache_scales(self, prefix: str) -> bool:
+        return all(
+            f"{prefix}.{scale}_scale" in self._kv_cache_scale_names
+            for scale in ("k", "v")
+        )
 
     def _configure_rank_sliced(self, metadata: dict[str, Any]) -> None:
         required = {
@@ -441,6 +519,9 @@ class Exl3Config(QuantizationConfig):
         # source-matrix discovery intentionally refers to the unstacked HF name.
         mapped = hf_to_vllm_mapper.apply_dict(self.tensor_storage)
         self.tensor_storage = {**self.tensor_storage, **mapped}
+        self._kv_cache_scale_names.update(
+            hf_to_vllm_mapper.apply_list(list(self._kv_cache_scale_names))
+        )
 
     def _validate_storage_metadata(self) -> None:
         bad: list[str] = []
@@ -466,7 +547,7 @@ class Exl3Config(QuantizationConfig):
         if bad:
             raise ValueError("Invalid EXL3 tensor metadata: " + "; ".join(bad[:16]))
 
-    def _force_independent_lm_head(self, hf_config: PretrainedConfig | None) -> None:
+    def _force_independent_lm_head(self, hf_config: PreTrainedConfig | None) -> None:
         if hf_config is None or not self.has_quantized_lm_head():
             return
         configs: list[Any] = [hf_config]
@@ -487,33 +568,11 @@ class Exl3Config(QuantizationConfig):
                 "overriding tie_word_embeddings so vLLM instantiates it."
             )
 
-    def _require_enforce_eager(self) -> None:
-        if self.rank_sliced_metadata is not None:
-            # The routed-expert path is eagerly planned before graph capture.
-            return
-        # exllamav3_ext's exl3_gemm autotunes with timing launches on the first
-        # call per (m-bucket, k, n, K) shape hash; under CUDA-graph capture
-        # those launches fault, and m-bucketing means a warmup pass cannot
-        # reliably cover every bucket. Fail fast at build time instead of
-        # faulting mid-capture.
-        if self._eager_checked:
-            return
-        self._eager_checked = True
-        vllm_config = get_current_vllm_config_or_none()
-        if vllm_config is None:
-            return
-        if not vllm_config.model_config.enforce_eager:
-            raise ValueError(
-                "The EXL3 quantization backend requires eager execution: "
-                "pass --enforce-eager (enforce_eager=True). exl3_gemm "
-                "autotunes with timing launches on first use per shape "
-                "bucket, which is incompatible with CUDA-graph capture."
-            )
-
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> QuantizeMethodBase | None:
-        self._require_enforce_eager()
+        if isinstance(layer, Attention) and self._has_kv_cache_scales(prefix):
+            return BaseKVCacheMethod(self)
         is_lm_head = layer.__class__.__name__ == "ParallelLMHead"
         if is_lm_head and not prefix:
             prefix = "lm_head"
@@ -525,11 +584,6 @@ class Exl3Config(QuantizationConfig):
             if not self._moe_prefix_is_exl3(prefix, layer):
                 return None
             return Exl3MoEMethod(self, layer.moe_config)
-        if isinstance(layer, Attention):
-            # EXL3 quantizes model weights, not the KV cache. Register the
-            # generic KV-cache scale parameters so calibrated k/v scales can
-            # still be loaded when the runtime cache dtype is FP8.
-            return BaseKVCacheMethod(self)
         return None
 
     def _storage_entry(self, prefix: str) -> dict[str, Any] | None:
@@ -734,6 +788,7 @@ class Exl3LinearMethod(LinearMethodBase):
             layer.register_parameter(name, param)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.exl3_autotune_warmed = False
         self._materialize_legacy_hadamard(layer)
         missing: list[str] = []
         for attr in ("suh", "svh", "trellis"):
@@ -775,12 +830,41 @@ class Exl3LinearMethod(LinearMethodBase):
                     device=device, non_blocking=True
                 ).contiguous()
 
+        if device.type == "cuda":
+            self._warm_autotune_buckets(layer)
+            layer.exl3_autotune_warmed = True
+
+    @staticmethod
+    def _warm_autotune_buckets(layer: torch.nn.Module) -> None:
+        # The pinned native GEMM key uses min(roundup_pow2(max(M, 2)), 16).
+        # All other key fields come from these same final per-rank tensors,
+        # device, codebook and FP16 output used by the forward operator.
+        for shard_id in layer.exl3_shard_ids:
+            trellis = layer.trellis.exl3_tensors[shard_id]
+            packed_k = trellis.shape[0] * 16
+            for rows in (2, 4, 8, 16):
+                x = torch.zeros(
+                    (rows, packed_k), dtype=torch.float16, device=trellis.device
+                )
+                _exl3_gemm(
+                    x,
+                    trellis,
+                    layer.suh.exl3_tensors[shard_id],
+                    layer.svh.exl3_tensors[shard_id],
+                    shard_id in layer.mcg.exl3_tensors,
+                    shard_id in layer.mul1.exl3_tensors,
+                )
+
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if x.is_cuda and not getattr(layer, "exl3_autotune_warmed", False):
+            raise RuntimeError(
+                "EXL3 dense weights must finish autotune warmup before CUDA execution"
+            )
         original_shape = x.shape[:-1]
         original_dtype = x.dtype
         x_2d = x.reshape(-1, x.shape[-1]).to(torch.float16).contiguous()
@@ -946,9 +1030,7 @@ class Exl3LinearMethod(LinearMethodBase):
             )
 
     @staticmethod
-    def _is_padded_qkv_value_shard(
-        layer: torch.nn.Module, shard_id: ShardId
-    ) -> bool:
+    def _is_padded_qkv_value_shard(layer: torch.nn.Module, shard_id: ShardId) -> bool:
         if not isinstance(layer, QKVParallelLinear) or shard_id != "v":
             return False
         if layer.v_head_size >= layer.head_size:
@@ -1530,6 +1612,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
     @property
     def topk_indices_dtype(self) -> torch.dtype | None:
+        # Trellis consumes the router's native int32 IDs without a per-layer cast.
+        # Keep the separate non-rank-sliced expert path's existing contract.
+        if self.quant_config.rank_sliced_metadata is not None:
+            return torch.int32
         return torch.long
 
     def _rank_sliced_runtime(
@@ -1561,6 +1647,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         max_batched_tokens = int(layer.exl3_max_num_batched_tokens)
         prefill_plan_enabled = max_batched_tokens > max_trellis_m
         topk = int(topk_ids.shape[1])
+        swiglu_limit = getattr(layer, "swiglu_limit", None)
         device_index = x.device.index
         key = (
             # Owning model scope first: the cached runtime holds mutable scratch,
@@ -1579,6 +1666,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             block_m,
             prefill_block_m,
             layer.exl3_trellis_tile_config,
+            swiglu_limit,
         )
         runtime = _RANK_SLICED_RUNTIMES.get(key)
         if runtime is not None:
@@ -1607,14 +1695,27 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 tile_config=layer.exl3_trellis_tile_config,
                 input_dtype=x.dtype,
                 device=x.device,
+                swiglu_limit=swiglu_limit,
+            )
+            check_startup_memory(
+                label="EXL3 plan preparation",
+                device=x.device,
             )
             plan = api.plan(caps)
             scratch_spec = plan.scratch_specs()[0]
+            if scratch_spec.dtype != torch.uint8:
+                raise TypeError("Trellis scratch contract requires a byte arena")
+            check_startup_memory(
+                device_bytes=math.prod(scratch_spec.shape),
+                label="EXL3 planned Trellis arena",
+                device=scratch_spec.device,
+            )
             scratch = torch.empty(
                 scratch_spec.shape,
                 dtype=scratch_spec.dtype,
                 device=scratch_spec.device,
             )
+            record_startup_memory_peak(scratch_spec.device)
             return plan, scratch
 
         trellis_plan, trellis_scratch = _plan_with_scratch(max_trellis_m, block_m)
@@ -1660,6 +1761,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             topk,
         )
         return runtime
+
+    def release_runtime_resources(self) -> None:
+        scope = getattr(self.quant_config, "_exl3_runtime_scope_id", None)
+        if scope is not None:
+            _release_runtime_scope(scope)
 
     def _apply_rank_sliced(
         self,
@@ -1751,6 +1857,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             expert_input = x_2d.index_select(0, token_ids)
             gate = self._apply_expert(layer, "w13", expert_input, expert_id, "w1")
             up = self._apply_expert(layer, "w13", expert_input, expert_id, "w3")
+            swiglu_limit = getattr(layer, "swiglu_limit", None)
+            if swiglu_limit is not None:
+                gate = gate.clamp(max=swiglu_limit)
+                up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
             hidden = torch.nn.functional.silu(gate) * up
             expert_output = self._apply_expert(layer, "w2", hidden, expert_id, "w2")
             route_weight = weights[token_ids, route_ids].unsqueeze(-1)

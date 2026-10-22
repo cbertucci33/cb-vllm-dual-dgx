@@ -1,25 +1,132 @@
+diff --git a/exllamav3/exllamav3_ext/avx2_target.cpp b/exllamav3/exllamav3_ext/avx2_target.cpp
+index f085320..435fa60 100644
+--- a/exllamav3/exllamav3_ext/avx2_target.cpp
++++ b/exllamav3/exllamav3_ext/avx2_target.cpp
+@@ -5,7 +5,9 @@ bool is_avx2_supported()
+     static bool avx2_check = false;
+     static bool avx2_supported = false;
+     if (avx2_check) return avx2_supported;
+-    #ifdef __linux__
++    #if defined(__linux__) && !(defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
++        (void)0;  // Non-x86 Linux has no AVX support.
++    #elif defined(__linux__)
+         avx2_supported = __builtin_cpu_supports("avx2");
+     #else
+         int cpuInfo[4];
+diff --git a/exllamav3/exllamav3_ext/avx2_target.h b/exllamav3/exllamav3_ext/avx2_target.h
+index b5f77b4..b2e88ef 100644
+--- a/exllamav3/exllamav3_ext/avx2_target.h
++++ b/exllamav3/exllamav3_ext/avx2_target.h
+@@ -6,7 +6,7 @@
+ 
+ bool is_avx2_supported();
+ 
+-#ifdef __linux__
++#if defined(__linux__) && (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
+     #define AVX2_TARGET __attribute__((target("avx2")))
+     #define AVX2_TARGET_OPTIONAL __attribute__((target_clones("avx2","default")))
+ #else
+diff --git a/exllamav3/exllamav3_ext/avx512_target.cpp b/exllamav3/exllamav3_ext/avx512_target.cpp
+index 2a676f6..0349792 100644
+--- a/exllamav3/exllamav3_ext/avx512_target.cpp
++++ b/exllamav3/exllamav3_ext/avx512_target.cpp
+@@ -6,7 +6,9 @@ bool is_avx512_supported()
+     static bool avx512_supported = false;
+     if (avx512_check) return avx512_supported;
+ 
+-#ifdef __linux__
++#if defined(__linux__) && !(defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
++        (void)0;  // Non-x86 Linux has no AVX support.
++    #elif defined(__linux__)
+     // Check for AVX-512F and AVX-512BW support
+     avx512_supported = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw");
+ #else
+diff --git a/exllamav3/exllamav3_ext/avx512_target.h b/exllamav3/exllamav3_ext/avx512_target.h
+index d953709..7ec0fec 100644
+--- a/exllamav3/exllamav3_ext/avx512_target.h
++++ b/exllamav3/exllamav3_ext/avx512_target.h
+@@ -6,7 +6,7 @@
+ 
+ bool is_avx512_supported();
+ 
+-#ifdef __linux__
++#if defined(__linux__) && (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
+     #define AVX512_TARGET __attribute__((target("avx512f,avx512bw")))
+     #define AVX512_TARGET_OPTIONAL __attribute__((target_clones("avx512f,avx512bw","default")))
+ #else
+diff --git a/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx2.cpp b/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx2.cpp
+index f55148c..da6e50f 100644
+--- a/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx2.cpp
++++ b/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx2.cpp
+@@ -1,3 +1,4 @@
++#if (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
+ #include <immintrin.h>
+ #include "all_reduce_cpu_avx2.h"
+ #include "all_reduce_cpu_avx512.h"
+@@ -228,3 +229,37 @@ void perform_cpu_reduce_avx2
+         num_chunks--;
+     }
+ }
++
++#else
++#include <stdexcept>
++#include "all_reduce_cpu_avx2.h"
++#include "all_reduce_cpu_avx512.h"
++
++void enable_fast_fp() {}
++void enable_fast_fp_avx2() {}
++void enable_fast_fp_avx512() {}
++
++[[noreturn]] static void unsupported_cpu_reduce()
++{
++    throw std::runtime_error(
++        "ExLlamaV3's native CPU all-reduce backend requires x86 AVX2"
++    );
++}
++
++void perform_cpu_reduce(PGContext*, size_t, uint32_t, uint8_t*, size_t)
++{
++    unsupported_cpu_reduce();
++}
++void perform_cpu_reduce_avx2(PGContext*, size_t, uint32_t, uint8_t*, size_t)
++{
++    unsupported_cpu_reduce();
++}
++void perform_cpu_reduce_avx512(PGContext*, size_t, uint32_t, uint8_t*, size_t)
++{
++    unsupported_cpu_reduce();
++}
++void bf16_add_inplace_avx512(uint16_t*, const uint16_t*, size_t)
++{
++    unsupported_cpu_reduce();
++}
++#endif
+diff --git a/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx512.cpp b/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx512.cpp
+index e9bc401..ff88e7e 100644
+--- a/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx512.cpp
++++ b/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx512.cpp
+@@ -1,3 +1,4 @@
++#if (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
+ #include <immintrin.h>
+ #include "all_reduce_cpu_avx512.h"
+ #include "all_reduce_cpu_avx2.h"
+@@ -273,3 +274,5 @@ void perform_cpu_reduce_avx512
+         num_chunks--;
+     }
+ }
++
++#endif
 diff --git a/setup.py b/setup.py
-index 65d7065..8f1c237 100644
+index 65d7065..c305dde 100644
 --- a/setup.py
 +++ b/setup.py
-@@ -3,0 +4 @@ import os
-+import platform
-@@ -59,0 +61,9 @@ sources = [
-+if platform.machine().lower() not in {"amd64", "x86_64"}:
-+    x86_only_sources = {
-+        os.path.join(sources_dir, "avx2_target.cpp"),
-+        os.path.join(sources_dir, "avx512_target.cpp"),
-+        os.path.join(sources_dir, "parallel", "all_reduce_cpu_avx2.cpp"),
-+        os.path.join(sources_dir, "parallel", "all_reduce_cpu_avx512.cpp"),
-+    }
-+    sources = [source for source in sources if source not in x86_only_sources]
-+
-@@ -85 +95,3 @@ setup(
+@@ -82,54 +82,14 @@ version = version_py["__version__"]
+ print("Version:", version)
+ 
+ setup(
 -    name="exllamav3",
-+    # vLLM consumes only the native extension. Keep unrelated standalone
-+    # ExLlamaV3 packages and their serving dependencies out of this image.
 +    name="exllamav3-ext-vllm",
-@@ -87,22 +99 @@ setup(
+     version=version,
 -    packages=[
 -        "exllamav3",
 -        "exllamav3.generator",
@@ -43,7 +150,9 @@ index 65d7065..8f1c237 100644
 -        "exllamav3.util",
 -    ],
 +    packages=[],
-@@ -112,21 +103,2 @@ setup(
+     url="https://github.com/turboderp-org/exllamav3",
+     license="MIT",
+     author="turboderp",
 -    install_requires=[
 -        "torch>=2.6.0",
 -        "flash_attn>=2.7.4.post1",
@@ -67,64 +176,6 @@ index 65d7065..8f1c237 100644
 -    },
 +    install_requires=[],
 +    include_package_data=False,
-diff --git a/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_unsupported.cpp b/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_unsupported.cpp
-new file mode 100644
-index 0000000..379645e
---- /dev/null
-+++ b/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_unsupported.cpp
-@@ -0,0 +1,55 @@
-+#include <stdexcept>
-+
-+#include "../avx2_target.h"
-+#include "../avx512_target.h"
-+#include "all_reduce_cpu_avx2.h"
-+#include "all_reduce_cpu_avx512.h"
-+
-+bool is_avx2_supported()
-+{
-+    return false;
-+}
-+
-+bool is_avx512_supported()
-+{
-+    return false;
-+}
-+
-+void enable_fast_fp() {}
-+void enable_fast_fp_avx2() {}
-+void enable_fast_fp_avx512() {}
-+
-+[[noreturn]] static void unsupported_cpu_reduce()
-+{
-+    throw std::runtime_error(
-+        "ExLlamaV3's native CPU all-reduce backend requires x86 AVX2"
-+    );
-+}
-+
-+void perform_cpu_reduce(
-+    PGContext*, size_t, uint32_t, uint8_t*, size_t
-+)
-+{
-+    unsupported_cpu_reduce();
-+}
-+
-+void perform_cpu_reduce_avx2(
-+    PGContext*, size_t, uint32_t, uint8_t*, size_t
-+)
-+{
-+    unsupported_cpu_reduce();
-+}
-+
-+void perform_cpu_reduce_avx512(
-+    PGContext*, size_t, uint32_t, uint8_t*, size_t
-+)
-+{
-+    unsupported_cpu_reduce();
-+}
-+
-+void bf16_add_inplace_avx512(
-+    uint16_t*, const uint16_t*, size_t
-+)
-+{
-+    unsupported_cpu_reduce();
-+}
+     verbose=verbose,
+     **setup_kwargs,
+ )

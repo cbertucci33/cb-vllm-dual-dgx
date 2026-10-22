@@ -1,0 +1,57 @@
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index 9ad0d4e658..8929a58c52 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -304,6 +304,9 @@ class SchedulerOutput:
+     # Scheduler-local; always None by the time this reaches a worker.
+     kv_connector_block_state: KVConnectorBlockState | None = None
+ 
++    # Internal request generation at scheduling time. Workers ignore this field.
++    scheduled_request_generations: dict[str, int] = field(default_factory=dict)
++
+     # Dynamic speculative decoding: optimal K chosen by scheduler.
+     # Number of spec tokens to schedule for the next step.
+     num_spec_tokens_to_schedule: int = 0
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index d3e81a7996..badbf91028 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -212,6 +212,8 @@ class Scheduler(SchedulerInterface):
+ 
+         # req_id -> Request
+         self.requests: dict[str, Request] = {}
++        self.request_generations: dict[str, int] = {}
++        self.next_request_generation = 0
+         # Scheduling policy
+         try:
+             self.policy = SchedulingPolicy(self.scheduler_config.policy)
+@@ -1528,6 +1530,10 @@ class Scheduler(SchedulerInterface):
+             scheduled_new_reqs=new_reqs_data,
+             scheduled_cached_reqs=cached_reqs_data,
+             num_scheduled_tokens=num_scheduled_tokens,
++            scheduled_request_generations={
++                req_id: self.request_generations[req_id]
++                for req_id in num_scheduled_tokens
++            },
+             total_num_scheduled_tokens=total_num_scheduled_tokens,
+             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+             scheduled_encoder_inputs=scheduled_encoder_inputs,
+@@ -2658,6 +2664,10 @@ class Scheduler(SchedulerInterface):
+                 request.streaming_queue = deque()
+             self._enqueue_waiting_request(request)
+             self.requests[request.request_id] = request
++            self.next_request_generation += 1
++            self.request_generations[request.request_id] = (
++                self.next_request_generation
++            )
+             if self.spec_decode_metrics_level != "none":
+                 request.spec_decode_metrics = RequestSpecDecodeMetrics.new(
+                     self.num_spec_tokens
+@@ -2773,6 +2783,7 @@ class Scheduler(SchedulerInterface):
+         assert request.is_finished()
+         self._free_request_blocks(request)
+         del self.requests[request.request_id]
++        del self.request_generations[request.request_id]
+ 
+     @property
+     def pause_state(self) -> PauseState:

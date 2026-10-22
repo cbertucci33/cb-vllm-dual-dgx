@@ -1,0 +1,386 @@
+--- a/flight_recorder.py
++++ b/flight_recorder.py
+@@ -175,8 +175,15 @@
+         self.response_usage: dict[str, Any] | None = None
+         self.response_output_count = 0
+         self.response_output_types: dict[str, int] = {}
+-
+-    def feed(self, chunk: bytes) -> None:
++        self.response_items: dict[int, dict[str, Any]] = {}
++        self.response_parts: dict[tuple[int, str, int], str] = {}
++        self.first_answer_ns: int | None = None
++        self.first_reasoning_ns: int | None = None
++        self.observed_ns: int | None = None
++        self.is_responses = False
++
++    def feed(self, chunk: bytes, observed_ns: int | None = None) -> None:
++        self.observed_ns = observed_ns
+         self.raw_tool_markers += chunk.count(b"<tool_call>")
+         self.buffer += chunk
+         while b"\n" in self.buffer:
+@@ -203,11 +210,63 @@
+         self.json_events += 1
+         self._payload(payload)
+ 
++    def _response_item(self, index: int, item: dict[str, Any]) -> None:
++        current = self.response_items.setdefault(index, {})
++        current.update(item)
++        kind = item.get("type")
++        if kind in {"function_call", "custom_tool_call"}:
++            field = "arguments" if kind == "function_call" else "input"
++            if isinstance(item.get(field), str):
++                self.response_parts[index, field, 0] = item[field]
++        for field, channel in (("content", "text"), ("summary", "summary")):
++            for part_index, part in enumerate(item.get(field) or []):
++                text = part.get("text", part.get("refusal"))
++                if isinstance(text, str):
++                    part_channel = "reasoning" if kind == "reasoning" and field == "content" else channel
++                    self.response_parts[index, part_channel, part_index] = text
++
++    def _response_delta(self, payload: dict[str, Any]) -> None:
++        event_type = payload.get("type")
++        channels = {
++            "response.output_text.delta": "text",
++            "response.refusal.delta": "text",
++            "response.reasoning_text.delta": "reasoning",
++            "response.reasoning_summary_text.delta": "summary",
++            "response.function_call_arguments.delta": "arguments",
++            "response.custom_tool_call_input.delta": "input",
++        }
++        if event_type not in channels:
++            return
++        index = payload.get("output_index")
++        delta = payload.get("delta")
++        if not isinstance(index, int) or not isinstance(delta, str):
++            return
++        channel = channels[event_type]
++        part_index = payload.get("content_index", payload.get("summary_index", 0))
++        key = (index, channel, part_index)
++        self.response_parts[key] = self.response_parts.get(key, "") + delta
++        item = self.response_items.setdefault(index, {})
++        if payload.get("item_id"):
++            item["id"] = payload["item_id"]
++        if delta and channel == "text" and self.first_answer_ns is None:
++            self.first_answer_ns = self.observed_ns
++        if delta and channel in {"reasoning", "summary"} and self.first_reasoning_ns is None:
++            self.first_reasoning_ns = self.observed_ns
++        if channel in {"arguments", "input"}:
++            self.tool_fragments += 1
++
+     def _payload(self, payload: dict[str, Any]) -> None:
+         if isinstance(payload.get("id"), str):
+             self.response_ids.add(payload["id"])
+         event_type = payload.get("type")
+         response = payload.get("response")
++        if isinstance(event_type, str) and event_type.startswith("response."):
++            self.is_responses = True
++            self._response_delta(payload)
++            if event_type in {"response.output_item.added", "response.output_item.done"}:
++                index, item = payload.get("output_index"), payload.get("item")
++                if isinstance(index, int) and isinstance(item, dict):
++                    self._response_item(index, item)
+         if event_type == "response.completed":
+             self.done = True
+         if isinstance(response, dict):
+@@ -233,6 +292,9 @@
+                     if isinstance(item_type, str):
+                         output_types[item_type] = output_types.get(item_type, 0) + 1
+                 self.response_output_types = output_types
++                for index, item in enumerate(output):
++                    if isinstance(item, dict):
++                        self._response_item(index, item)
+         for choice in payload.get("choices") or []:
+             reason = choice.get("finish_reason")
+             if reason:
+@@ -241,9 +303,13 @@
+             content = message.get("content")
+             reasoning = message.get("reasoning") or message.get("reasoning_content")
+             if isinstance(content, str):
++                if content and self.first_answer_ns is None:
++                    self.first_answer_ns = self.observed_ns
+                 self.content_chars += len(content)
+                 self.replacement_chars += content.count("\ufffd")
+             if isinstance(reasoning, str):
++                if reasoning and self.first_reasoning_ns is None:
++                    self.first_reasoning_ns = self.observed_ns
+                 self.reasoning_chars += len(reasoning)
+                 self.replacement_chars += reasoning.count("\ufffd")
+             self.tool_fragments += len(message.get("tool_calls") or [])
+@@ -273,6 +339,49 @@
+                 "arguments_sha256": hashlib.sha256(arguments.encode()).hexdigest(),
+                 "arguments_json_valid": valid_json,
+             })
++        content_chars = self.content_chars
++        reasoning_chars = self.reasoning_chars
++        replacement_chars = self.replacement_chars
++        content_anomalies = []
++        if self.is_responses:
++            content = "".join(text for (_, channel, _), text in self.response_parts.items() if channel == "text")
++            reasoning = "".join(text for (_, channel, _), text in self.response_parts.items() if channel == "reasoning")
++            summaries = "".join(text for (_, channel, _), text in self.response_parts.items() if channel == "summary")
++            content_chars, reasoning_chars = len(content), len(reasoning)
++            replacement_chars = sum(text.count("\ufffd") for text in (content, reasoning, summaries))
++            output_types: dict[str, int] = {}
++            tool_calls = []
++            for index, item in sorted(self.response_items.items()):
++                kind = item.get("type")
++                if isinstance(kind, str):
++                    output_types[kind] = output_types.get(kind, 0) + 1
++                if kind not in {"function_call", "custom_tool_call"}:
++                    continue
++                field = "arguments" if kind == "function_call" else "input"
++                value = self.response_parts.get((index, field, 0), "")
++                valid_json = None
++                if kind == "function_call":
++                    try:
++                        json.loads(value)
++                        valid_json = True
++                    except (TypeError, json.JSONDecodeError):
++                        valid_json = False
++                tool_calls.append({
++                    "index": index, "id": item.get("id"), "call_id": item.get("call_id"),
++                    "type": kind, "name": item.get("name"), "argument_chars": len(value),
++                    "arguments_sha256": hashlib.sha256(value.encode()).hexdigest(),
++                    "arguments_json_valid": valid_json,
++                })
++            self.response_output_count = len(self.response_items)
++            self.response_output_types = output_types
++            if self.terminal_response_status == "completed" and not any(
++                kind.endswith("_call") for kind in output_types
++            ):
++                # A reasoning-only or silent response is not proof of a missing answer.
++                if output_types.get("message") and not content.strip():
++                    content_anomalies.append("empty_completed_message")
++                if content.strip() == "</｜end▁of▁thinking｜>":
++                    content_anomalies.append("reasoning_marker_only_answer")
+         return {
+             "sse_events": self.events,
+             "sse_json_events": self.json_events,
+@@ -284,12 +393,14 @@
+             "response_output_count": self.response_output_count,
+             "response_output_types": dict(sorted(self.response_output_types.items())),
+             "finish_reasons": sorted(self.finish_reasons),
+-            "content_chars": self.content_chars,
+-            "reasoning_chars": self.reasoning_chars,
++            "content_chars": content_chars,
++            "reasoning_chars": reasoning_chars,
++            "reasoning_summary_chars": len(summaries) if self.is_responses else 0,
++            "content_anomalies": content_anomalies,
+             "tool_fragments": self.tool_fragments,
+             "tool_calls": tool_calls,
+             "raw_tool_markers": self.raw_tool_markers,
+-            "replacement_chars": self.replacement_chars,
++            "replacement_chars": replacement_chars,
+         }
+ 
+ 
+@@ -364,6 +475,12 @@
+         choices = payload.get("choices") or []
+         summary["finish_reasons"] = sorted({str(c.get("finish_reason")) for c in choices if c.get("finish_reason")})
+         summary["tool_calls"] = sum(len(((c.get("message") or {}).get("tool_calls") or [])) for c in choices)
++        if payload.get("object") == "response" or (
++            "output" in payload and "status" in payload
++        ):
++            recorder = StreamSummary()
++            recorder._payload({"type": "response.completed", "response": payload})
++            summary.update(recorder.as_dict())
+         messages = payload.get("messages") or []
+         if isinstance(messages, list):
+             roles: dict[str, int] = {}
+@@ -517,7 +634,7 @@
+                     if not delivered:
+                         continue
+                     response_bytes.extend(delivered)
+-                    stream_summary.feed(delivered)
++                    stream_summary.feed(delivered, observed_ns=time.monotonic_ns())
+                     try:
+                         await downstream.write(delivered)
+                     except (ConnectionResetError, RuntimeError):
+@@ -532,7 +649,7 @@
+                     )
+                 if tail and not client_disconnected:
+                     response_bytes.extend(tail)
+-                    stream_summary.feed(tail)
++                    stream_summary.feed(tail, observed_ns=time.monotonic_ns())
+                     try:
+                         await downstream.write(tail)
+                     except (ConnectionResetError, RuntimeError):
+@@ -554,7 +671,7 @@
+         response_body = bytes(response_bytes)
+         response_capture = writer.capture(trace_id, "response", response_body, args.capture_limit)
+         summary = stream_summary.as_dict() if "text/event-stream" in content_type else summarize_json(response_body)
+-        anomalies: list[str] = []
++        anomalies: list[str] = list(summary.get("content_anomalies") or [])
+         if status >= 400:
+             anomalies.append(f"http_{status}")
+         if client_disconnected:
+@@ -566,13 +683,15 @@
+             anomalies.append(f"response_{terminal_response_status}")
+         if summary.get("replacement_chars"):
+             anomalies.append("unicode_replacement")
+-        if summary.get("raw_tool_markers") and not summary.get("tool_fragments"):
++        if summary.get("raw_tool_markers") and not summary.get("tool_fragments") and not summary.get("tool_calls"):
+             anomalies.append("raw_tool_marker_without_structured_call")
+         finished_ns = time.monotonic_ns()
+         await writer.write({
+             "event": "request_end", "trace_id": trace_id, "status": status,
+             "content_type": content_type, "capture": response_capture, "response_summary": summary,
+             "ttfb_ms": None if first_byte_ns is None else (first_byte_ns - started_ns) / 1_000_000,
++            "first_answer_ms": None if stream_summary.first_answer_ns is None else (stream_summary.first_answer_ns - started_ns) / 1_000_000,
++            "first_reasoning_ms": None if stream_summary.first_reasoning_ns is None else (stream_summary.first_reasoning_ns - started_ns) / 1_000_000,
+             "elapsed_ms": (finished_ns - started_ns) / 1_000_000,
+             "client_disconnected": client_disconnected, "anomalies": anomalies,
+         })
+--- a/test_flight_recorder.py
++++ b/test_flight_recorder.py
+@@ -44,7 +44,8 @@
+             await response.prepare(request)
+             chunks = [
+                 b'data: {"type":"response.created","response":{"id":"resp-test","model":"mock","output":[]}}\n\n',
+-                b'data: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg-test","type":"message"}}\n\n',
++                b'data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"item_id":"msg-test","delta":"ok"}\n\n',
++                b'data: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg-test","type":"message","content":[{"type":"output_text","text":"ok"}]}}\n\n',
+                 b'data: {"type":"response.completed","response":{"id":"resp-test","model":"mock","status":"completed","output":[]}}\n\n',
+                 b"data: [DONE]\n\n",
+             ]
+@@ -128,7 +129,7 @@
+                         if line.startswith(b"data:") and b'"response.completed"' in line
+                     )
+                     assert terminal["response"]["output"] == [
+-                        {"id": "msg-test", "type": "message"},
++                        {"id": "msg-test", "type": "message", "content": [{"type": "output_text", "text": "ok"}]},
+                     ]
+             assert received_authorization
+             event_file = next(Path(temp).glob("events-*.jsonl"))
+@@ -145,6 +146,11 @@
+             assert summary["tool_calls"][0]["arguments_json_valid"] is True
+             assert summary["tool_calls"][0]["argument_chars"] == 2
+             assert summary["finish_reasons"] == ["tool_calls"]
++            responses_end = next(e for e in ends if e["response_summary"].get("response_output_types", {}).get("message"))
++            assert responses_end["response_summary"]["content_chars"] == 2
++            assert responses_end["first_answer_ms"] >= responses_end["ttfb_ms"]
++            assert responses_end["first_reasoning_ms"] is None
++            assert responses_end["anomalies"] == []
+             for event in ends:
+                 capture = Path(event["capture"]["path"])
+                 assert capture.stat().st_mode & 0o777 == 0o600
+--- /dev/null
++++ b/test_responses_summary.py
+@@ -0,0 +1,117 @@
++import gzip
++import json
++import unittest
++from pathlib import Path
++
++from flight_recorder import StreamSummary, summarize_json
++
++
++def event(summary, kind, observed_ns=10, **fields):
++    wire = ('data: ' + json.dumps({'type': kind, **fields}, ensure_ascii=False) + '\n\n').encode()
++    # Fragment Unicode and SSE lines, as real TCP streams may do.
++    for start in range(0, len(wire), 7):
++        summary.feed(wire[start:start + 7], observed_ns=observed_ns)
++
++
++class ResponsesSummaryTests(unittest.TestCase):
++    def test_parts_and_terminal_reconciliation_without_double_counting(self):
++        s = StreamSummary()
++        event(s, 'response.output_item.added', output_index=0, item={'id': 'r1', 'type': 'reasoning'})
++        event(s, 'response.reasoning_text.delta', 20, output_index=0, content_index=0, item_id='r1', delta='think')
++        event(s, 'response.reasoning_summary_text.delta', 25, output_index=0, summary_index=0, item_id='r1', delta='brief')
++        event(s, 'response.output_item.added', output_index=1, item={'id': 'm1', 'type': 'message'})
++        event(s, 'response.output_text.delta', 30, output_index=1, content_index=0, item_id='m1', delta='hi')
++        event(s, 'response.output_text.delta', 31, output_index=1, content_index=1, item_id='m1', delta='🙂')
++        output = [
++            {'id': 'r1', 'type': 'reasoning', 'content': [{'type': 'reasoning_text', 'text': 'think'}], 'summary': [{'type': 'summary_text', 'text': 'brief'}]},
++            {'id': 'm1', 'type': 'message', 'content': [{'type': 'output_text', 'text': 'hi'}, {'type': 'output_text', 'text': '🙂'}]},
++        ]
++        for i, item in enumerate(output):
++            event(s, 'response.output_item.done', output_index=i, item=item)
++        event(s, 'response.completed', response={'id': 'resp1', 'status': 'completed', 'output': output})
++        result = s.as_dict()
++        self.assertEqual((result['content_chars'], result['reasoning_chars'], result['reasoning_summary_chars']), (3, 5, 5))
++        self.assertEqual((s.first_reasoning_ns, s.first_answer_ns), (20, 30))
++        self.assertEqual(result['content_anomalies'], [])
++        self.assertEqual(result['response_output_types'], {'message': 1, 'reasoning': 1})
++
++    def test_parallel_function_and_custom_tools_keep_both_identities(self):
++        s = StreamSummary()
++        items = [
++            {'type': 'function_call', 'id': 'fc1', 'call_id': 'call1', 'name': 'read'},
++            {'type': 'custom_tool_call', 'id': 'ct2', 'call_id': 'call2', 'name': 'shell'},
++        ]
++        for i, item in enumerate(items):
++            event(s, 'response.output_item.added', output_index=i, item=item)
++        event(s, 'response.function_call_arguments.delta', output_index=0, item_id='fc1', delta='{"a":')
++        event(s, 'response.custom_tool_call_input.delta', output_index=1, item_id='ct2', delta='echo hi')
++        event(s, 'response.function_call_arguments.delta', output_index=0, item_id='fc1', delta='1}')
++        items[0]['arguments'] = '{"a":1}'
++        items[1]['input'] = 'echo hi'
++        for i, item in enumerate(items):
++            event(s, 'response.output_item.done', output_index=i, item=item)
++        event(s, 'response.completed', response={'status': 'completed', 'output': items})
++        calls = s.as_dict()['tool_calls']
++        self.assertEqual([(c['id'], c['call_id']) for c in calls], [('fc1', 'call1'), ('ct2', 'call2')])
++        self.assertEqual([c['argument_chars'] for c in calls], [7, 7])
++        self.assertEqual([c['arguments_json_valid'] for c in calls], [True, None])
++        self.assertEqual(s.as_dict()['tool_fragments'], 3)
++        self.assertEqual(s.as_dict()['content_anomalies'], [])
++
++    def test_terminal_only_and_nonstreaming_fallback(self):
++        response = {'object': 'response', 'id': 'r', 'status': 'completed', 'output': [
++            {'type': 'reasoning', 'id': 'rs', 'content': [{'type': 'reasoning_text', 'text': 'why'}]},
++            {'type': 'message', 'id': 'msg', 'content': [{'type': 'output_text', 'text': 'answer'}]},
++            {'type': 'function_call', 'id': 'fc', 'call_id': 'call', 'name': 'f', 'arguments': '{}'},
++        ]}
++        s = StreamSummary()
++        event(s, 'response.completed', response=response)
++        result = summarize_json(json.dumps(response).encode())
++        self.assertEqual((result['content_chars'], result['reasoning_chars']), (6, 3))
++        self.assertEqual(result['tool_calls'][0]['call_id'], 'call')
++        self.assertEqual(result['tool_calls'], s.as_dict()['tool_calls'])
++        self.assertIsNone(s.first_answer_ns)  # Terminal arrival is not generation time.
++
++    def test_empty_silent_reasoning_tools_and_marker_semantics(self):
++        cases = [
++            ([], []),
++            ([{'type': 'reasoning', 'content': [{'text': 'thinking'}]}], []),
++            ([{'type': 'message', 'content': []}], ['empty_completed_message']),
++            ([{'type': 'message', 'content': []}, {'type': 'web_search_call', 'id': 'web'}], []),
++            ([{'type': 'message', 'content': []}, {'type': 'function_call', 'call_id': 'c', 'arguments': '{}'}], []),
++            ([{'type': 'message', 'content': [{'type': 'refusal', 'refusal': 'Cannot do that'}]}], []),
++            ([{'type': 'message', 'content': [{'text': '</｜end▁of▁thinking｜>'}]}], ['reasoning_marker_only_answer']),
++            ([{'type': 'message', 'content': [{'text': 'Quoted </｜end▁of▁thinking｜> here.'}]}], []),
++        ]
++        for output, expected in cases:
++            with self.subTest(output=output):
++                result = summarize_json(json.dumps({'object': 'response', 'status': 'completed', 'output': output}).encode())
++                self.assertEqual(result['content_anomalies'], expected)
++
++    def test_saved_five_captures_against_completed_items(self):
++        root = Path('/opt/project/model-flight-recorder-data/proxy/captures/20261020')
++        ids = ['e76811c37596476a9928c3c440b28f00', '9a75b923484f4a86a470d61a39bffaf0', '86db7d1e9f7942d8acb04683312e842d', '41d565994bb54a7ba0c53ae8c823cffa', '004fb674040a47399078487eed43a557']
++        if not root.exists():
++            self.skipTest('Private captures remain on their source host')
++        for trace in ids:
++            with self.subTest(trace=trace):
++                with gzip.open(root / (trace + '.response.gz'), 'rb') as capture:
++                    raw = capture.read()
++                s = StreamSummary()
++                for i in range(0, len(raw), 997):
++                    s.feed(raw[i:i + 997])
++                s.finish()
++                terminal = next(json.loads(line[5:])['response'] for line in raw.splitlines() if line.startswith(b'data:') and b'response.completed' in line)
++                expected = {'message': 0, 'reasoning': 0}
++                for item in terminal['output']:
++                    if item['type'] in expected:
++                        expected[item['type']] += sum(len(part.get('text', '')) for part in item.get('content', []))
++                result = s.as_dict()
++                self.assertEqual(result['content_chars'], expected['message'])
++                self.assertEqual(result['reasoning_chars'], expected['reasoning'])
++                self.assertEqual(result['content_anomalies'], ['reasoning_marker_only_answer'] if trace == ids[0] else [])
++                self.assertIsNone(s.first_answer_ns)
++
++
++if __name__ == '__main__':
++    unittest.main()

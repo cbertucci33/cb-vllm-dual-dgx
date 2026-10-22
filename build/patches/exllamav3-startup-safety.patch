@@ -1,0 +1,226 @@
+--- a/exllamav3/exllamav3_ext/quant/coop_autotune.cu
++++ b/exllamav3/exllamav3_ext/quant/coop_autotune.cu
+@@ -124,7 +124,7 @@
+     if (!in) return false;
+     if (std::memcmp(header.magic, DISK_CACHE_MAGIC, sizeof(header.magic)) != 0) return false;
+     if (header.format != DISK_CACHE_FORMAT) return false;
+-    if (header.record_size < sizeof(DiskCacheRecordV1)) return false;
++    if (header.record_size != sizeof(DiskCacheRecordV1)) return false;
+     return true;
+ }
+ 
+@@ -144,11 +144,9 @@
+     in.read((char*) &header, sizeof(header));
+     if (!in) return;
+ 
+-    std::vector<char> record_bytes(header.record_size);
+-    while (in.read(record_bytes.data(), header.record_size))
+-    {
+-        DiskCacheRecordV1 record;
+-        std::memcpy(&record, record_bytes.data(), sizeof(record));
++    DiskCacheRecordV1 record;
++    while (in.read(reinterpret_cast<char*>(&record), sizeof(record)))
++    {
+         disk_cache[record.hash] = record;
+     }
+ 
+@@ -475,10 +473,23 @@
+     }
+     TORCH_CHECK(!candidates.empty(), "CoopKernelAutotuner: no candidates");
+ 
+-    cudaEvent_t start;
+-    cudaEvent_t end;
+-    cuda_check(cudaEventCreate(&start));
+-    cuda_check(cudaEventCreate(&end));
++    struct TimingEvent {
++        cudaEvent_t handle = nullptr;
++        TimingEvent() { cuda_check(cudaEventCreate(&handle)); }
++        ~TimingEvent() {
++            if (!handle) return;
++            auto error = cudaEventDestroy(handle);
++            if (error != cudaSuccess)
++                fprintf(stderr, "EXL3 timing-event cleanup: %s\n", cudaGetErrorString(error));
++        }
++        void close() {
++            cuda_check(cudaEventDestroy(handle));
++            handle = nullptr;
++        }
++        operator cudaEvent_t() const { return handle; }
++    };
++    TimingEvent start;
++    TimingEvent end;
+ 
+     int repeats = 10;
+     if (numel_B > 1e6) repeats = 6;
+@@ -503,8 +514,8 @@
+     if (candidates.size() > 1)
+         measure_stage(candidates, kernel_args, smem, stream, MIN(64, max_rounds), repeats, 1, start, end);
+ 
+-    cuda_check(cudaEventDestroy(start));
+-    cuda_check(cudaEventDestroy(end));
++    end.close();
++    start.close();
+ 
+     const ExpandedCandidate& best = candidates[0];
+     return { best.kernel, best.block_dim, best.num_sms, best.concurrency, best.tag };
+--- a/exllamav3/exllamav3_ext/quant/exl3_devctx.cu
++++ b/exllamav3/exllamav3_ext/quant/exl3_devctx.cu
+@@ -1,6 +1,7 @@
+ #include <cuda_fp16.h>
+ #include <c10/cuda/CUDAGuard.h>
+ #include <ATen/cuda/CUDAContext.h>
++#include <ATen/Functions.h>
+ #include <cooperative_groups.h>
+ namespace cg = cooperative_groups;
+ #include "exl3_devctx.cuh"
+@@ -23,6 +24,7 @@
+ 
+ int DevCtx::get_num_sms(int device)
+ {
++    TORCH_CHECK(device >= 0 && device < MAX_DEVICES, "EXL3 device index out of range");
+     std::lock_guard<std::mutex> lock(mtx);
+     if (!num_sms[device])
+         cuda_check(cudaDeviceGetAttribute(&num_sms[device], cudaDevAttrMultiProcessorCount, device));
+@@ -31,6 +33,7 @@
+ 
+ int DevCtx::get_cc(int device)
+ {
++    TORCH_CHECK(device >= 0 && device < MAX_DEVICES, "EXL3 device index out of range");
+     std::lock_guard<std::mutex> lock(mtx);
+     if (!cc[device])
+     {
+@@ -47,26 +50,31 @@
+ 
+ void* DevCtx::get_ws(int device)
+ {
++    TORCH_CHECK(device >= 0 && device < MAX_DEVICES, "EXL3 device index out of range");
+     std::lock_guard<std::mutex> lock(mtx);
+-    if (!ws[device])
++    if (!ws[device].defined())
+     {
+-        cudaSetDevice(device);
+-        cudaMalloc(&ws[device], WORKSPACE_SIZE);
++        c10::cuda::CUDAGuard guard(device);
++        ws[device] = at::empty({WORKSPACE_SIZE}, at::TensorOptions().dtype(at::kByte).device(at::kCUDA, device));
+     }
+-    return ws[device];
++    return ws[device].data_ptr();
+ }
+ 
+ int* DevCtx::get_locks(int device)
+ {
++    TORCH_CHECK(device >= 0 && device < MAX_DEVICES, "EXL3 device index out of range");
+     std::lock_guard<std::mutex> lock(mtx);
+-    if (!locks[device])
++    if (!locks[device].defined())
+     {
+-        cudaSetDevice(device);
+-        size_t size = (MAX_TILES_C + MAX_BARRIERS * 2) * sizeof(int);
+-        cudaMalloc(&locks[device], size);
+-        cudaMemset(locks[device], 0, size);
++        c10::cuda::CUDAGuard guard(device);
++        size_t elements = MAX_TILES_C + MAX_BARRIERS * 2;
++        auto initialized = at::empty({static_cast<int64_t>(elements)}, at::TensorOptions().dtype(at::kInt).device(at::kCUDA, device));
++        auto stream = at::cuda::getCurrentCUDAStream(device).stream();
++        cuda_check(cudaMemsetAsync(initialized.data_ptr(), 0, elements * sizeof(int), stream));
++        cuda_check(cudaStreamSynchronize(stream));
++        locks[device] = std::move(initialized);
+     }
+-    return (int*) locks[device];
++    return locks[device].data_ptr<int>();
+ }
+ 
+ int g_get_cc(int device)
+--- a/exllamav3/exllamav3_ext/quant/exl3_devctx.cuh
++++ b/exllamav3/exllamav3_ext/quant/exl3_devctx.cuh
+@@ -2,6 +2,7 @@
+ 
+ #include <tuple>
+ #include <mutex>
++#include <ATen/Tensor.h>
+ 
+ // Max allowable output size, in tiles. Used to allocate global lock buffer per device for sync across threadblocks
+ #define MAX_TILES_C (1024 * 1024)
+@@ -25,8 +26,8 @@
+ private:
+     int num_sms[MAX_DEVICES] = {};
+     int cc[MAX_DEVICES] = {};
+-    void* locks[MAX_DEVICES] = {};
+-    void* ws[MAX_DEVICES] = {};
++    at::Tensor locks[MAX_DEVICES];
++    at::Tensor ws[MAX_DEVICES];
+     std::mutex mtx;
+ 
+ public:
+--- a/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
++++ b/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
+@@ -151,7 +151,7 @@
+ 
+     // Device properties
+     int device;
+-    cudaGetDevice(&device);
++    cuda_check(cudaGetDevice(&device));
+     int num_sms = force_num_sms ? force_num_sms : DevCtx::instance().get_num_sms(device);
+     int cc = DevCtx::instance().get_cc(device);
+     int* locks = DevCtx::instance().get_locks(device);
+@@ -255,16 +255,16 @@
+         force_shape_idx, &block_dim, &shape_idx,
+         &num_sms, cb
+     );
+-    if (!kernel) return 0;
++    TORCH_CHECK(kernel, "No EXL3 kernel supports the requested shape");
+ 
+     // Launch
+     if (kernel_attr_set[device].find((void*) kernel) == kernel_attr_set[device].end())
+     {
+-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
++        cuda_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX));
+         kernel_attr_set[device].insert((void*) kernel);
+         cuda_check(cudaPeekAtLastError());
+     }
+-    cudaLaunchCooperativeKernel
++    cuda_check(cudaLaunchCooperativeKernel
+     (
+         (void*) kernel,
+         num_sms,
+@@ -272,7 +272,7 @@
+         kernelArgs,
+         SMEM_MAX,
+         stream
+-    );
++    ));
+     add_graph_args((void*) kernel);
+ 
+     cuda_check(cudaPeekAtLastError());
+@@ -391,7 +391,7 @@
+ 
+     // Device properties
+     int device;
+-    cudaGetDevice(&device);
++    cuda_check(cudaGetDevice(&device));
+     int total_sms = DevCtx::instance().get_num_sms(device);
+     int num_sms = force_num_sms ? force_num_sms : total_sms;
+     int cc = DevCtx::instance().get_cc(device);
+@@ -522,11 +522,11 @@
+     // Launch
+     if (kernel_attr_set[device].find((void*) kernel) == kernel_attr_set[device].end())
+     {
+-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
++        cuda_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX));
+         kernel_attr_set[device].insert((void*) kernel);
+     }
+ 
+-    cudaLaunchCooperativeKernel
++    cuda_check(cudaLaunchCooperativeKernel
+     (
+         (void*) kernel,
+         block_grid,
+@@ -534,7 +534,7 @@
+         kernelArgs,
+         SMEM_MAX,
+         stream
+-    );
++    ));
+     add_graph_args((void*) kernel);
+ 
+     cuda_check(cudaPeekAtLastError());

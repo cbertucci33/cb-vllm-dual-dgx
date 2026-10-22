@@ -33,6 +33,7 @@ from vllm.multimodal.inputs import (
     MultiModalSharedField,
     NestedTensors,
 )
+from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.utils import tensor_data
 
 logger = init_logger(__name__)
@@ -56,8 +57,7 @@ bytestr: TypeAlias = bytes | bytearray | memoryview | zmq.Frame
 class OOBTensorConsumer(ABC):
     @abstractmethod
     def __call__(self, tensor: torch.Tensor) -> dict | None:
-        """
-        Called with tensors for the current message.
+        """Called with tensors for the current message.
         Returns None to reject the tensor (falls back to regular serialization),
         otherwise a dict with arbitrary placeholder data to be included
         in the serialized message.
@@ -324,8 +324,11 @@ class MsgpackDecoder:
         t: Any | None = None,
         share_mem: bool = True,
         oob_tensor_provider: OOBTensorProvider | None = None,
+        *,
+        pin_tensors: bool | None = None,
     ):
         self.share_mem = share_mem
+        self.pin_tensors = PIN_MEMORY if pin_tensors is None else pin_tensors
         args = () if t is None else (t,)
         self.decoder = msgpack.Decoder(
             *args, ext_hook=self.ext_hook, dec_hook=self.dec_hook
@@ -413,9 +416,12 @@ class MsgpackDecoder:
         # Create uint8 array
         arr = torch.frombuffer(buffer, dtype=torch.uint8)
         # Clone ensures tensor is backed by pytorch-owned memory for safe
-        # future async CPU->GPU transfer, which stages it through pinned memory.
-        if not is_aux or not self.share_mem:
+        # future async CPU->GPU transfer.
+        # Pin larger tensors for more efficient CPU->GPU transfer.
+        if not is_aux:
             arr = arr.clone()
+        elif not self.share_mem:
+            arr = arr.pin_memory() if self.pin_tensors else arr.clone()
         # Convert back to proper shape & type
         return arr.view(torch_dtype).view(shape)
 
@@ -484,8 +490,7 @@ def run_method(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> Any:
-    """
-    Run a method of an object with the given arguments and keyword arguments.
+    """Run a method of an object with the given arguments and keyword arguments.
     If the method is string, it will be converted to a method using getattr.
     If the method is serialized bytes and will be deserialized using
     cloudpickle.
@@ -523,14 +528,13 @@ class PydanticMsgspecMixin:
     def __get_pydantic_core_schema__(
         cls, source_type: Any, handler: GetCoreSchemaHandler
     ) -> core_schema.CoreSchema:
-        """
-        Make msgspec.Struct compatible with Pydantic, respecting defaults.
+        """Make msgspec.Struct compatible with Pydantic, respecting defaults.
         Handle JSON=>msgspec.Struct. Used when exposing msgspec.Struct to the
         API as input or in `/docs`. Note this is cached by Pydantic and not
         called on every validation.
         """
         msgspec_fields = {f.name: f for f in msgspec.structs.fields(source_type)}
-        type_hints = get_type_hints(source_type)
+        type_hints = get_type_hints(source_type, include_extras=True)
 
         # Build the Pydantic typed_dict_field for each msgspec field
         fields = {}

@@ -9,11 +9,10 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from functools import cached_property
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import regex as re
 
-from vllm.entrypoints.chat_utils import get_tool_call_id_type, make_tool_call_id
 from vllm.entrypoints.generate.base.protocol import (
     DeltaFunctionCall,
     DeltaMessage,
@@ -25,8 +24,16 @@ from vllm.entrypoints.generate.base.protocol import (
 from vllm.logger import init_logger
 from vllm.parser.abstract_parser import Parser, StreamState
 from vllm.parser.engine.events import EventType, SemanticEvent
-from vllm.parser.engine.parser_engine_config import ParserEngineConfig, ParserState
-from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
+from vllm.parser.engine.parser_engine_config import (
+    ArgValueExtender,
+    ParserEngineConfig,
+    ParserState,
+)
+from vllm.parser.engine.streaming_parser_engine import (
+    StreamingParserEngine,
+    TokenReasoningCounter,
+)
+from vllm.renderers.chat_utils import get_tool_call_id_type, make_tool_call_id
 from vllm.tool_parsers.utils import (
     coerce_to_schema_type,
     extract_types_from_schema,
@@ -45,6 +52,13 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+class ReasoningEnd(NamedTuple):
+    """Where reasoning ends in a token sequence."""
+
+    offset: int  # index of the first end token, or the sequence length
+    implicit: bool  # the end token is also content, e.g. a tool-call start
+
+
 class ToolCallSlot:
     __slots__ = (
         "id",
@@ -53,7 +67,10 @@ class ToolCallSlot:
         "_args_joined",
         "name_sent",
         "string_keys",
-        "streamed_json",
+        "_streamed_parts",
+        "_streamed_joined",
+        "extend_open_value",
+        "open_value_streams",
     )
 
     def __init__(self) -> None:
@@ -63,7 +80,10 @@ class ToolCallSlot:
         self._args_joined: str | None = ""
         self.name_sent: bool = False
         self.string_keys: set[str] | None = None
-        self.streamed_json: str = ""
+        self._streamed_parts: list[str] = []
+        self._streamed_joined: str | None = ""
+        self.extend_open_value: ArgValueExtender | None = None
+        self.open_value_streams: bool = False
 
     @property
     def args(self) -> str:
@@ -75,13 +95,31 @@ class ToolCallSlot:
         self._args_parts.append(value)
         self._args_joined = None
 
+    @property
+    def streamed_json(self) -> str:
+        if self._streamed_joined is None:
+            self._streamed_joined = "".join(self._streamed_parts)
+        return self._streamed_joined
+
+    @streamed_json.setter
+    def streamed_json(self, value: str) -> None:
+        self._streamed_parts = [value]
+        self._streamed_joined = value
+
+    def append_streamed(self, value: str) -> None:
+        self._streamed_parts.append(value)
+        self._streamed_joined = None
+
 
 class ParserEngine(Parser):
-    """A :class:`Parser` backed by a single declarative engine config.
+    """A :class:`Parser` backed by a single deoperatortive engine config.
 
     Subclasses set the ``ParserEngineConfig`` in ``__init__`` to define the
     complete output format for a model (reasoning + tool calls).
     """
+
+    token_id_reasoning_accounting = False
+    token_id_text_alignment = False
 
     def __init__(
         self,
@@ -105,8 +143,13 @@ class ParserEngine(Parser):
         self._tool_parser = None
         self.parser_engine_config = parser_engine_config
         self._engine = StreamingParserEngine(
-            parser_engine_config, tokenizer, vocab=self.vocab
+            parser_engine_config,
+            tokenizer,
+            vocab=self.vocab,
+            track_token_positions=self.token_id_text_alignment,
         )
+        # Text-only parsing does not require a tokenizer with control IDs.
+        self._token_reasoning_counter: TokenReasoningCounter | None = None
 
         self._has_reasoning = (
             "THINK_END" in parser_engine_config.token_id_terminals
@@ -126,6 +169,7 @@ class ParserEngine(Parser):
 
         self._arg_converter = parser_engine_config.arg_converter
         self._arg_structural_chars = parser_engine_config.arg_structural_chars
+        self._arg_value_extender = parser_engine_config.arg_value_extender
         self._stream_arg_deltas = parser_engine_config.stream_arg_deltas
         self._strip_trailing_reasoning_ws = (
             parser_engine_config.strip_trailing_reasoning_whitespace
@@ -193,10 +237,14 @@ class ParserEngine(Parser):
     def initialize_streaming(
         self,
         initial_state: ParserState | None = None,
+        *,
+        prompt_token_ids: Sequence[int] | None = None,
     ) -> None:
         if not self._streaming_initialized:
             self._streaming_initialized = True
             self._reset(initial_state=initial_state)
+            if prompt_token_ids is not None:
+                self._engine.set_prompt_token_ids(prompt_token_ids)
 
     def adjust_initial_state_from_prompt(self, prompt_token_ids: Sequence[int]) -> None:
         """See :meth:`ReasoningParser.adjust_initial_state_from_prompt`."""
@@ -210,6 +258,8 @@ class ParserEngine(Parser):
 
     def _reset(self, initial_state: ParserState | None = None) -> None:
         self._engine.reset(initial_state=initial_state)
+        if self._token_reasoning_counter is not None:
+            self._token_reasoning_counter.reset(initial_state=initial_state)
         self._reasoning_ended = not self._has_reasoning
         self._tool_slots.clear()
         self._deferred_content = ""
@@ -236,6 +286,19 @@ class ParserEngine(Parser):
         delta_token_ids: Sequence[int],
     ) -> list[SemanticEvent]:
         delta_text, delta_token_ids = self._preprocess_feed(delta_text, delta_token_ids)
+        counter = self._token_reasoning_counter
+        if counter is None and self.token_id_reasoning_accounting and delta_token_ids:
+            counter = TokenReasoningCounter(
+                self.parser_engine_config,
+                self.model_tokenizer,
+                initial_state=self._engine.state,
+                vocab=self.vocab,
+            )
+            self._token_reasoning_counter = counter
+        if counter is not None:
+            counter.skip_tool_parsing = self.skip_tool_parsing
+            counter.skip_reasoning_parsing = self.skip_reasoning_parsing
+            counter.feed_token_ids(delta_token_ids)
         return self._engine.feed(delta_text, delta_token_ids)
 
     # ── Schema-aware type correction ─────────────────────────────────
@@ -296,7 +359,9 @@ class ParserEngine(Parser):
         return args, changed
 
     @staticmethod
-    def _safe_arg_prefix(json_str: str, string_keys: set[str] | None = None) -> str:
+    def _safe_arg_prefix(
+        json_str: str, string_keys: set[str] | None = None
+    ) -> tuple[str, bool]:
         """Return the prefix of *json_str* up to the last top-level value.
 
         Middle values (followed by a comma) are stable across streaming
@@ -306,6 +371,11 @@ class ParserEngine(Parser):
         String values for keys in ``string_keys`` are prefix-stable, so stream
         their unterminated content instead of buffering long arguments until
         the closing tag arrives.
+
+        Also returns whether the returned prefix stops inside that trailing
+        string, so streamed text may be appended to it.  This holds even when
+        *json_str* closes the string: converters serialise an open raw value
+        as a closed JSON string.
         """
         last_colon = -1
         last_key: str | None = None
@@ -338,14 +408,14 @@ class ParserEngine(Parser):
                 last_key = pending_key
                 pending_key = None
         if last_colon < 0:
-            return ""
+            return "", False
         end = last_colon + 1
         while end < len(json_str) and json_str[end] in (" ", "\t", "\n", "\r"):
             end += 1
         if end >= len(json_str) or json_str[end] != '"':
-            return json_str[:end]
+            return json_str[:end], False
         if string_keys is not None and last_key not in string_keys:
-            return json_str[:end]
+            return json_str[:end], False
 
         escape = False
         for i in range(end + 1, len(json_str)):
@@ -357,8 +427,8 @@ class ParserEngine(Parser):
                 escape = True
                 continue
             if c == '"':
-                return json_str[:i]
-        return json_str
+                return json_str[:i], True
+        return json_str, True
 
     @staticmethod
     def _streamable_string_keys(properties: dict) -> set[str] | None:
@@ -452,6 +522,27 @@ class ParserEngine(Parser):
         *,
         finished: bool,
     ) -> DeltaMessage | None:
+        # Chat Completions accumulates fields rather than typed output items.
+        # Keep that API, but do not discard segments after a tool call.
+        return self._combine_deltas(
+            self.parse_deltas(
+                delta_text,
+                delta_token_ids,
+                request,
+                prompt_token_ids,
+                finished=finished,
+            )
+        )
+
+    def parse_deltas(
+        self,
+        delta_text: str,
+        delta_token_ids: list[int],
+        request: ChatCompletionRequest | ResponsesRequest,
+        prompt_token_ids: list[int] | None = None,
+        *,
+        finished: bool,
+    ) -> list[DeltaMessage]:
         self._initialize_history_tool_call_cnt(request)
         if not self._prompt_streaming_prepared and prompt_token_ids is not None:
             # NOTE: call the hook BEFORE setting the flag, because the hook
@@ -463,16 +554,16 @@ class ParserEngine(Parser):
         events = self._feed(delta_text, delta_token_ids)
         if finished:
             events.extend(self._engine.finish())
-        result = self._events_to_delta(events, finished=finished)
-        result = self._strip_trailing_reasoning(result)
-
-        # Suppress reasoning deltas if not requested
-        if result and not request.include_reasoning:
-            result.reasoning = None
-            if not result.content and not result.tool_calls:
-                result = None
-
-        return result
+        results = []
+        for raw_delta in self._events_to_deltas(events, finished=finished):
+            delta = self._strip_trailing_reasoning(raw_delta)
+            if delta is not None and not request.include_reasoning:
+                delta.reasoning = None
+                if not delta.content and not delta.tool_calls:
+                    delta = None
+            if delta is not None:
+                results.append(delta)
+        return results
 
     def _strip_trailing_reasoning(
         self,
@@ -638,16 +729,17 @@ class ParserEngine(Parser):
     def reasoning_end_token_ids(self) -> frozenset[int]:
         return self._reasoning_end_token_ids
 
-    def find_reasoning_end_offset(self, token_ids: Sequence[int]) -> int | None:
+    def find_reasoning_end(self, token_ids: Sequence[int]) -> ReasoningEnd | None:
+        """First reasoning end in `token_ids`, and if its token is content."""
         end_ids = self._reasoning_end_token_ids
         if not end_ids:
             return None
         for offset, token_id in enumerate(token_ids):
             if token_id in end_ids:
-                return offset
-        return len(token_ids)
+                return ReasoningEnd(offset, token_id != self._reasoning_end_token_id)
+        return ReasoningEnd(len(token_ids), False)
 
-    def is_reasoning_end(self, input_ids: list[int]) -> bool:
+    def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         config = self.parser_engine_config
         wait_for_reasoning = config.wait_for_reasoning
         if wait_for_reasoning is None:
@@ -672,11 +764,30 @@ class ParserEngine(Parser):
         return not wait_for_reasoning
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
+        config = self.parser_engine_config
+        wait_for_reasoning = config.wait_for_reasoning
+        if wait_for_reasoning is None:
+            wait_for_reasoning = config.initial_state is ParserState.REASONING
+        if not wait_for_reasoning:
+            return input_ids
+
         end_id = self._reasoning_end_token_id
         if end_id is not None:
             for i in range(len(input_ids) - 1, -1, -1):
                 if input_ids[i] == end_id:
                     return input_ids[i + 1 :]
+
+        end_ids = self._reasoning_end_token_ids
+        if end_ids:
+            turn_start = 0
+            boundary_ids = self._turn_boundary_token_ids
+            for i in range(len(input_ids) - 1, -1, -1):
+                if input_ids[i] in boundary_ids:
+                    turn_start = i + 1
+                    break
+            for i in range(turn_start, len(input_ids)):
+                if input_ids[i] in end_ids:
+                    return input_ids[i:]
         return input_ids
 
     def get_streaming_fallback_content(
@@ -688,6 +799,9 @@ class ParserEngine(Parser):
 
     def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:
         """Return reasoning tokens observed by the parser engine so far."""
+        counter = self._token_reasoning_counter
+        if counter is not None and counter._ever_had_token_ids:
+            return counter.reasoning_token_count
         return self._engine.reasoning_token_count
 
     # ── Single-pass parse helper ────────────────────────────────────────
@@ -707,7 +821,7 @@ class ParserEngine(Parser):
         events = self._feed(text, token_ids)
         events.extend(self._engine.finish())
 
-        delta = self._events_to_delta(events, finished=True)
+        delta = self._combine_deltas(self._events_to_deltas(events, finished=True))
         tool_call_info = self._build_extracted_result()
 
         reasoning = delta.reasoning if delta else None
@@ -752,6 +866,55 @@ class ParserEngine(Parser):
         return reasoning, content, tool_calls
 
     # ── Event-to-delta conversion ─────────────────────────────────────
+
+    @classmethod
+    def _combine_deltas(cls, deltas: list[DeltaMessage]) -> DeltaMessage | None:
+        if not deltas:
+            return None
+        if len(deltas) == 1:
+            return deltas[0]
+        calls = [call for delta in deltas for call in delta.tool_calls or []]
+        return DeltaMessage(
+            reasoning="".join(delta.reasoning or "" for delta in deltas) or None,
+            content="".join(delta.content or "" for delta in deltas) or None,
+            tool_calls=cls._coalesce_tool_call_deltas(calls),
+        )
+
+    def _events_to_deltas(
+        self, events: list[SemanticEvent], finished: bool = False
+    ) -> list[DeltaMessage]:
+        # split_delta emits reasoning -> content -> tools within a compound
+        # delta. Start a new segment whenever semantic events reverse that
+        # order, so text between/after calls is neither lost nor reordered.
+        groups: list[list[SemanticEvent]] = [[]]
+        rank = -1
+        for event in events:
+            if event.type == EventType.REASONING_CHUNK:
+                next_rank = 0
+            elif event.type == EventType.TEXT_CHUNK:
+                next_rank = 1
+            elif event.type in (
+                EventType.TOOL_CALL_START,
+                EventType.TOOL_NAME,
+                EventType.ARG_VALUE_CHUNK,
+                EventType.TOOL_CALL_END,
+            ):
+                next_rank = 2
+            else:
+                groups[-1].append(event)
+                continue
+            if next_rank < rank:
+                groups.append([])
+            groups[-1].append(event)
+            rank = next_rank
+        results = []
+        for index, group in enumerate(groups):
+            delta = self._events_to_delta(
+                group, finished=finished and index == len(groups) - 1
+            )
+            if delta is not None:
+                results.append(delta)
+        return results
 
     def _events_to_delta(
         self,
@@ -995,11 +1158,19 @@ class ParserEngine(Parser):
         if not self._stream_arg_deltas:
             return None
 
+        slot = self._tool_slots[idx]
         structural = self._arg_structural_chars
-        if structural is not None and structural.isdisjoint(raw_delta):
+        if slot.extend_open_value is not None:
+            diff = slot.extend_open_value(raw_delta)
+            if diff is not None:
+                if not diff or not slot.open_value_streams:
+                    return None
+                slot.append_streamed(diff)
+                return diff
+            slot.extend_open_value = None
+        elif structural is not None and structural.isdisjoint(raw_delta):
             return None
 
-        slot = self._tool_slots[idx]
         try:
             current_json = converter(slot.args, True)
         except (json.JSONDecodeError, ValueError, TypeError):
@@ -1013,22 +1184,19 @@ class ParserEngine(Parser):
             current_json = self._fix_arg_types(current_json, slot.name)
 
         prev = slot.streamed_json
-        safe_json = self._safe_arg_prefix(current_json, slot.string_keys)
+        safe_json, value_streams = self._safe_arg_prefix(current_json, slot.string_keys)
 
-        if not safe_json or safe_json == prev:
+        if not safe_json:
+            return None
+        if prev and not safe_json.startswith(prev):
             return None
 
-        if prev:
-            if not safe_json.startswith(prev):
-                return None
-            diff = safe_json[len(prev) :]
-        else:
-            diff = safe_json
-
-        if diff:
-            slot.streamed_json = safe_json
-            return diff
-        return None
+        slot.streamed_json = safe_json
+        if self._arg_value_extender is not None:
+            # Deltas that only extend the open value skip the conversion above.
+            slot.extend_open_value = self._arg_value_extender(slot.args)
+            slot.open_value_streams = value_streams
+        return safe_json[len(prev) :] or None
 
     def _flush_arg_converter(self, idx: int) -> str | None:
         converter = self._arg_converter

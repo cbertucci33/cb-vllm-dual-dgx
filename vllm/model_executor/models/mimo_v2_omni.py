@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import replace
 from functools import partial
 from typing import Any
 
@@ -10,16 +11,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import BatchFeature, PretrainedConfig
-from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
+from transformers import BatchFeature, PreTrainedConfig
 from typing_extensions import TypedDict
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.config.multimodal import (
-    BaseDummyOptions,
-    ImageDummyOptions,
-    VideoDummyOptions,
-)
+from vllm.config.multimodal import MultiModalDummyOptions
 from vllm.distributed import parallel_state
 from vllm.distributed import utils as dist_utils
 from vllm.inputs import MultiModalDataDict
@@ -37,7 +34,11 @@ from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
-from vllm.multimodal.parse import ImageSize, MultiModalDataItems
+from vllm.multimodal.parse import (
+    ImageSize,
+    MultiModalDataItems,
+    VideoProcessorItems,
+)
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
@@ -46,11 +47,13 @@ from vllm.multimodal.processing import (
     PromptUpdate,
     PromptUpdateDetails,
 )
+from vllm.multimodal.processing.processor import HFMultiModalInputs
 from vllm.transformers_utils.configs.mimo_v2_omni import Mimo_VLVisionConfig
 from vllm.transformers_utils.processors.mimo_v2_omni import (
     MiMoOmniProcessor,
     VideoAudioInput,
     _format_timestamp,
+    _smart_resize,
 )
 
 from .interfaces import (
@@ -61,7 +64,7 @@ from .interfaces import (
     SupportsQuant,
 )
 from .mimo_audio import MimoAudioEncoder
-from .mimo_v2 import MiMoV2FlashForCausalLM
+from .mimo_v2 import MiMoV2FlashForCausalLM, _check_pending_fp8_qkv_projections
 from .qwen2_5_vl import (
     Qwen2_5_VisionMLP,
     Qwen2_5_VisionPatchEmbed,
@@ -72,7 +75,10 @@ from .qwen2_5_vl import (
     Qwen2_5_VLVideoInputs,
     Qwen2_5_VLVideoPixelInputs,
 )
-from .qwen2_vl import _create_qwen2vl_field_factory
+from .qwen2_vl import (
+    Qwen2VLMultiModalDataParser,
+    _create_qwen2vl_field_factory,
+)
 from .utils import AutoWeightsLoader, IntermediateTensors, WeightsMapper, maybe_prefix
 
 
@@ -89,7 +95,19 @@ class MiMoV2OmniMultiModalInputs(TypedDict, total=False):
 
 
 class MiMoVisionMLP(Qwen2_5_VisionMLP):
-    pass
+    def forward(self, x: torch.Tensor):
+        from vllm.utils.mem_utils import check_startup_memory
+
+        rows = x.numel() // x.shape[-1]
+        gate_up = self.gate_up_proj.output_size_per_partition
+        check_startup_memory(
+            device_bytes=rows
+            * x.element_size()
+            * (gate_up + gate_up // 2 + self.down_proj.output_size),
+            label="MiMo vision gate/up, activation and down projection",
+            device=x.device,
+        )
+        return super().forward(x)
 
 
 class MiMoVisionPatchEmbed(Qwen2_5_VisionPatchEmbed):
@@ -136,6 +154,21 @@ class MiMoVisionPatchMerger(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from vllm.utils.mem_utils import check_startup_memory
+
+        groups = x.numel() // self.hidden_size
+        check_startup_memory(
+            device_bytes=x.nbytes
+            + groups
+            * x.element_size()
+            * (
+                self.mlp[0].output_size_per_partition
+                + self.mlp[0].output_size_per_partition
+                + self.mlp[2].output_size
+            ),
+            label="MiMo vision merger norm, linear/GELU and output",
+            device=x.device,
+        )
         x = self.ln_q(x)
         x = x.view(-1, self.hidden_size)
         out = self.mlp(x)
@@ -232,7 +265,12 @@ class MiMoVisionAttention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: torch.Tensor,
     ) -> torch.Tensor:
-        """Window attention with the per-head sink as a null softmax logit."""
+        """Window attention with the per-head sink applied to key 0.
+
+        The reference adds ``sinks[h]`` to the logit of each sequence's first
+        key, which the Triton prefill kernel supports directly, so the softmax
+        normalizes over the biased scores in one pass.
+        """
         from vllm.v1.attention.ops.triton_prefill_attention import (
             context_attention_fwd,
         )
@@ -258,7 +296,7 @@ class MiMoVisionAttention(nn.Module):
             sliding_window_q=w,
             sliding_window_k=w,
             sinks=sinks,
-            sinks_bias_key0=False,
+            sinks_bias_key0=True,
         )
         return output
 
@@ -271,16 +309,39 @@ class MiMoVisionAttention(nn.Module):
         max_seqlen: torch.Tensor,
         full_attn: bool = True,
     ) -> torch.Tensor:
-        """
-        Args:
-            x: [seq_len, batch=1, embed_dim]  (seq-first convention)
-            cu_seqlens: cumulative sequence lengths [num_seqs+1], int32
-            rotary_pos_emb_cos: [seq_len, qk_channels // 2]
-            rotary_pos_emb_sin: [seq_len, qk_channels // 2]
-            max_seqlen: maximum sequence length
-            full_attn: if True, full attention; if False, window attention
+        """Args:
+        x: [seq_len, batch=1, embed_dim]  (seq-first convention)
+        cu_seqlens: cumulative sequence lengths [num_seqs+1], int32
+        rotary_pos_emb_cos: [seq_len, qk_channels // 2]
+        rotary_pos_emb_sin: [seq_len, qk_channels // 2]
+        max_seqlen: maximum sequence length
+        full_attn: if True, full attention; if False, window attention
+
         """
         # [seq_len, 1, embed_dim] -> QKV projection
+        from vllm.utils.mem_utils import check_startup_memory
+
+        rows = x.numel() // x.shape[-1]
+        q_width = self.num_heads_per_partition * self.qk_channels
+        k_width = self.num_kv_heads_per_partition * self.qk_channels
+        v_width = self.num_kv_heads_per_partition * self.kv_channels
+        context_width = self.num_heads_per_partition * self.kv_channels
+        check_startup_memory(
+            device_bytes=rows
+            * x.element_size()
+            * (
+                q_width
+                + k_width
+                + v_width
+                + q_width
+                + k_width
+                + context_width
+                + context_width
+                + self.embed_dim
+            ),
+            label="MiMo vision QKV, rotary, context/layout and output",
+            device=x.device,
+        )
         qkv, _ = self.qkv(x)  # [seq_len, 1, q_size + kv_size + kv_size]
         seq_len, batch_size, _ = qkv.shape
 
@@ -416,7 +477,7 @@ class MiMoVisionTransformer(nn.Module):
 
     def __init__(
         self,
-        vision_cfg: PretrainedConfig,
+        vision_cfg: PreTrainedConfig,
         *,
         norm_eps: float = 1e-6,
         quant_config: QuantizationConfig | None = None,
@@ -500,6 +561,13 @@ class MiMoVisionTransformer(nn.Module):
     def apply_index(self, tensor: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
         """Reindex tensor at the spatial_merge_unit granularity."""
         tensor = tensor.unflatten(0, (-1, self.spatial_merge_unit))
+        from vllm.utils.mem_utils import check_startup_memory
+
+        check_startup_memory(
+            device_bytes=tensor.nbytes,
+            label="MiMo vision row/column layout copy",
+            device=tensor.device,
+        )
         tensor = tensor[index]
         tensor = tensor.flatten(0, 1)
         return tensor
@@ -527,6 +595,7 @@ class MiMoVisionTransformer(nn.Module):
         Returns:
             cos: [total_tokens, qk_channels // 2]
             sin: [total_tokens, qk_channels // 2]
+
         """
         cos_list, sin_list = [], []
         for i in range(grid_thw.size(0)):
@@ -572,12 +641,12 @@ class MiMoVisionTransformer(nn.Module):
         return torch.cat(cos_list, dim=0), torch.cat(sin_list, dim=0)
 
     def forward(self, x: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
+        """Args:
             x: [total_tokens, C] pre-flattened patches
             grid_thw: [num_images, 3] tensor of (t, h, w) for each image/video
         Returns:
             [merged_tokens, out_hidden_size]
+
         """
         # Ensure grid_thw is a tensor
         if not isinstance(grid_thw, torch.Tensor):
@@ -611,12 +680,7 @@ class MiMoVisionTransformer(nn.Module):
         window_index_1d_col = self.get_window_index_1d(grid_thw, col=True).to(
             device=x.device
         )
-        reverse_window_index_1d_col = torch.empty_like(window_index_1d_col)
-        reverse_window_index_1d_col[window_index_1d_col] = torch.arange(
-            window_index_1d_col.numel(),
-            device=window_index_1d_col.device,
-            dtype=window_index_1d_col.dtype,
-        )
+        reverse_window_index_1d_col = torch.argsort(window_index_1d_col)
 
         # Col-based rotary embeddings (reordered at spatial_merge_unit granularity).
         # apply_index reorders groups of spatial_merge_unit tokens, just like x.
@@ -672,7 +736,96 @@ class MiMoVisionTransformer(nn.Module):
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
+class MiMoV2OmniMultiModalDataParser(Qwen2VLMultiModalDataParser):
+    # Video stays raw: get_video_replacement also reads second_per_grid_ts and
+    # video_start_times, which a metadata-only rewrite would not carry.
+    embedding_fields = {
+        "image": Qwen2VLMultiModalDataParser.embedding_fields["image"],
+    }
+
+
+class MiMoVideoProcessorItems(VideoProcessorItems):
+    def get_item_for_hash(self, index: int) -> Any:
+        item = self.data[index]
+        if isinstance(item, VideoAudioInput):
+            return vars(item)
+        metadata = (
+            self.metadata[index] if isinstance(self.metadata, list) else self.metadata
+        )
+        return (
+            {"frames": super().get_item_for_hash(index), "metadata": metadata}
+            if metadata is not None
+            else super().get_item_for_hash(index)
+        )
+
+    def get_processor_data(self) -> Mapping[str, object]:
+        result = []
+        for index in range(self.get_count()):
+            item = self.get(index)
+            metadata = (
+                self.metadata[index]
+                if isinstance(self.metadata, list)
+                else self.metadata
+            )
+            if metadata is not None and not isinstance(item, VideoAudioInput):
+                item = (item, metadata)
+            result.append(item)
+        return {"videos": result}
+
+    def get_num_frames(self, item_idx: int) -> int:
+        item = self.get(item_idx)
+        if not isinstance(item, VideoAudioInput):
+            return super().get_num_frames(item_idx)
+        frames = item.video[0] if isinstance(item.video, tuple) else item.video
+        return len(frames)
+
+    def get_frame_size(self, item_idx: int) -> ImageSize:
+        item = self.get(item_idx)
+        if not isinstance(item, VideoAudioInput):
+            return super().get_frame_size(item_idx)
+        frames = item.video[0] if isinstance(item.video, tuple) else item.video
+        image = frames[0]
+        if image.shape[-1] in (1, 3, 4):
+            height, width = image.shape[:2]
+        else:
+            _, height, width = image.shape
+        return ImageSize(width=width, height=height)
+
+
+class MiMoDataParser(MiMoV2OmniMultiModalDataParser):
+    def _parse_video_data(self, data):
+        items = [data] if isinstance(data, VideoAudioInput) else data
+        if isinstance(items, (list, tuple)) and any(
+            isinstance(item, VideoAudioInput) for item in items
+        ):
+            normalized: list[Any] = []
+            metadata: list[dict[str, Any] | None] = []
+            for item in items:
+                if isinstance(item, VideoAudioInput):
+                    normalized.append(item)
+                    metadata.append(None)
+                else:
+                    parsed = super()._parse_video_data([item])
+                    if not isinstance(parsed, VideoProcessorItems):
+                        raise ValueError(
+                            "Mixed MiMo video input requires decoded frames"
+                        )
+                    normalized.append(parsed.get(0))
+                    metadata.append(
+                        parsed.metadata[0]
+                        if isinstance(parsed.metadata, list)
+                        else parsed.metadata
+                    )
+            return MiMoVideoProcessorItems(normalized, metadata=metadata)
+        parsed = super()._parse_video_data(data)
+        if isinstance(parsed, VideoProcessorItems):
+            return MiMoVideoProcessorItems(parsed.data, metadata=parsed.metadata)
+        return parsed
+
+
 class MiMoV2OmniProcessingInfo(BaseProcessingInfo):
+    profile_each_modality = True
+
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"audio": None, "image": None, "video": None}
 
@@ -685,25 +838,100 @@ class MiMoV2OmniProcessingInfo(BaseProcessingInfo):
     def get_hf_processor(self, **kwargs: object) -> MiMoOmniProcessor:
         hf_config = self.get_hf_config()
         tokenizer = self.get_tokenizer()
-        return MiMoOmniProcessor.from_hf_config(tokenizer, hf_config)
+        baseline = MiMoOmniProcessor.from_hf_config(
+            tokenizer, hf_config, **self.ctx.get_merged_mm_kwargs({})
+        )
+        candidate = baseline.with_overrides(dict(kwargs))
+        if kwargs:
+            original = baseline.mimo_processor
+            requested = candidate.mimo_processor
+            for modality, fields in (
+                ("_img_kw", ("max_pixels",)),
+                ("_vid_kw", ("max_pixels", "total_max_pixels", "max_frames")),
+            ):
+                before = getattr(original, modality)
+                after = getattr(requested, modality)
+                for name in fields:
+                    if before[name] is not None and (
+                        after[name] is None or after[name] > before[name]
+                    ):
+                        raise ValueError(
+                            f"Request {name} exceeds profiled MiMo bounds; "
+                            "declare it in startup mm_processor_kwargs"
+                        )
+            for name, value in candidate._constructor_kwargs.items():
+                if (
+                    name.startswith("audio_")
+                    and value != baseline._constructor_kwargs[name]
+                ):
+                    raise ValueError(
+                        f"Request {name} differs from profiled MiMo audio settings"
+                    )
+        return candidate
 
     def get_image_processor(self, **kwargs: object):
         return self.get_hf_processor(**kwargs).image_processor
 
     def get_data_parser(self):
-        from vllm.multimodal.parse import MultiModalDataParser
-
-        return MultiModalDataParser(target_sr=24000.0)
+        # Without embedding_fields the EC producer publishes no metadata and
+        # the EPD proxy never rewrites the media item.
+        return MiMoDataParser(
+            self.get_hf_config().vision_config.spatial_merge_size,
+            target_sr=24000.0,
+            expected_hidden_size=self._get_expected_hidden_size(),
+            allow_missing_mm_embeddings=self.allow_missing_mm_embeddings,
+        )
 
     def get_mm_max_tokens_per_item(
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
     ) -> Mapping[str, int]:
-        return {
-            "image": self.get_max_image_tokens(),
-            "video": self.get_max_video_tokens(seq_len, mm_counts),
-        }
+        limits = {}
+        if mm_counts.get("image", 0):
+            limits["image"] = self.get_max_image_tokens()
+        if mm_counts.get("video", 0):
+            limits["video"] = self.get_max_video_tokens(seq_len, mm_counts)
+        if mm_counts.get("audio", 0):
+            limits["audio"] = self._get_audio_profile(seq_len)[1]
+        return limits
+
+    def _get_audio_profile(self, seq_len: int) -> tuple[int, int]:
+        """Return PCM samples and feature tokens for public audio profiling.
+
+        AudioMediaIO already enforces the decoder duration limit. This only
+        sizes profiling inputs; it does not add a limit to audio processing.
+        """
+        processor = self.get_hf_processor().mimo_processor
+        duration = envs.VLLM_MAX_AUDIO_DECODE_DURATION_S
+        if duration <= 0:
+            raise ValueError(
+                "MiMo audio profiling requires a positive decoder duration"
+            )
+        # Each input includes independent audio-start/audio-end wrapper tokens.
+        token_budget = seq_len - 2
+        if token_budget <= 0:
+            raise ValueError("MiMo audio profiling needs room for audio feature tokens")
+
+        def token_count(samples: int) -> int:
+            # Match centered MelSpectrogram, convolution, pooling and grouping
+            # in MiMoVLProcessor.preprocess_audio without allocating a waveform.
+            frames = samples // processor.audio_hop_length + 1
+            encoded = frames + 3 - processor.audio_kernel_size
+            encoded = (
+                encoded + 2 - processor.audio_kernel_size
+            ) // processor.audio_stride_size + 1
+            pooled = math.ceil(encoded / processor.audio_avg_pooler)
+            return math.ceil(pooled / processor.audio_group_size)
+
+        low, high = 0, duration * processor.audio_sampling_rate
+        while low < high:
+            middle = (low + high + 1) // 2
+            if token_count(middle) <= token_budget:
+                low = middle
+            else:
+                high = middle - 1
+        return low, token_count(low)
 
     def _get_vision_info(
         self,
@@ -714,50 +942,32 @@ class MiMoV2OmniProcessingInfo(BaseProcessingInfo):
         do_resize: bool = True,
         image_processor,
         mm_kwargs: Mapping[str, object],
-        modality: str | None = None,
+        is_video: bool = False,
     ) -> tuple[ImageSize, int]:
-        hf_config = self.get_hf_config()
-        vision_config = hf_config.vision_config
-        patch_size = vision_config.patch_size
-        merge_size = vision_config.spatial_merge_size
-        temporal_patch_size = vision_config.temporal_patch_size
-        tokens_per_second = vision_config.tokens_per_second
-
-        mm_kwargs = self.ctx.get_merged_mm_kwargs(mm_kwargs, modality=modality)
-        size = image_processor.size
-        if override_size := mm_kwargs.get("size"):
-            size = size | override_size
-        if (override_min_pixels := mm_kwargs.get("min_pixels")) is not None:
-            size = size | {"shortest_edge": override_min_pixels}
-        if (override_max_pixels := mm_kwargs.get("max_pixels")) is not None:
-            size = size | {"longest_edge": override_max_pixels}
-
+        processor = self.get_hf_processor(**mm_kwargs).mimo_processor
+        unit = processor.patch_size * processor.merge_size
+        if is_video:
+            minimum = processor._vid_kw["min_pixels"]
+            if not isinstance(minimum, int):
+                raise ValueError("MiMo minimum pixel bounds must be integers")
+            maximum = processor.video_pixel_budget(num_frames)
+        else:
+            minimum = processor._img_kw["min_pixels"]
+            maximum = processor._img_kw["max_pixels"]
         if do_resize:
-            resized_height, resized_width = smart_resize(
-                height=image_height,
-                width=image_width,
-                factor=patch_size * merge_size,
-                min_pixels=size["shortest_edge"],
-                max_pixels=size["longest_edge"],
+            height, width = _smart_resize(
+                image_height, image_width, unit, minimum, maximum
             )
-            preprocessed_size = ImageSize(width=resized_width, height=resized_height)
         else:
-            preprocessed_size = ImageSize(width=image_width, height=image_height)
-
-        # For video, MiMo resamples to tokens_per_second fps before temporal patching,
-        # effective tokens = num_frames * tokens_per_second / temporal_patch_size.
-        # For images (num_frames == 1) no resampling is applied.
-        if num_frames > 1:
-            effective_frames = num_frames * tokens_per_second
-        else:
-            effective_frames = num_frames
-        padded_num_frames = effective_frames + (-effective_frames % temporal_patch_size)
-        grid_t = max(padded_num_frames // temporal_patch_size, 1)
-        grid_h = preprocessed_size.height // patch_size
-        grid_w = preprocessed_size.width // patch_size
-        num_patches = grid_t * grid_h * grid_w
-        num_vision_tokens = num_patches // (merge_size**2)
-        return preprocessed_size, num_vision_tokens
+            height, width = image_height, image_width
+        temporal = processor.temporal_patch_size * processor.temporal_compression_ratio
+        grid_t = (
+            math.ceil(num_frames / temporal) * processor.temporal_compression_ratio
+            if is_video
+            else 1
+        )
+        tokens = grid_t * (height // unit) * (width // unit)
+        return ImageSize(width=width, height=height), tokens
 
     def get_num_image_tokens(
         self,
@@ -773,7 +983,6 @@ class MiMoV2OmniProcessingInfo(BaseProcessingInfo):
             num_frames=1,
             image_processor=image_processor,
             mm_kwargs=mm_kwargs,
-            modality="image",
         )
         return num_image_tokens
 
@@ -792,7 +1001,7 @@ class MiMoV2OmniProcessingInfo(BaseProcessingInfo):
             num_frames=num_frames,
             image_processor=image_processor,
             mm_kwargs=mm_kwargs,
-            modality="video",
+            is_video=True,
         )
         return num_video_tokens
 
@@ -805,20 +1014,7 @@ class MiMoV2OmniProcessingInfo(BaseProcessingInfo):
         merge_size = vision_config.spatial_merge_size
 
         if max_pixels is None:
-            image_processor = self.get_image_processor()
-            # Unscoped on purpose: this bound is shared by the image budget,
-            # the video budget and the dummy data, so a modality-scoped
-            # override must not move it. get_num_{image,video}_tokens
-            # re-resize it with the cap for their own modality.
-            mm_kwargs = self.ctx.get_merged_mm_kwargs({})
-            size = image_processor.size
-            if override_size := mm_kwargs.get("size"):
-                size = size | override_size
-            if (override_min_pixels := mm_kwargs.get("min_pixels")) is not None:
-                size = size | {"shortest_edge": override_min_pixels}
-            if (override_max_pixels := mm_kwargs.get("max_pixels")) is not None:
-                size = size | {"longest_edge": override_max_pixels}
-            max_pixels = size["longest_edge"]
+            max_pixels = self.get_hf_processor().mimo_processor._img_kw["max_pixels"]
 
         unit = patch_size * merge_size
         max_seq_len = max_pixels // (unit * unit)
@@ -920,6 +1116,9 @@ class MiMoV2OmniMultiModalProcessor(BaseMultiModalProcessor[MiMoV2OmniProcessing
             **_create_qwen2vl_field_factory(merge_size)(hf_inputs),
             second_per_grid_ts=MultiModalFieldConfig.batched("video", keep_on_cpu=True),
             video_start_times=MultiModalFieldConfig.batched("video", keep_on_cpu=True),
+            video_grid_timestamps=MultiModalFieldConfig.batched(
+                "video", keep_on_cpu=True
+            ),
             audio_features=MultiModalFieldConfig.batched("audio"),
             audio_token_lens=MultiModalFieldConfig.batched("audio", keep_on_cpu=True),
         )
@@ -933,116 +1132,88 @@ class MiMoV2OmniMultiModalProcessor(BaseMultiModalProcessor[MiMoV2OmniProcessing
             fields["video_audio_seg_lens"] = MultiModalFieldConfig.batched(
                 "video", keep_on_cpu=True
             )
+        if "video_audio_frame_counts" in hf_inputs:
+            fields["video_audio_frame_counts"] = MultiModalFieldConfig.batched(
+                "video", keep_on_cpu=True
+            )
+        if "video_audio_start_offsets" in hf_inputs:
+            fields["video_audio_start_offsets"] = MultiModalFieldConfig.batched(
+                "video", keep_on_cpu=True
+            )
         if "va_audio_features" in hf_inputs:
-            fields["va_audio_features"] = MultiModalFieldConfig.batched("va_audio")
+            fields["va_audio_features"] = MultiModalFieldConfig.batched("video")
         return fields
 
-    def _apply_hf_processor_main(
+    def _get_hf_mm_inputs(
         self,
         mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
-    ) -> BatchFeature:
-        """Convert numpy video arrays to (TCHW, timestamps) tuples for MiMo.
-        Also remap 'audios' → 'audio' since MiMoOmniProcessor.__call__ uses
-        the singular form.
-        """
-        valid_mm_items = mm_items.select(
-            {k for k, c in mm_items.get_all_counts().items() if c > 0}
-        )
-        mm_data, passthrough_data = self._get_hf_mm_data(valid_mm_items)
-
-        if not mm_data:
-            return BatchFeature(dict(passthrough_data))
-
-        # Remap audios → audio (MiMoOmniProcessor uses singular param name)
-        if "audios" in mm_data:
-            mm_data = {**mm_data, "audio": mm_data["audios"]}
-            mm_data = {k: v for k, v in mm_data.items() if k != "audios"}
-
-        # Handle video_audio items: convert video part to (TCHW, timestamps) tuple
-        if "video_audio" in mm_data:
-            va_converted: list[VideoAudioInput] = []
-            video_audio_items = mm_data["video_audio"]
-            assert isinstance(video_audio_items, Sequence)
-            for va_item in video_audio_items:
-                if isinstance(va_item, VideoAudioInput):
-                    vid = va_item.video
-                else:
-                    # Expect (video_frames, audio_source) tuple
-                    assert isinstance(va_item, (list, tuple)) and len(va_item) == 2
-                    vid, audio_src = va_item
-                    va_item = VideoAudioInput(video=vid, audio=audio_src)
-                    vid = vid
-                # Convert video frames to (TCHW, timestamps) if needed
-                if (
-                    isinstance(vid, tuple)
-                    and len(vid) == 2
-                    and isinstance(vid[0], torch.Tensor)
-                    and isinstance(vid[1], torch.Tensor)
-                ):
-                    va_converted.append(va_item)
-                else:
-                    if isinstance(vid, np.ndarray):
-                        frames = torch.from_numpy(vid)
-                    elif isinstance(vid, torch.Tensor):
-                        frames = vid
-                    else:
-                        frames = torch.tensor(np.array(vid))
-                    if frames.ndim == 4 and frames.shape[-1] in (1, 3, 4):
-                        frames = frames.permute(0, 3, 1, 2).float()
-                    else:
-                        frames = frames.float()
-                    T = frames.shape[0]
-                    timestamps = torch.arange(T, dtype=torch.float32) / self._INPUT_FPS
-                    va_converted.append(
-                        VideoAudioInput(
-                            video=(frames, timestamps),
-                            audio=va_item.audio,
-                        )
-                    )
-            mm_data = {**mm_data, "video_audio": va_converted}
+        hf_kwargs: Mapping[str, object],
+    ) -> HFMultiModalInputs:
+        """Convert numpy video arrays to (TCHW, timestamps) tuples for MiMo."""
+        hf_inputs = super()._get_hf_mm_inputs(mm_items, hf_kwargs)
+        mm_data = hf_inputs.hf_data
 
         if "videos" in mm_data:
-            converted: list[tuple[torch.Tensor, torch.Tensor]] = []
+            converted = []
             videos = mm_data["videos"]
-            assert isinstance(videos, Sequence)
-            for video in videos:
+            if not isinstance(videos, (list, tuple)):
+                raise ValueError("MiMo processor video items must be a sequence")
+            for item in videos:
+                metadata = None
+                video = item.video if isinstance(item, VideoAudioInput) else item
                 if (
                     isinstance(video, tuple)
                     and len(video) == 2
                     and isinstance(video[0], torch.Tensor)
                     and isinstance(video[1], torch.Tensor)
                 ):
-                    # already in MiMo format
-                    converted.append(video)
+                    pair = video
                 else:
-                    # numpy (T, H, W, C) or torch (T, H, W, C) / (T, C, H, W)
-                    if isinstance(video, np.ndarray):
-                        frames = torch.from_numpy(video)
-                    elif isinstance(video, torch.Tensor):
-                        frames = video
+                    if isinstance(video, tuple) and len(video) == 2:
+                        video, metadata = video
+                        if not isinstance(metadata, Mapping):
+                            raise ValueError("MiMo video metadata must be a mapping")
+                    frames = (
+                        torch.as_tensor(np.asarray(video))
+                        if not isinstance(video, torch.Tensor)
+                        else video
+                    )
+                    if frames.ndim != 4:
+                        raise ValueError("MiMo decoded video must have four dimensions")
+                    if frames.shape[-1] in (1, 3, 4):
+                        frames = frames.permute(0, 3, 1, 2)
+                    frames = frames.float()
+                    if isinstance(video, tuple):
+                        raise ValueError("Unresolved MiMo video payload")
+                    if metadata is not None:
+                        if (
+                            "frames_indices" not in metadata
+                            or not metadata.get("fps", 0) > 0
+                        ):
+                            raise ValueError(
+                                "MiMo video metadata needs frame indices and FPS"
+                            )
+                        timestamps = torch.as_tensor(
+                            metadata["frames_indices"], dtype=torch.float32
+                        ) / float(metadata["fps"])
+                        if timestamps.numel() != frames.shape[0]:
+                            raise ValueError(
+                                "MiMo video timestamp/frame counts disagree"
+                            )
                     else:
-                        frames = torch.tensor(np.array(video))
+                        timestamps = (
+                            torch.arange(frames.shape[0], dtype=torch.float32)
+                            / self._INPUT_FPS
+                        )
+                    pair = (frames, timestamps)
+                converted.append(
+                    replace(item, video=pair)
+                    if isinstance(item, VideoAudioInput)
+                    else pair
+                )
+            mm_data["videos"] = converted
 
-                    if frames.ndim == 4 and frames.shape[-1] in (1, 3, 4):
-                        # THWC → TCHW
-                        frames = frames.permute(0, 3, 1, 2).float()
-                    else:
-                        frames = frames.float()
-
-                    T = frames.shape[0]
-                    timestamps = torch.arange(T, dtype=torch.float32) / self._INPUT_FPS
-                    converted.append((frames, timestamps))
-
-            mm_data = {**mm_data, "videos": converted}
-
-        processed_data = self.info.ctx.call_hf_processor(
-            self.info.get_hf_processor(**hf_processor_mm_kwargs),
-            mm_data,
-            hf_processor_mm_kwargs,
-        )
-        processed_data.update(passthrough_data)
-        return processed_data
+        return hf_inputs
 
     def _get_prompt_updates(
         self,
@@ -1089,6 +1260,13 @@ class MiMoV2OmniMultiModalProcessor(BaseMultiModalProcessor[MiMoV2OmniProcessing
             assert isinstance(video_start_time, (int, float, torch.Tensor))
             spt = float(second_per_grid_ts)
             start = float(video_start_time)
+            timestamp_field = out_item.get("video_grid_timestamps")
+            grid_timestamps = None
+            if timestamp_field is not None:
+                timestamps = timestamp_field.data
+                if not isinstance(timestamps, torch.Tensor):
+                    raise ValueError("MiMo video timestamps must be a tensor")
+                grid_timestamps = timestamps.tolist()
 
             T, H, W = map(int, grid_thw)
             n_per_grid = H * W // (merge_size * merge_size)
@@ -1115,7 +1293,11 @@ class MiMoV2OmniMultiModalProcessor(BaseMultiModalProcessor[MiMoV2OmniProcessing
             if va_seg_lens is None:
                 # Regular video: timestamp + vision tokens per grid
                 for j in range(T):
-                    ts_text = _format_timestamp(start + j * spt)
+                    ts_text = _format_timestamp(
+                        grid_timestamps[j]
+                        if grid_timestamps is not None
+                        else start + j * spt
+                    )
                     ts_ids = tokenizer.encode(ts_text, add_special_tokens=False)
                     full.extend(ts_ids)
                     is_embed_mask.extend([False] * len(ts_ids))
@@ -1128,11 +1310,19 @@ class MiMoV2OmniMultiModalProcessor(BaseMultiModalProcessor[MiMoV2OmniProcessing
             else:
                 # video_audio: interleaved vision+audio per group
                 n_groups = len(va_seg_lens)
-                frames_per_group = T // n_groups  # 1 for il=0, T for il=-1
-                for g in range(n_groups):
+                frame_counts = out_item["video_audio_frame_counts"].data
+                assert isinstance(frame_counts, torch.Tensor)
+                frame_counts = frame_counts[:n_groups].tolist()
+                if sum(frame_counts) != T:
+                    raise ValueError("MiMo video/audio frame groups do not cover video")
+                frame0 = 0
+                for g, frames_per_group in enumerate(frame_counts):
                     # Timestamp for first frame of this group
-                    frame0 = g * frames_per_group
-                    ts_text = _format_timestamp(start + frame0 * spt)
+                    ts_text = _format_timestamp(
+                        grid_timestamps[frame0]
+                        if grid_timestamps is not None
+                        else start + frame0 * spt
+                    )
                     ts_ids = tokenizer.encode(ts_text, add_special_tokens=False)
                     full.extend(ts_ids)
                     is_embed_mask.extend([False] * len(ts_ids))
@@ -1155,6 +1345,7 @@ class MiMoV2OmniMultiModalProcessor(BaseMultiModalProcessor[MiMoV2OmniProcessing
                     is_embed_mask.extend([True] * seg_len)
                     full.append(audio_end_id)
                     is_embed_mask.append(False)
+                    frame0 += frames_per_group
 
             full.append(video_end_id)
             is_embed_mask.append(False)
@@ -1210,35 +1401,71 @@ class MiMoV2OmniDummyInputsBuilder(BaseDummyInputsBuilder[MiMoV2OmniProcessingIn
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
-        mm_options: Mapping[str, BaseDummyOptions],
+        mm_options: MultiModalDummyOptions,
     ) -> MultiModalDataDict:
-        num_images = mm_counts.get("image", 0)
-        num_videos = mm_counts.get("video", 0)
-
         target_width, target_height = self.info.get_image_size_with_most_features()
         target_num_frames = self.info.get_num_frames_with_most_features(
             seq_len, mm_counts
         )
-        image_overrides = mm_options.get("image")
-        video_overrides = mm_options.get("video")
-        assert image_overrides is None or isinstance(image_overrides, ImageDummyOptions)
-        assert video_overrides is None or isinstance(video_overrides, VideoDummyOptions)
+        video_size = ImageSize(width=target_width, height=target_height)
 
         return {
             "image": self._get_dummy_images(
                 width=target_width,
                 height=target_height,
-                num_images=num_images,
-                overrides=image_overrides,
+                num_images=mm_counts.get("image", 0),
+                overrides=mm_options.get("image"),
             ),
             "video": self._get_dummy_videos(
-                width=target_width,
-                height=target_height,
+                width=video_size.width,
+                height=video_size.height,
                 num_frames=target_num_frames,
-                num_videos=num_videos,
-                overrides=video_overrides,
+                num_videos=mm_counts.get("video", 0),
+                overrides=mm_options.get("video"),
+            ),
+            "audio": self._get_dummy_audios(
+                length=(
+                    self.info._get_audio_profile(seq_len)[0]
+                    if mm_counts.get("audio", 0)
+                    else 0
+                ),
+                num_audios=mm_counts.get("audio", 0),
+                overrides=mm_options.get("audio"),
             ),
         }
+
+
+def _interleave_video_audio_embeddings(
+    video: torch.Tensor,
+    audio: torch.Tensor,
+    num_grids: int,
+    frame_counts: list[int],
+    audio_lengths: list[int],
+) -> torch.Tensor:
+    if (
+        len(frame_counts) != len(audio_lengths)
+        or sum(frame_counts) != num_grids
+        or sum(audio_lengths) != audio.shape[0]
+        or num_grids <= 0
+        or video.shape[0] % num_grids
+        or any(count <= 0 for count in frame_counts)
+        or any(length < 0 for length in audio_lengths)
+    ):
+        raise ValueError("Invalid MiMo video/audio interleave boundaries")
+    from vllm.utils.mem_utils import check_startup_memory
+
+    check_startup_memory(
+        device_bytes=video.nbytes + audio.nbytes,
+        label="MiMo combined video/audio embedding assembly",
+        device=video.device,
+    )
+    video_groups = video.split(
+        [count * (video.shape[0] // num_grids) for count in frame_counts]
+    )
+    audio_groups = audio.split(audio_lengths)
+    return torch.cat(
+        [item for pair in zip(video_groups, audio_groups) for item in pair], dim=0
+    )
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -1249,7 +1476,8 @@ class MiMoV2OmniDummyInputsBuilder(BaseDummyInputsBuilder[MiMoV2OmniProcessingIn
 class MiMoV2OmniForCausalLM(
     nn.Module, SupportsMultiModal, SupportsPP, SupportsQuant, SupportsEagle3
 ):
-    packed_modules_mapping = MiMoV2FlashForCausalLM.packed_modules_mapping.copy()
+    packed_modules_mapping = dict(MiMoV2FlashForCausalLM.packed_modules_mapping)
+
     # To ensure correct weight loading and mapping.
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -1278,6 +1506,7 @@ class MiMoV2OmniForCausalLM(
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        vllm_config.cache_config.require_kv_cache_scales = True
         config = vllm_config.model_config.hf_config
         self.config = config
         # Omni ViT/Audio Encoder BF16
@@ -1469,6 +1698,8 @@ class MiMoV2OmniForCausalLM(
         video_audio_n_segs = kwargs.pop("video_audio_n_segs", None)
         video_audio_seg_lens = kwargs.pop("video_audio_seg_lens", None)
         va_audio_features = kwargs.pop("va_audio_features", None)
+        video_audio_frame_counts = kwargs.pop("video_audio_frame_counts", None)
+        video_audio_start_offsets = kwargs.pop("video_audio_start_offsets", None)
 
         mm_input_by_modality = self._parse_and_validate_multimodal_inputs(**kwargs)
         if not mm_input_by_modality and va_audio_features is None:
@@ -1480,19 +1711,19 @@ class MiMoV2OmniForCausalLM(
 
         # Pre-process va audio: one mel spec per va video → per-video audio embeddings
         # keyed by va video index (0-based among va videos only)
-        va_audio_embs_list: list[torch.Tensor] = []
-        if va_audio_features is not None and self.audio_encoder is not None:
+        va_audio_embs_list: list[torch.Tensor | None] = []
+        if va_audio_features is not None:
+            if self.audio_encoder is None:
+                raise ValueError("Video/audio input requires the MiMo audio encoder")
             assert isinstance(va_audio_features, (torch.Tensor, list, tuple))
-            mel_list: list[torch.Tensor] = []
             for mel_spec in va_audio_features:
                 assert isinstance(mel_spec, torch.Tensor)
-                mel_list.append(mel_spec)
-            for mel_spec in mel_list:
-                embs, tok_lens = self.audio_encoder.get_audio_feature([mel_spec])
-                # tok_lens is a list/tensor with one entry (total tokens for this mel)
-                va_audio_embs_list.append(embs)  # shape (total_tok, hidden)
+                if mel_spec.numel() == 0:
+                    va_audio_embs_list.append(None)
+                else:
+                    embs, _ = self.audio_encoder.get_audio_feature([mel_spec])
+                    va_audio_embs_list.append(embs)
 
-        va_cursor = 0  # index into va_audio_embs_list
         assert video_audio_n_segs is None or isinstance(
             video_audio_n_segs, torch.Tensor
         )
@@ -1522,29 +1753,43 @@ class MiMoV2OmniForCausalLM(
                     grid_thw = video_input["video_grid_thw"]
                     for i, vid_embs in enumerate(video_embs_tuple):
                         n_segs = int(video_audio_n_segs[i])
-                        if n_segs == 0 or not va_audio_embs_list:
+                        if n_segs == 0:
                             multimodal_embeddings.append(vid_embs)
                         else:
                             assert video_audio_seg_lens is not None
-                            T = int(grid_thw[i][0])
-                            n_per_grid = vid_embs.shape[0] // T
-                            frames = list(vid_embs.split(n_per_grid, dim=0))
-                            frames_per_group = T // n_segs
-                            # Per-group audio token lengths for this va video
-                            # video_audio_seg_lens is (num_videos, max_T); row i
-                            # has valid values in [:n_segs], rest are zeros.
-                            seg_lens = video_audio_seg_lens[i][:n_segs].tolist()
-                            # Split full audio embs for this va video by group lengths
-                            full_va_embs = va_audio_embs_list[va_cursor]
-                            va_cursor += 1
-                            group_audio_embs = full_va_embs.split(seg_lens)
-                            # Interleave: all vid frames in group, then audio for group
-                            for g in range(n_segs):
-                                for f in range(frames_per_group):
-                                    multimodal_embeddings.append(
-                                        frames[g * frames_per_group + f]
-                                    )
-                                multimodal_embeddings.append(group_audio_embs[g])
+                            assert isinstance(video_audio_frame_counts, torch.Tensor)
+                            if len(va_audio_embs_list) != len(video_embs_tuple):
+                                raise ValueError(
+                                    "MiMo video/audio item counts disagree"
+                                )
+                            if not isinstance(video_audio_start_offsets, torch.Tensor):
+                                raise ValueError(
+                                    "Missing MiMo video/audio start offsets"
+                                )
+                            full_va_embs = va_audio_embs_list[i]
+                            if full_va_embs is None:
+                                raise ValueError(
+                                    "Missing audio features for combined video"
+                                )
+                            start = int(video_audio_start_offsets[i])
+                            audio_length = int(video_audio_seg_lens[i][:n_segs].sum())
+                            if (
+                                start < 0
+                                or start + audio_length > full_va_embs.shape[0]
+                            ):
+                                raise ValueError(
+                                    "MiMo video/audio clip exceeds encoded audio"
+                                )
+                            clip_audio = full_va_embs[start : start + audio_length]
+                            multimodal_embeddings.append(
+                                _interleave_video_audio_embeddings(
+                                    vid_embs,
+                                    clip_audio,
+                                    int(grid_thw[i][0]),
+                                    video_audio_frame_counts[i][:n_segs].tolist(),
+                                    video_audio_seg_lens[i][:n_segs].tolist(),
+                                )
+                            )
             elif modality == "audio":
                 audio_input = mm_input_by_modality["audio"]
                 assert audio_input is not None
@@ -1568,8 +1813,10 @@ class MiMoV2OmniForCausalLM(
                 batch. **NOTE**: If mrope is enabled (default setting for
                 Qwen2.5-VL opensource models), the shape will be `(3, seq_len)`,
                 otherwise it will be `(seq_len,).
-        """
+            intermediate_tensors: Intermediate tensors from prior forward pass.
+            inputs_embeds: Optional tensor of input embeddings.
 
+        """
         if intermediate_tensors is not None:
             inputs_embeds = None
 
@@ -1586,6 +1833,9 @@ class MiMoV2OmniForCausalLM(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
+
+    def process_weights_after_loading(self) -> None:
+        _check_pending_fp8_qkv_projections(self)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         audio_loaded: set[str] = set()

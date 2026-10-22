@@ -116,6 +116,7 @@ def fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
     Returns:
         (q_fp8 ``[rows, 128]`` float8_e4m3fn, scale ``[rows, 1]`` float32).
+
     """
     assert q.ndim == 2 and q.shape[1] == 128, q.shape
     assert q.dtype == torch.bfloat16
@@ -276,6 +277,13 @@ def kpool_compress_and_write_cache(
         slot_score: ``[n_pools, pool_size, head_dim]`` — per-token gate score.
         ape: ``[pool_size, head_dim]`` fp32 — per-slot position bias.
         loc: ``[n_pools]`` int64 — flat physical slot per pool.
+        pool_size: Number of tokens compressed into one cache entry.
+        head_dim: Indexer head dimension.
+        write_mask: ``[n_pools]`` bool — pools to write, or None for all.
+        round_scale: Round each fp8 scale down to a power of two.
+        return_compressed: Also return the compressed K and scales.
+        write_cache: Write the compressed result into ``kv_cache``.
+
     """
     assert slot_k.ndim == 3
     assert slot_score.shape == slot_k.shape
@@ -377,7 +385,6 @@ def _kpool_tail_seed_kernel(
     n_tokens,
     TAIL_BLOCK_ELEMS: tl.constexpr,
     KPOOL_HEAD: tl.constexpr,
-    NUM_TAIL_BLOCKS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     KPOOL: tl.constexpr,
     RING: tl.constexpr,
@@ -395,8 +402,6 @@ def _kpool_tail_seed_kernel(
     if t < 0:
         return
     blk = t // RING  # t >= 0 here, so trunc == floor
-    if blk >= NUM_TAIL_BLOCKS:
-        return
     ahead = tl.load(tslot_ptr + i + KPOOL, mask=i + KPOOL < n_tokens, other=-1).to(
         tl.int64
     )
@@ -426,8 +431,6 @@ def kpool_seed_tail_cache(
     assert tail_kv_cache.dtype == torch.bfloat16
     assert tail_kv_cache.ndim == 4 and tail_kv_cache.shape[1] == 2
     assert tail_kv_cache.stride(3) == 1 and tail_kv_cache.stride(2) == head_dim
-    ring = tail_kv_cache.shape[2]
-    assert ring >= kpool and ring % kpool == 0
     assert key.dtype == torch.bfloat16
     n = tslot.shape[0]
     if n == 0:
@@ -440,10 +443,9 @@ def kpool_seed_tail_cache(
         n,
         TAIL_BLOCK_ELEMS=tail_kv_cache.stride(0),
         KPOOL_HEAD=tail_kv_cache.stride(1),
-        NUM_TAIL_BLOCKS=int(tail_kv_cache.shape[0]),
         HEAD_DIM=head_dim,
         KPOOL=kpool,
-        RING=ring,
+        RING=tail_kv_cache.shape[2],
         BLOCK_D=triton.next_power_of_2(head_dim),
     )
 
@@ -486,10 +488,7 @@ def _kpool_decode_update_batched_kernel(
     the tail-ring slots that tokens t < t* (same request) just stashed in this
     same invocation. ``tl.range`` iterates sequentially within the program, so
     those stashes are visible to the later completion read. Cross-request
-    programs are independent (distinct tail blocks). With NEXT_N < POOL_SIZE
-    (the spec-verify case: NEXT_N ~= num_spec+1, POOL_SIZE=16) at most one
-    completion can occur per request per call, but the ordered loop is correct
-    for any NEXT_N.
+    programs are independent (distinct tail blocks). RING >= POOL_SIZE.
     """
     req = tl.program_id(0)
     offs = tl.arange(0, BLOCK_D)
@@ -649,7 +648,7 @@ def kpool_decode_update_and_maybe_write_cache_batched(
 
     Args:
         kv_cache: indexer K cache ``[num_blocks, block_size, head_dim+4]`` uint8.
-        tail_kv_cache: paged tail cache ``[num_blocks, 2, ring, head_dim]``
+        tail_kv_cache: paged tail cache ``[num_blocks, 2, pool_size, head_dim]``
             bf16 (K at half 0, gate score at half 1).
         tail_slot_mapping: ``[num_requests, next_n]`` int32.
         key: ``[num_requests, next_n, head_dim]`` bf16.
@@ -657,6 +656,10 @@ def kpool_decode_update_and_maybe_write_cache_batched(
         ape: ``[pool_size, head_dim]`` fp32.
         slot_mapping: ``[num_requests, next_n]`` int32.
         positions: ``[num_requests, next_n]`` int32.
+        pool_size: Number of tokens compressed into one cache entry.
+        head_dim: Indexer head dimension.
+        round_scale: Round each fp8 scale down to a power of two.
+
     """
     num_requests, next_n = key.shape[0], key.shape[1]
     if num_requests == 0 or next_n == 0:
@@ -664,7 +667,7 @@ def kpool_decode_update_and_maybe_write_cache_batched(
     assert tail_kv_cache.ndim == 4
     assert tail_kv_cache.shape[1] == 2
     ring = tail_kv_cache.shape[2]
-    assert ring >= pool_size and ring % pool_size == 0
+    assert ring >= pool_size and ring % pool_size == 0, (ring, pool_size)
     assert tail_kv_cache.shape[3] == head_dim
     assert tail_kv_cache.dtype == torch.bfloat16
     assert key.ndim == 3 and key.shape[2] == head_dim
@@ -880,6 +883,8 @@ def expand_pools_and_append_tail(
     pool_ids: torch.Tensor,
     seq_lens: torch.Tensor,
     pool_size: int,
+    *,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fuse ``expand_pools_to_tokens`` + ``append_tail_to_topk`` (identity path).
 
@@ -893,7 +898,15 @@ def expand_pools_and_append_tail(
     rows, n_groups = pool_ids.shape
     topk = n_groups * pool_size
     out_cols = topk + pool_size - 1
-    out = torch.empty((rows, out_cols), dtype=torch.int32, device=pool_ids.device)
+    if out is None:
+        out = torch.empty((rows, out_cols), dtype=torch.int32, device=pool_ids.device)
+    elif (
+        out.shape != (rows, out_cols)
+        or out.dtype != torch.int32
+        or out.device != pool_ids.device
+        or out.stride(1) != 1
+    ):
+        raise ValueError("Pool expansion output must be row-strided int32 [rows, cols]")
     BLOCK_COLS = 128
     n_tiles = triton.cdiv(out_cols, BLOCK_COLS)
     _expand_pools_and_append_tail_kernel[(rows, n_tiles)](

@@ -19,10 +19,11 @@ Checkpoint weight layout (model.mtp.layers.{idx}.*):
 """
 
 from collections.abc import Iterable
+from copy import copy
 
 import torch
 import torch.nn as nn
-from transformers import PretrainedConfig
+from transformers import PreTrainedConfig
 
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
@@ -37,7 +38,10 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import (
@@ -45,8 +49,16 @@ from .interfaces import (
     SupportsMultiModal,
     _require_is_multimodal,
 )
-from .mimo_v2 import MiMoV2Attention, MiMoV2MLP
-from .utils import _merge_multimodal_embeddings, maybe_prefix
+from .mimo_v2 import (
+    MiMoV2Attention,
+    MiMoV2MLP,
+    _check_pending_fp8_qkv_projections,
+    _shard_fp8_qkv_proj,
+)
+from .utils import (
+    _merge_multimodal_embeddings,
+    maybe_prefix,
+)
 
 # MiMo-V2 checkpoints contain multiple MTP layers, but vLLM currently supports
 # only the first layer
@@ -62,12 +74,14 @@ class MiMoV2MTPLayer(nn.Module):
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: PreTrainedConfig,
         prefix: str,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
+        if cache_config is not None:
+            cache_config = copy(cache_config)
 
         # Predictor head components
         self.enorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
@@ -143,11 +157,11 @@ class MiMoV2MTPLayer(nn.Module):
 
 
 class _MiMoV2MTPLayers(nn.Module):
-    """Thin wrapper so parameter paths match checkpoint: model.mtp.layers.*"""
+    """Thin wrapper so parameter paths match checkpoint: model.mtp.layers.*."""
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: PreTrainedConfig,
         num_mtp_layers: int,
         cache_config: CacheConfig | None,
         quant_config: QuantizationConfig | None,
@@ -256,6 +270,9 @@ class MiMoV2MTP(nn.Module):
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, self.lm_head, spec_step_idx)
 
+    def process_weights_after_loading(self) -> None:
+        _check_pending_fp8_qkv_projections(self)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
@@ -271,6 +288,12 @@ class MiMoV2MTP(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        # The pairing state must outlive this call: AutoWeightsLoader delegates
+        # per contiguous group of names, so a pair can straddle two calls and
+        # would otherwise be dropped silently.
+        pending_qkv_proj = getattr(self, "_pending_qkv_proj", None)
+        if pending_qkv_proj is None:
+            self._pending_qkv_proj = pending_qkv_proj = {}
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -284,14 +307,53 @@ class MiMoV2MTP(nn.Module):
             ):
                 continue
 
-            # Support fused qkv_proj checkpoint (Pro format).
-            # The checkpoint is stored pre-sharded for TP=8 as
-            # [Q_rank0, K_rank0, V_rank0, Q_rank1, ...], so splitting along
-            # dim 0 with chunk(tp_size) gives each rank its Q+K+V slice for
-            # both the FP8 weight and the block weight_scale_inv. This matches
-            # how the main model loads the same layout.
+            # Fused qkv_proj: the fp8 weight and its block scales arrive as
+            # separate tensors and are pre-sharded at `config.num_key_value_heads`
+            # chunks of [Q_c | K_c | V_c] (see _shard_fp8_qkv_proj for the
+            # layout). Shard them together: a plain chunk(tp_size) only happens
+            # to be right when tp_size is that chunk count *and* the scales are
+            # tiled per chunk (they are 4 x 29 = 116 rows for MiMo-V2.5, not
+            # tp_size slices of an even split).
             if "qkv_proj" in name:
-                if name in params_dict:
+                is_fp8_weight = (
+                    name.endswith("qkv_proj.weight")
+                    and loaded_weight.dtype == torch.float8_e4m3fn
+                )
+                is_fp8_scale = name.endswith("qkv_proj.weight_scale_inv")
+                if is_fp8_weight or is_fp8_scale:
+                    prefix, kind = name.rsplit(".", 1)
+                    if (
+                        f"{prefix}.weight" not in params_dict
+                        or f"{prefix}.weight_scale_inv" not in params_dict
+                    ):
+                        continue
+                    entry = pending_qkv_proj.setdefault(prefix, {})
+                    entry[kind] = loaded_weight
+                    if "weight" not in entry or "weight_scale_inv" not in entry:
+                        # Waiting for the other half of the fused projection.
+                        continue
+                    # Geometry comes from the module the weights belong to.
+                    attn = self.get_submodule(prefix.rsplit(".", 1)[0])
+                    w_rank, s_rank = _shard_fp8_qkv_proj(
+                        entry["weight"],
+                        entry["weight_scale_inv"],
+                        num_heads=attn.total_num_heads,
+                        num_kv_heads=attn.total_num_kv_heads,
+                        head_dim=attn.head_dim,
+                        v_head_dim=attn.v_head_dim,
+                        tp_rank=tp_rank,
+                        tp_size=tp_size,
+                        ckpt_tp=self.config.num_key_value_heads,
+                    )
+                    for k, tensor in (("weight", w_rank), ("weight_scale_inv", s_rank)):
+                        param = params_dict[f"{prefix}.{k}"]
+                        if tensor.shape[0] > param.shape[0]:
+                            tensor = tensor[: param.shape[0]]
+                        default_weight_loader(param, tensor)
+                        loaded_params.add(f"{prefix}.{k}")
+                    del pending_qkv_proj[prefix]
+                elif name in params_dict:
+                    # Non-fp8 fused checkpoint: unchanged behaviour.
                     param = params_dict[name]
                     loaded_weight = loaded_weight.chunk(tp_size, dim=0)[tp_rank]
                     default_weight_loader(param, loaded_weight)
@@ -327,6 +389,9 @@ class MiMoV2MTP(nn.Module):
 
             if name.endswith(".bias") and name not in params_dict:
                 continue
+            mapped_name = maybe_remap_kv_scale_name(name, params_dict)
+            if mapped_name is not None:
+                name = mapped_name
             if name not in params_dict:
                 continue
 

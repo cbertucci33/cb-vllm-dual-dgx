@@ -53,6 +53,7 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "turboquant_4bit_nc": torch.uint8,
     "turboquant_k3v4_nc": torch.uint8,
     "turboquant_3bit_nc": torch.uint8,
+    "ultraquant_4bit": torch.uint8,
     "nvfp4": torch.uint8,
     "nvfp4_4over6": torch.uint8,
 }
@@ -75,7 +76,15 @@ MODELOPT_TO_VLLM_KV_CACHE_DTYPE_MAP = {
 T = TypeVar("T")
 
 
-PIN_MEMORY = is_pin_memory_available()
+if TYPE_CHECKING:
+    PIN_MEMORY: bool
+
+
+def __getattr__(name: str) -> Any:
+    # Lazy so that importing this module does not resolve current_platform.
+    if name == "PIN_MEMORY":
+        return is_pin_memory_available()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
@@ -99,8 +108,7 @@ def is_meta_module(module: torch.nn.Module) -> bool:
 
 
 def is_strictly_contiguous(t: torch.Tensor) -> bool:
-    """
-    Check if tensor is contiguous AND has no degenerate strides.
+    """Check if tensor is contiguous AND has no degenerate strides.
 
     A degenerate stride occurs when a dimension has size 1 but the stride
     doesn't match the canonical contiguous layout. This can cause issues
@@ -297,8 +305,7 @@ def set_torch_threads_for_runtime() -> None:
 
 @contextlib.contextmanager
 def set_default_torch_num_threads(num_threads: int | None = None):
-    """
-    Sets the default number of threads for PyTorch to the given value.
+    """Sets the default number of threads for PyTorch to the given value.
 
     `None` means using the value of the environment variable `OMP_NUM_THREADS`
     (or `1` if that is not available).
@@ -366,8 +373,7 @@ def _get_precision_level(dtype: torch.dtype) -> int:
 
 
 def is_lossless_cast(src_dtype: torch.dtype, tgt_dtype: torch.dtype):
-    """
-    Test whether it is lossless to cast a tensor from
+    """Test whether it is lossless to cast a tensor from
     `src_dtype` to `tgt_dtype`.
     """
     if src_dtype == tgt_dtype:
@@ -398,8 +404,7 @@ def is_lossless_cast(src_dtype: torch.dtype, tgt_dtype: torch.dtype):
 
 
 def common_broadcastable_dtype(dtypes: Collection[torch.dtype]):
-    """
-    Get the common `dtype` where all of the other `dtypes` can be
+    """Get the common `dtype` where all of the other `dtypes` can be
     cast to it without losing any information.
     """
     return max(
@@ -537,8 +542,12 @@ def kv_cache_dtype_str_to_dtype(
     return STR_DTYPE_TO_TORCH_DTYPE[kv_cache_dtype]
 
 
-def set_random_seed(seed: int | None) -> None:
+def set_random_seed(seed: int | None, data_parallel_index: int = 0) -> None:
     if seed is not None:
+        if data_parallel_index:
+            # DP engines share the seed but must not sample unseeded requests alike.
+            ss = np.random.SeedSequence((seed, data_parallel_index))
+            seed = int(ss.generate_state(1)[0])
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
@@ -570,6 +579,7 @@ def nvfp4_split_data_scale(
     Returns:
         ``(data, scale)`` where *data* is uint8 and *scale* is
         float8_e4m3fn, both views of the same storage.
+
     """
     num_pages = kv_side.shape[0]
     dim_1, dim_2 = kv_side.shape[1], kv_side.shape[2]
@@ -719,13 +729,15 @@ def async_tensor_h2d(
         data = torch.from_numpy(data)
     if isinstance(data, torch.Tensor):
         t = data
-        if PIN_MEMORY and not t.is_pinned():
+        if is_pin_memory_available() and not t.is_pinned():
             # Stage in pinned, contiguous buffer to ensure fully async copy.
             t = torch.empty(
                 t.shape, dtype=dtype or t.dtype, device="cpu", pin_memory=True
             ).copy_(t)
     else:
-        t = torch.tensor(data, dtype=dtype, pin_memory=PIN_MEMORY, device="cpu")
+        t = torch.tensor(
+            data, dtype=dtype, pin_memory=is_pin_memory_available(), device="cpu"
+        )
     assert t.is_cpu
 
     if out is not None:
@@ -737,92 +749,140 @@ def async_tensor_h2d(
 
 def np_to_pinned_tensor(array: np.ndarray) -> torch.Tensor:
     t = torch.from_numpy(array)
-    return t.pin_memory() if PIN_MEMORY else t
+    return t.pin_memory() if is_pin_memory_available() else t
 
 
 def _pinned_uint8_buffer(nbytes: int) -> torch.Tensor:
-    """Allocate a pinned buffer of exactly `nbytes`.
-
-    `pin_memory=True` rounds the size up to a power of two, so register a
-    regular allocation with cudaHostRegister instead when possible.
-    """
+    """Allocate an exactly sized pinned host buffer when CUDA permits."""
     if torch.cuda.is_available():
-        buf = torch.empty(nbytes, dtype=torch.uint8)
-        cudart = torch.cuda.cudart()
-        if cudart.cudaHostRegister(buf.data_ptr(), nbytes, 0).value == 0:
-            weakref.finalize(buf, cudart.cudaHostUnregister, buf.data_ptr())
-            return buf
-    return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+        buf = torch.empty(nbytes, dtype=torch.uint8, device="cpu")
+        try:
+            cudart = torch.cuda.cudart()
+            if cudart.cudaHostRegister(buf.data_ptr(), nbytes, 0).value == 0:
+                weakref.finalize(buf, cudart.cudaHostUnregister, buf.data_ptr())
+                return buf
+        except (AttributeError, RuntimeError):
+            pass
+        del buf
+    return torch.empty(nbytes, dtype=torch.uint8, device="cpu", pin_memory=True)
 
 
 class PinnedStagingBuffer:
-    """Fixed-size pinned host buffer for staging async host-to-device copies.
-
-    Pinning a new tensor per copy makes PyTorch's host caching allocator keep
-    a block for every power-of-two size it has seen and never release it, so
-    inputs of varying size (e.g. images and videos) grow pinned memory without
-    bound. This buffer is carved up as a ring instead, and a region is reused
-    only after the copies issued from it have completed. Not thread-safe.
-    """
+    """Fixed-size pinned host ring used for async host-to-device copies."""
 
     _ALIGN = 256
 
     def __init__(self, capacity: int):
+        if capacity <= 0:
+            raise ValueError("Pinned staging buffer capacity must be positive")
         self.capacity = capacity
         self._buf: torch.Tensor | None = None
         self._head = 0
-        # [start, end, event] of regions in use, oldest first. The event is
-        # None until `record()` is called after the region's copy is issued.
+        self._lock = threading.Lock()
+        # Regions are (start, end, event), oldest first; an unrecorded region
+        # cannot be reclaimed because its async consumer is not yet known.
         self._regions: deque[list] = deque()
 
     def empty(self, shape: Sequence[int], dtype: torch.dtype) -> torch.Tensor | None:
-        """Return a pinned tensor carved from the buffer, or None if it does
-        not fit. Call `record()` after issuing the copies that read it."""
         nbytes = math.prod(shape) * dtype.itemsize
-        start = self._reserve(nbytes)
-        if start is None:
+        if nbytes == 0:
+            # A zero-width lease cannot be uniquely identified by pointer and
+            # would never advance the ring head. Use the caller's ordinary
+            # zero-sized allocation path instead.
             return None
-        assert self._buf is not None
-        return self._buf[start : start + nbytes].view(dtype).view(shape)
+        with self._lock:
+            start = self._reserve(nbytes)
+            if start is None:
+                return None
+            assert self._buf is not None
+            return self._buf[start : start + nbytes].view(dtype).view(shape)
 
-    def record(self) -> None:
-        """Allow reusing the regions returned by `empty()` so far once the work
-        issued on the current stream has completed."""
-        if not self._regions or self._regions[-1][2] is not None:
-            return
-        event = torch.Event()
-        event.record()
-        for region in reversed(self._regions):
-            if region[2] is not None:
-                break
+    def record(
+        self,
+        tensor: torch.Tensor,
+        device: torch.types.Device,
+        stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        """Fence the region backing ``tensor`` on its destination stream."""
+        with self._lock:
+            if self._buf is None:
+                return
+            start = tensor.data_ptr() - self._buf.data_ptr()
+            region = next(
+                (region for region in self._regions if region[0] == start), None
+            )
+            if region is None or region[2] is not None:
+                return
+            if stream is None:
+                stream = torch.cuda.current_stream(device=device)
+            event = torch.Event(device=device)
+            event.record(stream)
             region[2] = event
+
+    def release(self, tensor: torch.Tensor) -> None:
+        """Release an unfenced lease after its producer fails."""
+        with self._lock:
+            if self._buf is None:
+                return
+            start = tensor.data_ptr() - self._buf.data_ptr()
+            for region in self._regions:
+                if region[0] == start and region[2] is None:
+                    self._regions.remove(region)
+                    return
 
     def copy_to_device(
         self, x: torch.Tensor, device: torch.types.Device
     ) -> torch.Tensor:
-        """Asynchronously copy host tensor `x` to `device` through the buffer,
-        in chunks if it is larger than half of the buffer."""
+        if torch.device(device).type != "cuda":
+            raise ValueError("PinnedStagingBuffer only supports CUDA destinations")
+        from vllm.utils.mem_utils import check_startup_memory
+
+        check_startup_memory(
+            device_bytes=x.nbytes,
+            host_bytes=x.nbytes if not x.is_contiguous() else 0,
+            label="pinned H2D destination and contiguous source",
+            device=device,
+        )
         out = torch.empty(x.shape, dtype=x.dtype, device=device)
-        chunk_bytes = self.capacity // 2
+        chunk_bytes = max(self.capacity // 2, 1)
+        stream = torch.cuda.current_stream(device=device)
         if x.nbytes <= chunk_bytes:
             buf = self.empty(x.shape, x.dtype)
             if buf is not None:
-                out.copy_(buf.copy_(x), non_blocking=True)
-                self.record()
+                try:
+                    with torch.cuda.stream(stream):
+                        out.copy_(buf.copy_(x), non_blocking=True)
+                    self.record(buf, device, stream)
+                except BaseException:
+                    # If the asynchronous copy was already queued, the host
+                    # lease must not be reused until that exact stream drains.
+                    # When synchronization itself fails, intentionally retain
+                    # the lease rather than risk DMA reading overwritten data.
+                    stream.synchronize()
+                    self.release(buf)
+                    raise
                 return out
+
         src = x.contiguous().view(-1).view(torch.uint8)
         dst = out.view(-1).view(torch.uint8)
-        for start in range(0, src.numel(), chunk_bytes):
-            chunk = src[start : start + chunk_bytes]
-            buf = self.empty(chunk.shape, torch.uint8)
-            if buf is None:
-                # Only blocked by regions whose copies were not issued yet.
-                dst[start : start + chunk.numel()].copy_(chunk)
-                continue
-            dst[start : start + chunk.numel()].copy_(
-                buf.copy_(chunk), non_blocking=True
-            )
-            self.record()
+        with torch.cuda.stream(stream):
+            for offset in range(0, src.numel(), chunk_bytes):
+                chunk = src[offset : offset + chunk_bytes]
+                buf = self.empty(chunk.shape, torch.uint8)
+                if buf is None:
+                    dst[offset : offset + chunk.numel()].copy_(chunk)
+                    continue
+                try:
+                    dst[offset : offset + chunk.numel()].copy_(
+                        buf.copy_(chunk), non_blocking=True
+                    )
+                    self.record(buf, device, stream)
+                except BaseException:
+                    # See the single-buffer path above.  This is an error-only
+                    # synchronization and does not affect the normal async path.
+                    stream.synchronize()
+                    self.release(buf)
+                    raise
         return out
 
     def _reserve(self, nbytes: int) -> int | None:
@@ -830,9 +890,11 @@ class PinnedStagingBuffer:
         if size > self.capacity:
             return None
         if self._buf is None:
+            from vllm.utils.mem_utils import check_startup_memory
+
+            check_startup_memory(host_bytes=self.capacity, label="pinned staging ring")
             self._buf = _pinned_uint8_buffer(self.capacity)
         regions = self._regions
-        # Drop regions whose copies have completed.
         while regions and regions[0][2] is not None and regions[0][2].query():
             regions.popleft()
         while True:
@@ -840,7 +902,6 @@ class PinnedStagingBuffer:
             end = start + size
             if not any(s < end and start < e for s, e, _ in regions):
                 break
-            # Wait for the oldest region, which frees space in ring order.
             event = regions[0][2]
             if event is None:
                 return None
@@ -858,8 +919,7 @@ def make_ndarray_with_pad(
     *,
     max_len: int | None = None,
 ) -> npt.NDArray:
-    """
-    Make a padded array from 2D inputs.
+    """Make a padded array from 2D inputs.
 
     The padding is applied to the end of each inner list until it reaches
     `max_len`.
@@ -885,8 +945,7 @@ def make_tensor_with_pad(
     device: str | torch.device | None = None,
     pin_memory: bool = False,
 ) -> torch.Tensor:
-    """
-    Make a padded tensor from 2D inputs.
+    """Make a padded tensor from 2D inputs.
 
     The padding is applied to the end of each inner list until it reaches
     `max_len`.
@@ -920,8 +979,7 @@ class _StreamPlaceholder:
 
 
 def current_stream() -> torch.cuda.Stream:
-    """
-    replace `torch.cuda.current_stream()` with `vllm.utils.current_stream()`.
+    """Replace `torch.cuda.current_stream()` with `vllm.utils.current_stream()`.
     it turns out that `torch.cuda.current_stream()` is quite expensive,
     as it will construct a new stream object at each call.
     here we patch `torch.cuda.set_stream` to keep track of the current stream
@@ -972,9 +1030,7 @@ _aux_stream: torch.cuda.Stream | None = None
 
 
 def aux_stream() -> torch.cuda.Stream | None:
-    """
-    Ensures aux_stream is initialized only once
-    """
+    """Ensures aux_stream is initialized only once."""
     global _aux_stream
 
     from vllm.platforms import current_platform
@@ -986,8 +1042,7 @@ def aux_stream() -> torch.cuda.Stream | None:
 
 
 def weak_ref_tensor(tensor: Any) -> Any:
-    """
-    Create a weak reference to a tensor.
+    """Create a weak reference to a tensor.
     The new tensor will share the same data as the original tensor,
     but will not keep the original tensor alive.
     This ignores 0-size tensors as those don't allocate any memory.
@@ -1004,8 +1059,7 @@ def weak_ref_tensors(
     | tuple[torch.Tensor]
     | IntermediateTensors,
 ) -> torch.Tensor | list[Any] | tuple[Any] | Any:
-    """
-    Convenience function to create weak references to tensors,
+    """Convenience function to create weak references to tensors,
     for single tensor, list of tensors or tuple of tensors.
     """
     if isinstance(tensors, torch.Tensor):
@@ -1027,9 +1081,7 @@ def weak_ref_tensors(
 
 
 def get_accelerator_view_from_cpu_tensor(cpu_tensor: torch.Tensor) -> torch.Tensor:
-    """
-    Get an accelerator view of a CPU tensor using Unified Virtual Addressing (UVA).
-    """
+    """Get an accelerator view of a CPU tensor via Unified Virtual Addressing."""
     from vllm.platforms import current_platform
 
     if current_platform.is_xpu():
@@ -1038,10 +1090,15 @@ def get_accelerator_view_from_cpu_tensor(cpu_tensor: torch.Tensor) -> torch.Tens
         if cpu_tensor.numel() == 0:
             return torch.empty(cpu_tensor.shape, dtype=cpu_tensor.dtype, device="xpu")
         if not cpu_tensor.is_pinned():
-            contiguous_cpu = cpu_tensor.contiguous()
-            pinned = torch.empty_like(contiguous_cpu, pin_memory=True)
-            pinned.copy_(contiguous_cpu)
-            cpu_tensor = pinned
+            pinned = torch.empty_strided(
+                cpu_tensor.size(),
+                cpu_tensor.stride(),
+                dtype=cpu_tensor.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            pinned.copy_(cpu_tensor)
+            return torch.ops._C.get_xpu_view_from_cpu_tensor(pinned)
         return torch.ops._C.get_xpu_view_from_cpu_tensor(cpu_tensor)
     elif current_platform.is_cuda_alike():
         return torch.ops._C.get_cuda_view_from_cpu_tensor(cpu_tensor)
@@ -1065,6 +1122,7 @@ def is_torch_equal_or_newer(target: str) -> bool:
 
     Returns:
         Whether the condition meets.
+
     """
     try:
         return _is_torch_equal_or_newer(str(torch.__version__), target)
@@ -1093,6 +1151,7 @@ def is_torch_equal(target: str) -> bool:
 
     Returns:
         Whether the condition meets.
+
     """
     try:
         return _is_torch_equal(target)
@@ -1178,8 +1237,7 @@ def direct_register_custom_op(
     dispatch_key: str | None = None,
     tags: tuple[torch.Tag, ...] = (),
 ):
-    """
-    `torch.library.custom_op` can have significant overhead because it
+    """`torch.library.custom_op` can have significant overhead because it
     needs to consider complicated dispatching logic. This function
     directly registers a custom op and dispatches it to the CUDA backend.
     See https://gist.github.com/youkaichao/ecbea9ec9fc79a45d2adce1784d7a9a5

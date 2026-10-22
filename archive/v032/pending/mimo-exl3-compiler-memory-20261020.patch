@@ -1,0 +1,474 @@
+diff --git a/exllamav3/exllamav3_ext/avx2_target.cpp b/exllamav3/exllamav3_ext/avx2_target.cpp
+index f085320..435fa60 100644
+--- a/exllamav3/exllamav3_ext/avx2_target.cpp
++++ b/exllamav3/exllamav3_ext/avx2_target.cpp
+@@ -5,7 +5,9 @@ bool is_avx2_supported()
+     static bool avx2_check = false;
+     static bool avx2_supported = false;
+     if (avx2_check) return avx2_supported;
+-    #ifdef __linux__
++    #if defined(__linux__) && !(defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
++        (void)0;  // Non-x86 Linux has no AVX support.
++    #elif defined(__linux__)
+         avx2_supported = __builtin_cpu_supports("avx2");
+     #else
+         int cpuInfo[4];
+diff --git a/exllamav3/exllamav3_ext/avx2_target.h b/exllamav3/exllamav3_ext/avx2_target.h
+index b5f77b4..b2e88ef 100644
+--- a/exllamav3/exllamav3_ext/avx2_target.h
++++ b/exllamav3/exllamav3_ext/avx2_target.h
+@@ -6,7 +6,7 @@
+ 
+ bool is_avx2_supported();
+ 
+-#ifdef __linux__
++#if defined(__linux__) && (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
+     #define AVX2_TARGET __attribute__((target("avx2")))
+     #define AVX2_TARGET_OPTIONAL __attribute__((target_clones("avx2","default")))
+ #else
+diff --git a/exllamav3/exllamav3_ext/avx512_target.cpp b/exllamav3/exllamav3_ext/avx512_target.cpp
+index 2a676f6..0349792 100644
+--- a/exllamav3/exllamav3_ext/avx512_target.cpp
++++ b/exllamav3/exllamav3_ext/avx512_target.cpp
+@@ -6,7 +6,9 @@ bool is_avx512_supported()
+     static bool avx512_supported = false;
+     if (avx512_check) return avx512_supported;
+ 
+-#ifdef __linux__
++#if defined(__linux__) && !(defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
++        (void)0;  // Non-x86 Linux has no AVX support.
++    #elif defined(__linux__)
+     // Check for AVX-512F and AVX-512BW support
+     avx512_supported = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw");
+ #else
+diff --git a/exllamav3/exllamav3_ext/avx512_target.h b/exllamav3/exllamav3_ext/avx512_target.h
+index d953709..7ec0fec 100644
+--- a/exllamav3/exllamav3_ext/avx512_target.h
++++ b/exllamav3/exllamav3_ext/avx512_target.h
+@@ -6,7 +6,7 @@
+ 
+ bool is_avx512_supported();
+ 
+-#ifdef __linux__
++#if defined(__linux__) && (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
+     #define AVX512_TARGET __attribute__((target("avx512f,avx512bw")))
+     #define AVX512_TARGET_OPTIONAL __attribute__((target_clones("avx512f,avx512bw","default")))
+ #else
+diff --git a/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx2.cpp b/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx2.cpp
+index f55148c..da6e50f 100644
+--- a/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx2.cpp
++++ b/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx2.cpp
+@@ -1,3 +1,4 @@
++#if (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
+ #include <immintrin.h>
+ #include "all_reduce_cpu_avx2.h"
+ #include "all_reduce_cpu_avx512.h"
+@@ -228,3 +229,37 @@ void perform_cpu_reduce_avx2
+         num_chunks--;
+     }
+ }
++
++#else
++#include <stdexcept>
++#include "all_reduce_cpu_avx2.h"
++#include "all_reduce_cpu_avx512.h"
++
++void enable_fast_fp() {}
++void enable_fast_fp_avx2() {}
++void enable_fast_fp_avx512() {}
++
++[[noreturn]] static void unsupported_cpu_reduce()
++{
++    throw std::runtime_error(
++        "ExLlamaV3's native CPU all-reduce backend requires x86 AVX2"
++    );
++}
++
++void perform_cpu_reduce(PGContext*, size_t, uint32_t, uint8_t*, size_t)
++{
++    unsupported_cpu_reduce();
++}
++void perform_cpu_reduce_avx2(PGContext*, size_t, uint32_t, uint8_t*, size_t)
++{
++    unsupported_cpu_reduce();
++}
++void perform_cpu_reduce_avx512(PGContext*, size_t, uint32_t, uint8_t*, size_t)
++{
++    unsupported_cpu_reduce();
++}
++void bf16_add_inplace_avx512(uint16_t*, const uint16_t*, size_t)
++{
++    unsupported_cpu_reduce();
++}
++#endif
+diff --git a/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx512.cpp b/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx512.cpp
+index e9bc401..ff88e7e 100644
+--- a/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx512.cpp
++++ b/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx512.cpp
+@@ -1,3 +1,4 @@
++#if (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
+ #include <immintrin.h>
+ #include "all_reduce_cpu_avx512.h"
+ #include "all_reduce_cpu_avx2.h"
+@@ -273,3 +274,5 @@ void perform_cpu_reduce_avx512
+         num_chunks--;
+     }
+ }
++
++#endif
+diff --git a/exllamav3/exllamav3_ext/ptx.cuh b/exllamav3/exllamav3_ext/ptx.cuh
+index 0d591bd..9c298ab 100644
+--- a/exllamav3/exllamav3_ext/ptx.cuh
++++ b/exllamav3/exllamav3_ext/ptx.cuh
+@@ -111,7 +111,7 @@ __device__ inline void barrier_acquire
+         volatile int state = -1;
+         do
+         {
+-            asm volatile ("ld.global.acquire.gpu.b32 %0, [%1];\n" : "=r"(state) : "l"(lock));
++            asm volatile ("ld.global.acquire.gpu.b32 %0, [%1];\n" : "=r"(state) : "l"(lock) : "memory");
+         }
+         while (state != stage);
+     }
+@@ -133,8 +133,8 @@ __device__ inline void barrier_release
+             *lock = 0;
+             return;
+         }
+-        asm volatile ("fence.acq_rel.gpu;\n");
+-        asm volatile ("red.relaxed.gpu.global.add.s32 [%0], %1;\n" : : "l"(lock), "r"(val));
++        asm volatile ("fence.acq_rel.gpu;\n" ::: "memory");
++        asm volatile ("red.relaxed.gpu.global.add.s32 [%0], %1;\n" : : "l"(lock), "r"(val) : "memory");
+     }
+ }
+ 
+@@ -163,7 +163,7 @@ __device__ inline void cp_async(void* smem_ptr, const void* glob_ptr)
+     asm volatile(
+         "{\n"
+         "   cp.async.cg.shared.global [%0], [%1], %2;\n"
+-        "}\n" :: "r"(smem), "l"(glob_ptr), "n"(bytes)
++        "}\n" :: "r"(smem), "l"(glob_ptr), "n"(bytes) : "memory"
+     );
+ }
+ 
+@@ -187,7 +187,7 @@ __device__ inline void cp_async_stream(void* smem_ptr, const void* glob_ptr)
+ 
+ __device__ inline void cp_async_fence()
+ {
+-    asm volatile("cp.async.commit_group;\n" ::);
++    asm volatile("cp.async.commit_group;\n" ::: "memory");
+ }
+ 
+ // Wait until at most n async groups are still pending.
+@@ -195,7 +195,7 @@ __device__ inline void cp_async_fence()
+ template <int n>
+ __device__ inline void cp_async_wait()
+ {
+-    asm volatile("cp.async.wait_group %0;\n" :: "n"(n));
++    asm volatile("cp.async.wait_group %0;\n" :: "n"(n) : "memory");
+ }
+ 
+ // Load 16x16 matrix fragment from shared memory, directly in tensor core layout
+@@ -207,7 +207,7 @@ __device__ inline void ldsm4(FragA& frag_a, const void* smem_ptr)
+     asm volatile
+     (
+         "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+-        : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(smem)
++        : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(smem) : "memory"
+     );
+ }
+ 
+diff --git a/exllamav3/exllamav3_ext/quant/coop_autotune.cu b/exllamav3/exllamav3_ext/quant/coop_autotune.cu
+index 209b1a1..b75703c 100644
+--- a/exllamav3/exllamav3_ext/quant/coop_autotune.cu
++++ b/exllamav3/exllamav3_ext/quant/coop_autotune.cu
+@@ -124,7 +124,7 @@ bool read_disk_header(std::ifstream& in)
+     if (!in) return false;
+     if (std::memcmp(header.magic, DISK_CACHE_MAGIC, sizeof(header.magic)) != 0) return false;
+     if (header.format != DISK_CACHE_FORMAT) return false;
+-    if (header.record_size < sizeof(DiskCacheRecordV1)) return false;
++    if (header.record_size != sizeof(DiskCacheRecordV1)) return false;
+     return true;
+ }
+ 
+@@ -144,11 +144,9 @@ void load_disk_cache_locked()
+     in.read((char*) &header, sizeof(header));
+     if (!in) return;
+ 
+-    std::vector<char> record_bytes(header.record_size);
+-    while (in.read(record_bytes.data(), header.record_size))
++    DiskCacheRecordV1 record;
++    while (in.read(reinterpret_cast<char*>(&record), sizeof(record)))
+     {
+-        DiskCacheRecordV1 record;
+-        std::memcpy(&record, record_bytes.data(), sizeof(record));
+         disk_cache[record.hash] = record;
+     }
+ 
+@@ -475,10 +473,23 @@ CoopAutotuneLaunch tune
+     }
+     TORCH_CHECK(!candidates.empty(), "CoopKernelAutotuner: no candidates");
+ 
+-    cudaEvent_t start;
+-    cudaEvent_t end;
+-    cuda_check(cudaEventCreate(&start));
+-    cuda_check(cudaEventCreate(&end));
++    struct TimingEvent {
++        cudaEvent_t handle = nullptr;
++        TimingEvent() { cuda_check(cudaEventCreate(&handle)); }
++        ~TimingEvent() {
++            if (!handle) return;
++            auto error = cudaEventDestroy(handle);
++            if (error != cudaSuccess)
++                fprintf(stderr, "EXL3 timing-event cleanup: %s\n", cudaGetErrorString(error));
++        }
++        void close() {
++            cuda_check(cudaEventDestroy(handle));
++            handle = nullptr;
++        }
++        operator cudaEvent_t() const { return handle; }
++    };
++    TimingEvent start;
++    TimingEvent end;
+ 
+     int repeats = 10;
+     if (numel_B > 1e6) repeats = 6;
+@@ -503,8 +514,8 @@ CoopAutotuneLaunch tune
+     if (candidates.size() > 1)
+         measure_stage(candidates, kernel_args, smem, stream, MIN(64, max_rounds), repeats, 1, start, end);
+ 
+-    cuda_check(cudaEventDestroy(start));
+-    cuda_check(cudaEventDestroy(end));
++    end.close();
++    start.close();
+ 
+     const ExpandedCandidate& best = candidates[0];
+     return { best.kernel, best.block_dim, best.num_sms, best.concurrency, best.tag };
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_devctx.cu b/exllamav3/exllamav3_ext/quant/exl3_devctx.cu
+index 6c1cdb8..c894992 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_devctx.cu
++++ b/exllamav3/exllamav3_ext/quant/exl3_devctx.cu
+@@ -1,6 +1,7 @@
+ #include <cuda_fp16.h>
+ #include <c10/cuda/CUDAGuard.h>
+ #include <ATen/cuda/CUDAContext.h>
++#include <ATen/Functions.h>
+ #include <cooperative_groups.h>
+ namespace cg = cooperative_groups;
+ #include "exl3_devctx.cuh"
+@@ -23,6 +24,7 @@ DevCtx& DevCtx::instance()
+ 
+ int DevCtx::get_num_sms(int device)
+ {
++    TORCH_CHECK(device >= 0 && device < MAX_DEVICES, "EXL3 device index out of range");
+     std::lock_guard<std::mutex> lock(mtx);
+     if (!num_sms[device])
+         cuda_check(cudaDeviceGetAttribute(&num_sms[device], cudaDevAttrMultiProcessorCount, device));
+@@ -31,6 +33,7 @@ int DevCtx::get_num_sms(int device)
+ 
+ int DevCtx::get_cc(int device)
+ {
++    TORCH_CHECK(device >= 0 && device < MAX_DEVICES, "EXL3 device index out of range");
+     std::lock_guard<std::mutex> lock(mtx);
+     if (!cc[device])
+     {
+@@ -47,26 +50,31 @@ int DevCtx::get_cc(int device)
+ 
+ void* DevCtx::get_ws(int device)
+ {
++    TORCH_CHECK(device >= 0 && device < MAX_DEVICES, "EXL3 device index out of range");
+     std::lock_guard<std::mutex> lock(mtx);
+-    if (!ws[device])
++    if (!ws[device].defined())
+     {
+-        cudaSetDevice(device);
+-        cudaMalloc(&ws[device], WORKSPACE_SIZE);
++        c10::cuda::CUDAGuard guard(device);
++        ws[device] = at::empty({WORKSPACE_SIZE}, at::TensorOptions().dtype(at::kByte).device(at::kCUDA, device));
+     }
+-    return ws[device];
++    return ws[device].data_ptr();
+ }
+ 
+ int* DevCtx::get_locks(int device)
+ {
++    TORCH_CHECK(device >= 0 && device < MAX_DEVICES, "EXL3 device index out of range");
+     std::lock_guard<std::mutex> lock(mtx);
+-    if (!locks[device])
++    if (!locks[device].defined())
+     {
+-        cudaSetDevice(device);
+-        size_t size = (MAX_TILES_C + MAX_BARRIERS * 2) * sizeof(int);
+-        cudaMalloc(&locks[device], size);
+-        cudaMemset(locks[device], 0, size);
++        c10::cuda::CUDAGuard guard(device);
++        size_t elements = MAX_TILES_C + MAX_BARRIERS * 2;
++        auto initialized = at::empty({static_cast<int64_t>(elements)}, at::TensorOptions().dtype(at::kInt).device(at::kCUDA, device));
++        auto stream = at::cuda::getCurrentCUDAStream(device).stream();
++        cuda_check(cudaMemsetAsync(initialized.data_ptr(), 0, elements * sizeof(int), stream));
++        cuda_check(cudaStreamSynchronize(stream));
++        locks[device] = std::move(initialized);
+     }
+-    return (int*) locks[device];
++    return locks[device].data_ptr<int>();
+ }
+ 
+ int g_get_cc(int device)
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_devctx.cuh b/exllamav3/exllamav3_ext/quant/exl3_devctx.cuh
+index 090a75c..0957198 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_devctx.cuh
++++ b/exllamav3/exllamav3_ext/quant/exl3_devctx.cuh
+@@ -2,6 +2,7 @@
+ 
+ #include <tuple>
+ #include <mutex>
++#include <ATen/Tensor.h>
+ 
+ // Max allowable output size, in tiles. Used to allocate global lock buffer per device for sync across threadblocks
+ #define MAX_TILES_C (1024 * 1024)
+@@ -25,8 +26,8 @@ class DevCtx
+ private:
+     int num_sms[MAX_DEVICES] = {};
+     int cc[MAX_DEVICES] = {};
+-    void* locks[MAX_DEVICES] = {};
+-    void* ws[MAX_DEVICES] = {};
++    at::Tensor locks[MAX_DEVICES];
++    at::Tensor ws[MAX_DEVICES];
+     std::mutex mtx;
+ 
+ public:
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_gemm.cu b/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
+index a651426..6adb090 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
++++ b/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
+@@ -151,7 +151,7 @@ int exl3_gemm_gr
+ 
+     // Device properties
+     int device;
+-    cudaGetDevice(&device);
++    cuda_check(cudaGetDevice(&device));
+     int num_sms = force_num_sms ? force_num_sms : DevCtx::instance().get_num_sms(device);
+     int cc = DevCtx::instance().get_cc(device);
+     int* locks = DevCtx::instance().get_locks(device);
+@@ -255,16 +255,16 @@ int exl3_gemm_gr
+         force_shape_idx, &block_dim, &shape_idx,
+         &num_sms, cb
+     );
+-    if (!kernel) return 0;
++    TORCH_CHECK(kernel, "No EXL3 kernel supports the requested shape");
+ 
+     // Launch
+     if (kernel_attr_set[device].find((void*) kernel) == kernel_attr_set[device].end())
+     {
+-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
++        cuda_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX));
+         kernel_attr_set[device].insert((void*) kernel);
+         cuda_check(cudaPeekAtLastError());
+     }
+-    cudaLaunchCooperativeKernel
++    cuda_check(cudaLaunchCooperativeKernel
+     (
+         (void*) kernel,
+         num_sms,
+@@ -272,7 +272,7 @@ int exl3_gemm_gr
+         kernelArgs,
+         SMEM_MAX,
+         stream
+-    );
++    ));
+     add_graph_args((void*) kernel);
+ 
+     cuda_check(cudaPeekAtLastError());
+@@ -391,7 +391,7 @@ int exl3_mgemm_gr
+ 
+     // Device properties
+     int device;
+-    cudaGetDevice(&device);
++    cuda_check(cudaGetDevice(&device));
+     int total_sms = DevCtx::instance().get_num_sms(device);
+     int num_sms = force_num_sms ? force_num_sms : total_sms;
+     int cc = DevCtx::instance().get_cc(device);
+@@ -522,11 +522,11 @@ int exl3_mgemm_gr
+     // Launch
+     if (kernel_attr_set[device].find((void*) kernel) == kernel_attr_set[device].end())
+     {
+-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
++        cuda_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX));
+         kernel_attr_set[device].insert((void*) kernel);
+     }
+ 
+-    cudaLaunchCooperativeKernel
++    cuda_check(cudaLaunchCooperativeKernel
+     (
+         (void*) kernel,
+         block_grid,
+@@ -534,7 +534,7 @@ int exl3_mgemm_gr
+         kernelArgs,
+         SMEM_MAX,
+         stream
+-    );
++    ));
+     add_graph_args((void*) kernel);
+ 
+     cuda_check(cudaPeekAtLastError());
+diff --git a/setup.py b/setup.py
+index 65d7065..c305dde 100644
+--- a/setup.py
++++ b/setup.py
+@@ -82,54 +82,14 @@ version = version_py["__version__"]
+ print("Version:", version)
+ 
+ setup(
+-    name="exllamav3",
++    name="exllamav3-ext-vllm",
+     version=version,
+-    packages=[
+-        "exllamav3",
+-        "exllamav3.generator",
+-        "exllamav3.generator.sampler",
+-        "exllamav3.generator.filter",
+-        "exllamav3.conversion",
+-        "exllamav3.conversion.standard_cal_data",
+-        "exllamav3.integration",
+-        "exllamav3.architecture",
+-        "exllamav3.architecture.mm_processing",
+-        "exllamav3.model",
+-        "exllamav3.modules",
+-        "exllamav3.modules.attention_fn",
+-        "exllamav3.modules.arch_specific",
+-        "exllamav3.modules.gated_delta_net_fn",
+-        "exllamav3.modules.quant",
+-        "exllamav3.modules.quant.exl3_lib",
+-        "exllamav3.tokenizer",
+-        "exllamav3.cache",
+-        "exllamav3.loader",
+-        "exllamav3.util",
+-    ],
++    packages=[],
+     url="https://github.com/turboderp-org/exllamav3",
+     license="MIT",
+     author="turboderp",
+-    install_requires=[
+-        "torch>=2.6.0",
+-        "flash_attn>=2.7.4.post1",
+-        "tokenizers>=0.21.1",
+-        "numpy>=2.1.0",
+-        "rich",
+-        "typing_extensions",
+-        "ninja",
+-        "safetensors>=0.3.2",
+-        "pyyaml",
+-        "marisa_trie",
+-        "kbnf>=0.4.2",
+-        "formatron>=0.5.0",
+-        "pydantic",
+-        "xformers",
+-        "flash-linear-attention>=0.5.0",
+-    ],
+-    include_package_data=True,
+-    package_data = {
+-        "": ["py.typed"],
+-    },
++    install_requires=[],
++    include_package_data=False,
+     verbose=verbose,
+     **setup_kwargs,
+ )

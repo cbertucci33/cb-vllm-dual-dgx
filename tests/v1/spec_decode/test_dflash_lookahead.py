@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 from types import SimpleNamespace
 
 import torch
@@ -25,12 +24,12 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 # Matches defaults from tests/v1/spec_decode/test_eagle.py
-DFLASH_TARGET_DIR = os.environ.get("VLLM_TEST_DFLASH_TARGET", "Qwen/Qwen3-8B")
-DFLASH_DRAFT_DIR = os.environ.get("VLLM_TEST_DFLASH_DRAFT", "z-lab/Qwen3-8B-DFlash-b16")
+DFLASH_TARGET_DIR = "Qwen/Qwen3-8B"
+DFLASH_DRAFT_DIR = "z-lab/Qwen3-8B-DFlash-b16"
 
 BLOCK_SIZE = 16
 NUM_BLOCKS = 8
-NUM_SPECULATIVE_TOKENS = 4
+NUM_SPECULATIVE_TOKENS = 3
 
 
 def _dflash_speculative_config(num_speculative_tokens: int) -> SpeculativeConfig:
@@ -144,7 +143,7 @@ def test_dflash_drafter_window_reserves_bonus_token():
     # window = 4, so 96 fits (96 + 4 == 100) but 97 does not (97 + 4 == 101)
     assert input_fits_in_drafter(dflash_runner, SimpleNamespace(max_seq_len=96))
     assert not input_fits_in_drafter(dflash_runner, SimpleNamespace(max_seq_len=97))
-    assert not input_fits_in_drafter(dflash_runner, None)  # no metadata
+    assert not input_fits_in_drafter(dflash_runner, None)
 
     # Other drafters don't reserve the bonus token, so 97 fits (97 + 3 == 100).
     plain_runner = SimpleNamespace(
